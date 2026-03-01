@@ -86,6 +86,8 @@ All events use a standard envelope:
 | `tool_completed` | Local Agent Host |
 | `approval_requested` | Local Agent Host |
 | `approval_resolved` | Approval Service |
+| `task_completed` | Local Agent Host |
+| `task_failed` | Local Agent Host |
 | `session_completed` | Local Agent Host |
 | `session_failed` | Local Agent Host |
 
