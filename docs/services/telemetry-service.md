@@ -124,6 +124,8 @@ A `traceId` spans the full step lifecycle:
 |-------|------------|--------------------|
 | `session_started` | Local Agent Host | `executionEnvironment` |
 | `session_completed` | Local Agent Host | `taskCount`, `totalTokens`, `durationMs` |
+| `task_completed` | Local Agent Host | `taskId`, `stepCount`, `durationMs` |
+| `task_failed` | Local Agent Host | `taskId`, `reason`, `stepCount` |
 | `llm_request_started` | Local Agent Host | `model`, `inputTokens` |
 | `llm_request_completed` | Local Agent Host | `model`, `inputTokens`, `outputTokens`, `latencyMs` |
 | `tool_requested` | Local Agent Host | `toolName`, `capability` |
