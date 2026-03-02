@@ -425,6 +425,145 @@ Cancellation is **cooperative** — the agent loop checks for cancellation at sa
 
 The key principle is: **tool and policy failures go into the message thread so the LLM can self-correct.** Infrastructure failures (network, budget) are handled at the session level.
 
+#### 4.6.1 Advanced Error Recovery
+
+The `ErrorRecovery` module (`loop/error_recovery.py`) provides two additional mechanisms beyond the basic "feed failure back to LLM" strategy:
+
+**Consecutive Failure Reflection:**
+
+When the agent accumulates `consecutive_failure_threshold` (default: 3) consecutive tool failures without a success, the error recovery module injects a reflection prompt into the next LLM call:
+
+```
+## Self-Reflection Required
+The last N tool calls have failed. Review:
+- Tool: ReadFile, Args: {"path": "/etc/shadow"}, Error: Permission denied
+- Tool: ReadFile, Args: {"path": "/etc/shadow"}, Error: Permission denied
+- ...
+Consider: Are arguments valid? Are prerequisites met? Should you try a different approach?
+```
+
+The counter resets to zero on any successful tool execution.
+
+**Loop Detection:**
+
+The module tracks a hash signature of each `(tool_name, arguments)` pair. When the same signature appears `loop_detection_threshold` (default: 3) times, a loop-break prompt is injected:
+
+```
+## Loop Detected
+The following tool calls have been repeated 3+ times with identical arguments:
+- ReadFile(a1b2c3d4) called 4 times
+Try a different approach: use a different tool, change arguments, break into subtasks, or ask the user for clarification.
+```
+
+Both prompts are injected as system messages into the thread before the next LLM call. The loop counter persists across the entire task (not reset on success) to catch patterns where the agent alternates between two failing strategies.
+
+### 4.7 Working Memory
+
+The `memory/` module provides structured working memory that persists across steps within a task and across tasks within a session.
+
+**Structure:**
+
+```python
+@dataclass
+class WorkingMemory:
+    task_tracker: TaskTracker   # Ordered list of tasks with status
+    plan: Plan | None           # Current goal + ordered steps
+    notes: list[str]            # Free-form agent notes
+```
+
+**Injection:** Before each LLM call, the working memory is rendered as a system message inserted after the static system prompt and before conversation history:
+
+```
+## Working Memory
+### Current Plan
+Goal: Refactor the auth module
+Steps:
+  1. [x] Read existing auth code
+  2. [ ] Extract token validation into separate module
+  3. [ ] Update imports across codebase
+
+### Tasks
+- [in_progress] Extract token validation (task-1)
+- [pending] Update imports (task-2)
+
+### Notes
+- Auth module uses JWT with RS256
+- Token validation is duplicated in 3 files
+```
+
+**Agent-Internal Tools:**
+
+The agent modifies working memory via three internal tools that are handled by `AgentToolHandler` without going through the PolicyEnforcer:
+
+| Tool | Purpose |
+|------|---------|
+| `TaskTracker` | Create, update status, and list tasks |
+| `CreatePlan` | Set a goal with ordered steps |
+| `SpawnAgent` | Spawn a sub-agent (see [Section 4.8](#48-sub-agents)) |
+
+**Persistence:** Working memory is serialized into `SessionCheckpoint.working_memory` via `to_checkpoint()`/`from_checkpoint()`. On session resume, the full working memory state (tasks, plan, notes) is restored.
+
+### 4.8 Sub-Agents
+
+The `SubAgentManager` (`loop/sub_agents.py`) allows the main agent to spawn focused sub-agents for independent subtasks via the `SpawnAgent` tool.
+
+**Isolation model:**
+
+Each sub-agent receives:
+- A fresh `MessageThread` (no access to parent conversation history)
+- The parent's `ToolRouter` (same tool execution pipeline)
+- A restricted tool set (no `SpawnAgent` — depth=1, no recursive spawning)
+- The parent's `TokenBudget` reference (shared — safe because asyncio is single-threaded cooperative)
+
+**Concurrency:**
+
+- `asyncio.Semaphore(5)` limits concurrent sub-agents
+- Each sub-agent has a reduced `max_steps=10` (prevents runaway subtasks)
+- Sub-agent results are truncated to 2,048 tokens before being returned to the parent
+
+**Execution flow:**
+
+1. Parent calls `SpawnAgent(task="...", context="...")`
+2. `SubAgentManager` creates isolated `AgentLoop` instance with fresh thread
+3. Sub-agent runs to completion (or max_steps/budget exhaustion)
+4. Result text is truncated and returned as the tool result to the parent
+5. Parent continues with the sub-agent's findings
+
+**Error handling:** Sub-agent failures do not crash the parent. If a sub-agent fails (LLM error, budget exhaustion, max_steps), the failure message is returned as a tool result and the parent decides how to proceed.
+
+### 4.9 Skills System
+
+The skills system (`skills/`) provides formalized multi-step workflows that the agent can invoke as tools.
+
+**Skill Definition:**
+
+```python
+@dataclass
+class SkillDefinition:
+    name: str                              # e.g., "search_codebase"
+    description: str                       # Shown to LLM as tool description
+    system_prompt_additions: str           # Extra instructions for the skill's sub-conversation
+    tool_subset: list[str] | None          # Restrict available tools (None = all)
+    input_schema: dict[str, Any]           # JSON Schema for skill parameters
+```
+
+**Skill Loading:**
+
+`SkillLoader` discovers skills from three sources (in priority order):
+1. **Built-in Python** — hardcoded skills (e.g., `search_codebase`, `edit_and_verify`, `debug_error`)
+2. **Workspace YAML** — `{workspace_dir}/.cowork/skills/*.yaml` files authored by users
+3. **Policy bundle** — skills provided via the policy bundle from the Policy Service
+
+**Skill Execution:**
+
+`SkillExecutor` runs each skill as a focused sub-conversation via `AgentLoop`:
+1. Create a fresh `MessageThread` with the skill's `system_prompt_additions` appended to the system prompt
+2. Restrict available tools to `tool_subset` (if specified)
+3. Run the agent loop with the skill's input as the user prompt
+4. Return the agent's final text response as the tool result
+
+Skills are registered as `Skill_{name}` tools in `AgentToolHandler` and appear alongside regular tools in the LLM's tool list.
+
 ---
 
 ## 5. Message Thread Management
@@ -486,6 +625,17 @@ When the thread exceeds `llmPolicy.maxInputTokens`, the `thread/` module applies
 3. Always include the most recent N messages (recency window — ensures the LLM has immediate context)
 4. If the thread exceeds the budget after including system prompt + tools + recency window: drop the oldest messages from the middle of the thread
 5. Insert a `[Earlier conversation truncated — {count} messages removed]` marker at the truncation point
+
+**Phase 1 implementation (`DropOldestCompactor`):**
+
+The `thread/compactor.py` module implements the Phase 1 strategy:
+
+- **Trigger condition:** `thread.total_token_estimate() > max_context_tokens * 0.9` (checked before each LLM call)
+- **Recency window:** Configurable via `RECENCY_WINDOW` env var (default: 20 messages)
+- **Algorithm:** Keep system prompt (first message) + last N messages (recency window), drop everything in between
+- **Marker insertion:** `{"role": "system", "content": "[... {dropped} earlier messages omitted ...]"}` inserted at the truncation point
+- **Event emission:** `context_compacted` event with `messagesDropped`, `tokensBefore`, `tokensAfter` payload — notifies the Desktop App that context was reduced
+- **Post-compaction:** The agent continues normally with the reduced thread. Working memory (injected per-turn) is not affected by compaction.
 
 **Phase 2+ — LLM-based summarization:**
 
