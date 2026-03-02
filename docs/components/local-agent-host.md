@@ -957,8 +957,10 @@ The `events/` module provides a fire-and-forget event emitter. Events are emitte
 | Event | When Emitted | Key Payload Fields |
 |-------|-------------|-------------------|
 | `session_started` | After successful session init | `executionEnvironment` |
-| `session_completed` | On clean session end | `taskCount`, `totalTokens`, `durationMs` |
+| `session_completed` | On clean session shutdown (`Shutdown` RPC) | `taskCount`, `totalTokens`, `durationMs` |
 | `session_failed` | On session failure | `reason` |
+| `task_completed` | After a single task (user prompt) finishes successfully | `taskId` |
+| `task_failed` | After a single task fails | `taskId`, `reason` |
 | `step_started` | Before each LLM call | `stepId`, `stepCount` |
 | `step_completed` | After all tool results collected and checkpoint written | `stepId`, `stepCount` |
 | `step_limit_approaching` | When `stepCount` reaches 80% of `maxSteps` | `stepCount`, `maxSteps` |
