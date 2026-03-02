@@ -249,3 +249,24 @@ After receiving the policy bundle, the Local Agent Host must verify:
 - `schemaVersion` is supported by this version of the Local Agent Host
 
 If any check fails, the session must not start.
+
+---
+
+## Observability
+
+### Request ID Middleware
+
+Every inbound request is assigned a unique `X-Request-ID` (UUID v4). If the caller provides an `X-Request-ID` header, the service propagates it; otherwise it generates a new one. The ID is:
+
+- Bound to `structlog` context via `structlog.contextvars.bind_contextvars(request_id=...)` so all log lines during that request include it
+- Returned in the `X-Request-ID` response header for client-side correlation
+- Available for downstream calls (Workspace Service, Policy Service) to propagate the same request ID
+
+### Structured Logging
+
+All log output is JSON-formatted via `structlog` with the following processors: `merge_contextvars`, `add_log_level`, `TimeStamper(fmt="iso")`, `StackInfoRenderer`, `format_exc_info`, `JSONRenderer`.
+
+Every request logs on completion:
+```json
+{"event": "request_completed", "method": "POST", "path": "/sessions", "status_code": 200, "duration_ms": 45.2, "request_id": "abc-123", "level": "info", "timestamp": "..."}
+```

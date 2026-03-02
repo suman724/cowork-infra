@@ -277,3 +277,23 @@ The Workspace Service is the primary reason LocalStack is preferred over DynamoD
 # LocalStack covers both stores
 AWS_ENDPOINT_URL=http://localhost:4566
 ```
+
+---
+
+## Observability
+
+### Request ID Middleware
+
+Every inbound request is assigned a unique `X-Request-ID` (UUID v4). If the caller provides an `X-Request-ID` header, the service propagates it; otherwise it generates a new one. The ID is:
+
+- Bound to `structlog` context via `structlog.contextvars.bind_contextvars(request_id=...)` so all log lines during that request include it
+- Returned in the `X-Request-ID` response header for client-side correlation
+
+### Structured Logging
+
+All log output is JSON-formatted via `structlog` with the following processors: `merge_contextvars`, `add_log_level`, `TimeStamper(fmt="iso")`, `StackInfoRenderer`, `format_exc_info`, `JSONRenderer`.
+
+Every request logs on completion:
+```json
+{"event": "request_completed", "method": "POST", "path": "/workspaces/ws-1/artifacts", "status_code": 201, "duration_ms": 78.3, "request_id": "abc-123", "level": "info", "timestamp": "..."}
+```
