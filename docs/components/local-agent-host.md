@@ -72,14 +72,16 @@ flowchart LR
 
 ```
 agent-host/
-  session/         — JSON-RPC server, session lifecycle, session state machine
-  loop/            — Agent loop orchestration, step execution, task management
-  llm/             — LLM Gateway client (streaming HTTP), request construction, response parsing
+  server/          — JSON-RPC 2.0 server (parse, serialize, dispatch, handlers)
+  session/         — Session/Workspace HTTP clients, checkpoint manager, SessionManager
+  loop/            — Core agent loop, tool executor, agent-internal tools, error recovery, sub-agents
+  llm/             — LLM Gateway streaming client (openai SDK), response models, error classifier
+  thread/          — Message thread management, context compaction, token counting
+  memory/          — Working memory: task tracker, plan, notes (injected per-turn)
+  skills/          — Skill definitions, loader (built-in/YAML/policy), executor
   policy/          — Local Policy Enforcer (capability checks, path/command enforcement, risk assessment)
-  state/           — Local State Store (checkpoint write, load, cleanup)
-  routing/         — Tool routing (dispatch to Local Tool Runtime, tool-to-capability mapping)
-  thread/          — Message thread management (in-memory accumulation, token counting, context window)
-  approval/        — Approval request construction, Desktop App notification, decision waiting
+  budget/          — Token budget tracking (pre-check + record_usage)
+  approval/        — Approval gate (asyncio Futures for user approval flow)
   events/          — Telemetry and audit event emission (fire-and-forget)
 ```
 
