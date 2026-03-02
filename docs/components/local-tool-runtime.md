@@ -125,11 +125,18 @@ On startup, the router builds a registry of available tools:
 
 ```
 registry = {
-  "ReadFile":    FileReadTool,
-  "WriteFile":   FileWriteTool,
-  "DeleteFile":  FileDeleteTool,
-  "RunCommand":  ShellExecTool,
-  "HttpRequest": NetworkHttpTool,
+  "ReadFile":       FileReadTool,
+  "WriteFile":      FileWriteTool,
+  "DeleteFile":     FileDeleteTool,
+  "EditFile":       FileEditTool,
+  "ListDirectory":  ListDirectoryTool,
+  "FindFiles":      FindFilesTool,
+  "GrepFiles":      GrepFilesTool,
+  "ViewImage":      ViewImageTool,
+  "RunCommand":     ShellExecTool,
+  "HttpRequest":    NetworkHttpTool,
+  "FetchUrl":       FetchUrlTool,
+  "WebSearch":      WebSearchTool,
 }
 ```
 
@@ -333,6 +340,153 @@ Content-Length: {contentLength}
 
 ---
 
+### 4.6 EditFile
+
+**Capability:** `File.Write`
+
+**Arguments:**
+
+| Argument | Type | Required | Description |
+|----------|------|----------|-------------|
+| `path` | string | yes | Absolute path to the file to edit |
+| `old_text` | string | yes | Exact text to find and replace (must appear exactly once) |
+| `new_text` | string | yes | Replacement text |
+
+**Behavior:**
+1. Validate path (absolute, no null bytes), resolve symlinks
+2. Verify `old_text` appears exactly once in the file
+3. Replace `old_text` with `new_text` using atomic write (tempfile + rename)
+4. Generate unified diff of the changes
+5. Return diff as output (artifact if >10KB)
+
+**Error cases:** `old_text` not found → `TOOL_EXECUTION_FAILED`; multiple matches → `TOOL_EXECUTION_FAILED` with match count.
+
+---
+
+### 4.7 ListDirectory
+
+**Capability:** `File.Read`
+
+**Arguments:**
+
+| Argument | Type | Required | Description |
+|----------|------|----------|-------------|
+| `path` | string | yes | Absolute path to the directory |
+| `include_hidden` | boolean | no | Include dot-prefixed entries. Default: `false` |
+
+**Behavior:**
+1. Validate path, resolve symlinks, verify is a directory
+2. List entries sorted by name, filter hidden by default
+3. Format as `"d dirname"` for directories, `"f filename (size)"` for files
+
+---
+
+### 4.8 FindFiles
+
+**Capability:** `File.Read`
+
+**Arguments:**
+
+| Argument | Type | Required | Description |
+|----------|------|----------|-------------|
+| `directory` | string | yes | Absolute path to search directory |
+| `pattern` | string | yes | Glob pattern (e.g., `*.py`, `**/*.json`) |
+| `max_results` | integer | no | Max results. Default: 100, max: 500 |
+
+**Behavior:**
+1. Validate directory, verify exists
+2. Recursively glob with `Path.rglob(pattern)`
+3. Return relative paths sorted alphabetically, truncated at `max_results`
+
+---
+
+### 4.9 GrepFiles
+
+**Capability:** `File.Read`
+
+**Arguments:**
+
+| Argument | Type | Required | Description |
+|----------|------|----------|-------------|
+| `directory` | string | yes | Absolute path to search directory |
+| `pattern` | string | yes | Regex pattern to search for |
+| `file_glob` | string | no | Glob to filter files. Default: `*` |
+| `max_results` | integer | no | Max matching lines. Default: 50, max: 200 |
+| `context_lines` | integer | no | Context lines around matches. Default: 0, max: 5 |
+
+**Behavior:**
+1. Validate directory, compile regex (reject invalid patterns)
+2. Walk files matching `file_glob`, skip binary files (null byte check)
+3. Search line by line, collect matches with optional context
+4. Format as `"relative/path:linenum: line content"`
+
+---
+
+### 4.10 ViewImage
+
+**Capability:** `File.Read`
+
+**Arguments:**
+
+| Argument | Type | Required | Description |
+|----------|------|----------|-------------|
+| `path` | string | yes | Absolute path to the image file |
+
+**Behavior:**
+1. Validate path, resolve symlinks, verify file exists
+2. Check extension is supported (`.png`, `.jpg`, `.jpeg`, `.gif`, `.webp`, `.bmp`)
+3. Check file size against limit (default 10MB)
+4. Base64 encode the image data
+5. Return `RawToolOutput` with `image_content` for multimodal LLM consumption
+
+**Multimodal support:** The `image_content` field flows through `ToolExecutionResult` → `ToolCallResult` → `MessageThread.add_tool_result()`, which builds OpenAI-format multimodal content blocks (`image_url` with data URI).
+
+---
+
+### 4.11 FetchUrl
+
+**Capability:** `Network.Http`
+
+**Arguments:**
+
+| Argument | Type | Required | Description |
+|----------|------|----------|-------------|
+| `url` | string | yes | URL to fetch |
+| `timeout_seconds` | integer | no | Request timeout. Default: 30, max: 120 |
+
+**Behavior:**
+1. Validate URL with SSRF prevention (same as HttpRequest)
+2. HTTP GET with redirect following
+3. If HTML: convert to markdown via `markdownify` (strips script/style/nav/footer)
+4. If JSON: pretty-print with `json.dumps(indent=2)`
+5. If plain text: return as-is
+6. Truncate if response exceeds 10MB
+
+**Dependency:** `markdownify>=0.14,<1.0` (with fallback regex stripping if not installed)
+
+---
+
+### 4.12 WebSearch
+
+**Capability:** `Search.Web` (new capability)
+
+**Arguments:**
+
+| Argument | Type | Required | Description |
+|----------|------|----------|-------------|
+| `query` | string | yes | Search query |
+| `max_results` | integer | no | Max results. Default: 5, max: 10 |
+
+**Behavior:**
+1. Read `TAVILY_API_KEY` from environment (error if not set)
+2. POST to `https://api.tavily.com/search` with query and max_results
+3. Parse response, extract title/url/content for each result
+4. Format as numbered list: `"1. **Title** (url)\n   Content snippet...\n\n"`
+
+**Environment variable:** `TAVILY_API_KEY` required. No library dependency — uses direct httpx POST.
+
+---
+
 ## 5. Tool Definition Schema
 
 Each tool exposes a `ToolDefinition` that describes itself to the LLM. These are collected via `getAvailableTools()` and included in LLM requests.
@@ -352,13 +506,20 @@ Each tool exposes a `ToolDefinition` that describes itself to the LLM. These are
 
 Full definitions for each built-in tool:
 
-| Tool | Description (sent to LLM) |
-|------|--------------------------|
-| `ReadFile` | Read the contents of a file at the given path |
-| `WriteFile` | Create or overwrite a file with the given content |
-| `DeleteFile` | Delete a file at the given path |
-| `RunCommand` | Execute a shell command and return stdout, stderr, and exit code |
-| `HttpRequest` | Make an HTTP request and return the response |
+| Tool | Capability | Description (sent to LLM) |
+|------|-----------|--------------------------|
+| `ReadFile` | `File.Read` | Read the contents of a file at the given path |
+| `WriteFile` | `File.Write` | Create or overwrite a file with the given content |
+| `DeleteFile` | `File.Delete` | Delete a file at the given path |
+| `EditFile` | `File.Write` | Edit a file by finding and replacing an exact text match |
+| `ListDirectory` | `File.Read` | List files and directories at a given path |
+| `FindFiles` | `File.Read` | Find files matching a glob pattern recursively in a directory |
+| `GrepFiles` | `File.Read` | Search for a regex pattern across files in a directory |
+| `ViewImage` | `File.Read` | Read an image file and return it for visual analysis (multimodal) |
+| `RunCommand` | `Shell.Exec` | Execute a shell command and return stdout, stderr, and exit code |
+| `HttpRequest` | `Network.Http` | Make an HTTP request and return the response |
+| `FetchUrl` | `Network.Http` | Fetch a URL and extract readable text (HTML→markdown) |
+| `WebSearch` | `Search.Web` | Search the web using Tavily API |
 
 ---
 
