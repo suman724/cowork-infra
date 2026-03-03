@@ -222,6 +222,16 @@ The primary view during an active session. Shows the live conversation and agent
 | Prompt input | User types and submits | Sends `StartTask` JSON-RPC |
 | Cancel button | User clicks | Sends `CancelTask` JSON-RPC |
 
+**Markdown Rendering:**
+
+Assistant messages are rendered with full markdown formatting using `react-markdown` with `remark-gfm` (GitHub Flavored Markdown: tables, strikethrough, task lists) and `rehype-highlight` (syntax-highlighted code blocks via highlight.js). Custom component overrides provide:
+- Code blocks with dark background, language label header, and copy-to-clipboard button
+- Inline code with muted background
+- External links with `target="_blank"`
+- Streaming cursor (blinking bar) appended while response is streaming
+
+User messages are rendered as plain text in right-aligned chat bubbles.
+
 ### 4.2 History View
 
 The landing page. Shows past conversations grouped by workspace.
@@ -380,6 +390,16 @@ ipcClient.approveAction(params)  → Promise<void>
 ipcClient.shutdown()             → Promise<void>
 ```
 
+Additional invoke channels for Workspace Service operations (HTTPS REST, not JSON-RPC):
+
+```
+workspace:list             → listWorkspaces(tenantId, userId)
+workspace:list-sessions    → listSessions(workspaceId)
+workspace:get-session-history → getSessionHistory(workspaceId, sessionId)
+workspace:delete           → deleteWorkspace(workspaceId)
+workspace:delete-session   → deleteSession(workspaceId, sessionId)
+```
+
 - **Request timeout:** 30 seconds for most methods. `createSession` and `resumeSession` use 60 seconds (they involve backend calls).
 - **Error handling:** JSON-RPC errors are parsed into typed error objects using the standard error shape (see [architecture.md, Section 6.5](../architecture.md#65-error-shape--all-components)). The IPC module maps error codes to user-facing messages.
 
@@ -496,7 +516,8 @@ The `workspace/` module communicates directly with the Workspace Service over HT
 | `listWorkspaces(tenantId, userId)` | `GET /workspaces?tenantId=...&userId=...` | History view — workspace list |
 | `listSessions(workspaceId)` | `GET /workspaces/{workspaceId}/sessions` | History view — session list |
 | `getSessionHistory(workspaceId, sessionId)` | Fetch `session_history` artifact | History view — conversation display; session continuation |
-| `deleteWorkspace(workspaceId)` | `DELETE /workspaces/{workspaceId}` | Settings / workspace management |
+| `deleteWorkspace(workspaceId)` | `DELETE /workspaces/{workspaceId}` | Sidebar — workspace management |
+| `deleteSession(workspaceId, sessionId)` | `DELETE /workspaces/{workspaceId}/sessions/{sessionId}` | Sidebar — session management |
 
 ### 7.2 Session Continuation Flow
 
