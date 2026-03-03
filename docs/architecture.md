@@ -208,6 +208,8 @@ sequenceDiagram
 
 The handshake returns everything the Local Agent Host needs: `sessionId`, `workspaceId`, the full policy bundle, and feature flags. LLM Gateway configuration (endpoint and auth token) is read from local environment variables (`LLM_GATEWAY_ENDPOINT`, `LLM_GATEWAY_AUTH_TOKEN`) — not sent by the Session Service.
 
+After receiving the policy bundle, the Local Agent Host enriches it with the **workspace directory**: if the session was created with `workspaceHint.localPaths`, the resolved workspace path is appended to `allowedPaths` for file-operation capabilities (`File.Read`, `File.Write`, `File.Delete`). This local enrichment keeps the Policy Service workspace-agnostic — it only produces static policy rules, while workspace-specific path permissions are injected by the agent host.
+
 > Full API: [services/session-service.md](services/session-service.md)
 
 ### 4.2 LLM Call
@@ -284,6 +286,8 @@ Capabilities are issued in the policy bundle and enforced by **Local Policy Enfo
 | `LLM.Call` | Call LLM Gateway | model allowlist, token budgets | No |
 
 > Full policy bundle structure and LLM policy fields: [services/policy-service.md](services/policy-service.md)
+>
+> **Note:** For file-operation capabilities, the Local Agent Host augments `allowedPaths` with the session's workspace directory at initialization time. The Policy Service returns a static policy; workspace-specific paths are a local concern.
 
 ### Tool Architecture
 
