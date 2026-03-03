@@ -66,7 +66,9 @@ tool-runtime/
   tools/
     file/         — ReadFile, WriteFile, DeleteFile implementations
     shell/        — RunCommand implementation
-    network/      — HttpRequest implementation
+    network/      — HttpRequest, FetchUrl, WebSearch implementations
+    code/         — ExecuteCode implementation (Python script execution)
+  code/           — Code execution engine (PythonExecutor, preamble, CodeExecutionResult)
   platform/       — OS abstraction layer (path handling, shell resolution, encoding)
   mcp/            — MCP client: discovery, connection, lifecycle, manifest translation (Phase 2+)
   output/         — Output formatting, truncation, artifact extraction
@@ -80,6 +82,8 @@ flowchart TD
   file["tools/file/<br/><small>ReadFile, WriteFile<br/>DeleteFile</small>"]
   shell["tools/shell/<br/><small>RunCommand</small>"]
   network["tools/network/<br/><small>HttpRequest</small>"]
+  code["tools/code/<br/><small>ExecuteCode</small>"]
+  codeEngine["code/<br/><small>PythonExecutor<br/>preamble</small>"]
   platform["platform/<br/><small>OS abstraction</small>"]
   mcp["mcp/<br/><small>MCP client<br/>Phase 2+</small>"]
   output["output/<br/><small>formatting<br/>truncation</small>"]
@@ -87,6 +91,9 @@ flowchart TD
   router --> file
   router --> shell
   router --> network
+  router --> code
+  code --> codeEngine
+  codeEngine --> platform
   router -.-> mcp
   file --> platform
   file --> output
@@ -140,6 +147,7 @@ registry = {
   "HttpRequest":       NetworkHttpTool,
   "FetchUrl":          FetchUrlTool,
   "WebSearch":         WebSearchTool,
+  "ExecuteCode":       ExecuteCodeTool,
 }
 ```
 
@@ -617,6 +625,7 @@ Full definitions for each built-in tool:
 | `HttpRequest` | `Network.Http` | Make an HTTP request and return the response |
 | `FetchUrl` | `Network.Http` | Fetch a URL and extract readable text (HTML→markdown) |
 | `WebSearch` | `Search.Web` | Search the web using Tavily API |
+| `ExecuteCode` | `Code.Execute` | Execute a Python script and return stdout, stderr, exit code, and images (matplotlib auto-captured) |
 
 ---
 

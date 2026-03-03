@@ -894,6 +894,12 @@ function check(toolCall, capabilityName) → ALLOWED | DENIED(reason) | APPROVAL
     if allowedDomains is set AND domain NOT in capEntry.allowedDomains:
       return DENIED("Domain not allowed: " + domain)
 
+  if capabilityName == Code.Execute:
+    // Phase 1: Python-only. Validate "python" is in allowed languages.
+    allowedLanguages = capEntry.allowedLanguages ?? ["python"]
+    if "python" NOT in allowedLanguages:
+      return DENIED("Python execution not permitted by policy")
+
   // 3. Approval required?
   if capEntry.requiresApproval:
     riskLevel = assessRisk(toolCall, capabilityName)
