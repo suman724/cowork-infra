@@ -122,6 +122,8 @@ Capability entries can include any of these scope constraints:
 | `requiresApproval` | All capabilities |
 | `approvalRuleId` | All capabilities where requiresApproval is true |
 
+> **Workspace path enrichment:** The Policy Service does **not** inject workspace-specific paths into `allowedPaths`. That is the responsibility of the Local Agent Host, which appends the session's workspace directory to file-operation capabilities after receiving the policy bundle. This keeps the Policy Service workspace-agnostic and reusable across desktop and backend execution environments. See [components/local-agent-host.md](../components/local-agent-host.md), Section 8.1.
+
 ---
 
 ## LLM Policy

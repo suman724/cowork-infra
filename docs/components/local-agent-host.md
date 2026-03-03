@@ -153,13 +153,14 @@ Step-by-step algorithm for `CreateSession`:
    - `expiresAt` is in the future
    - `sessionId` in the bundle matches the returned `sessionId`
    - `schemaVersion` is supported by this version of the agent host
-6. Initialize Local Policy Enforcer with the policy bundle
-7. Initialize LLM client with `LLM_GATEWAY_ENDPOINT` and `LLM_GATEWAY_AUTH_TOKEN` (both from environment variables), and `llmPolicy` from the bundle
-8. Initialize empty message thread
-9. Initialize Local State Store (prepare checkpoint directory)
-10. Transition session state to `SESSION_RUNNING`
-11. Emit `session_started` event
-12. Return session ready response to Desktop App
+6. **Inject workspace directory into policy bundle**: If the session has a local workspace (`workspaceHint.localPaths`), resolve the workspace directory to an absolute path and append it to `allowedPaths` for all file-operation capabilities (`File.Read`, `File.Write`, `File.Delete`). This local enrichment ensures the agent can operate within the workspace without requiring the Policy Service to know local paths. Skip if the path is already present. See [Section 8.3](#83-path-enforcement) for path resolution details.
+7. Initialize Local Policy Enforcer with the (enriched) policy bundle
+8. Initialize LLM client with `LLM_GATEWAY_ENDPOINT` and `LLM_GATEWAY_AUTH_TOKEN` (both from environment variables), and `llmPolicy` from the bundle
+9. Initialize empty message thread
+10. Initialize Local State Store (prepare checkpoint directory)
+11. Transition session state to `SESSION_RUNNING`
+12. Emit `session_started` event
+13. Return session ready response to Desktop App
 
 > Session Service API: [services/session-service.md](../services/session-service.md)
 
@@ -836,8 +837,9 @@ On session init, the enforcer:
 
 1. Receives the policy bundle from the session initialization flow
 2. Validates it (see [Section 3.2](#32-session-initialization), step 5)
-3. Indexes capabilities by name into a lookup map for O(1) access during tool calls
-4. Indexes approval rules by `approvalRuleId` for O(1) access during approval construction
+3. **Workspace path injection** (step 6 in 3.2): if the session has a local workspace directory, the agent host appends its resolved absolute path to `allowedPaths` for `File.Read`, `File.Write`, and `File.Delete` capabilities. This ensures the agent can always operate within its workspace regardless of the static policy's path configuration. The workspace directory is a local concern — it is injected here rather than in the Policy Service so that the backend remains workspace-agnostic.
+4. Indexes capabilities by name into a lookup map for O(1) access during tool calls
+5. Indexes approval rules by `approvalRuleId` for O(1) access during approval construction
 
 > Full policy bundle structure: [services/policy-service.md](../services/policy-service.md)
 
@@ -886,6 +888,7 @@ function check(toolCall, capabilityName) → ALLOWED | DENIED(reason) | APPROVAL
 
 ### 8.3 Path Enforcement
 
+- **Workspace directory auto-inclusion:** when a session is initialized with a local workspace (via `workspaceHint.localPaths`), the workspace directory is automatically appended to `allowedPaths` for file-operation capabilities at session init. This means the agent always has read/write/delete access to the workspace directory without requiring the Policy Service to embed local paths.
 - **Prefix matching:** a file path is allowed if it starts with any entry in `allowedPaths`
 - **Blocklist precedence:** `blockedPaths` takes priority over `allowedPaths` — a path matching both is blocked
 - **OS-aware comparison:** case-insensitive on Windows, case-sensitive on macOS
