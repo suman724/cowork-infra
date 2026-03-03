@@ -712,11 +712,27 @@ Tool calls are dispatched only after the full response is received and the assis
 
 | Error | Strategy |
 |-------|----------|
-| HTTP 429 (rate limited) | Exponential backoff with jitter, max 3 retries. Use `Retry-After` header if present. |
+| HTTP 429 (rate limited) | Exponential backoff with jitter, max 3 retries. Use `Retry-After` header if present via `extract_retry_after()`. |
+| HTTP 529 (overloaded) | 3× base delay exponential backoff with jitter, max 3 retries (~3s → 6s → 12s with default 1s base). Anthropic-specific status code indicating server overload. |
 | HTTP 400 (guardrail blocked) | Do not retry. Emit `LLM_GUARDRAIL_BLOCKED` error to Desktop App. Add a system-level note to the thread so the LLM sees it on the next attempt. |
-| HTTP 500 / network timeout | Exponential backoff with jitter, max 3 retries. If exhausted, checkpoint and pause session. |
+| HTTP 500 / network timeout | Exponential backoff with jitter, max 3 retries (~1s → 2s → 4s with default 1s base). If exhausted, checkpoint and pause session. |
 | Token budget exceeded | Pre-check fails before the call is made. Task fails with `LLM_BUDGET_EXCEEDED`. |
 | Partial stream disconnection | Discard partial response, retry the full request. The thread has not been modified yet (assistant message is added only after the full response), so the retry is safe. |
+
+**Error Classification** (`error_classifier.py`):
+
+The `classify_llm_error(exc)` function returns structured metadata for any LLM error:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `error_code` | string | `RATE_LIMITED`, `LLM_OVERLOADED`, `LLM_UNAVAILABLE`, `LLM_ERROR` |
+| `error_type` | string | `rate_limit`, `overloaded`, `transient`, `permanent` |
+| `is_recoverable` | bool | `true` for all transient/rate-limit/overloaded errors |
+| `user_message` | string | Clean user-facing error description |
+
+This metadata is attached to `task_failed` events so the Desktop App can show a Retry button on recoverable failures. Helper functions: `is_rate_limit_error()` identifies 429 specifically, `extract_retry_after()` reads the `Retry-After` header from SDK exceptions.
+
+Each retry attempt emits an `llm_retry` event with `attempt`, `maxRetries`, `errorMessage`, and `delaySeconds` so the Desktop App can show retry progress to the user.
 
 ### 6.5 Token Budget Tracking
 
@@ -1141,7 +1157,8 @@ The `events/` module provides a fire-and-forget event emitter. Events are emitte
 | `session_completed` | On clean session shutdown (`Shutdown` RPC) | `taskCount`, `totalTokens`, `durationMs` |
 | `session_failed` | On session failure | `reason` |
 | `task_completed` | After a single task (user prompt) finishes successfully | `taskId` |
-| `task_failed` | After a single task fails | `taskId`, `reason` |
+| `task_failed` | After a single task fails | `taskId`, `message`, `errorCode`, `errorType`, `isRecoverable` |
+| `llm_retry` | Before each LLM retry attempt | `attempt`, `maxRetries`, `errorMessage`, `delaySeconds` |
 | `step_started` | Before each LLM call | `stepId`, `stepCount` |
 | `step_completed` | After all tool results collected and checkpoint written | `stepId`, `stepCount` |
 | `step_limit_approaching` | When `stepCount` reaches 80% of `maxSteps` | `stepCount`, `maxSteps` |

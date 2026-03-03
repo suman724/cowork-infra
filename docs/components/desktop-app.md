@@ -219,6 +219,9 @@ The primary view during an active session. Shows the live conversation and agent
 | Tool call cards | `SessionEvent` with `eventType: "tool_requested"` / `"tool_completed"` | Shows category icon, tool name, category badge, status badge, collapsible arguments, and live result output. Categories: File (`FileText`, blue), Shell (`Terminal`, amber), Network (`Globe`, purple), Agent (`Brain`, slate), Sub-Agent (`GitFork`, indigo), Skill (`Sparkles`, emerald). Category resolved from `toolType` field first, then inferred from `toolName` for backward compat. |
 | Step counter | `SessionEvent` with `eventType: "step_started"` | Shows `stepCount / maxSteps` |
 | Step limit warning | `SessionEvent` with `eventType: "step_limit_approaching"` | Highlighted counter when 80% reached |
+| System messages | `SessionEvent` errors/warnings/info | Severity-aware rendering: error (red AlertCircle), warning (yellow AlertTriangle), info (muted Info icon) |
+| Retry button | `task_failed` event with `isRecoverable: true` | Appears in footer when task is not running; re-submits the same prompt via `StartTask`. Cleared on new task start. |
+| LLM retry indicator | `SessionEvent` with `eventType: "llm_retry"` | Warning system message showing retry attempt count |
 | Prompt input | User types and submits | Sends `StartTask` JSON-RPC |
 | Cancel button | User clicks | Sends `CancelTask` JSON-RPC |
 
