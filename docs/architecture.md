@@ -284,6 +284,8 @@ Capabilities are issued in the policy bundle and enforced by **Local Policy Enfo
 | `Workspace.Upload` | Upload artifacts | workspace id, size limits | No |
 | `BackendTool.Invoke` | Invoke remote tools | tool name allowlist | Sometimes |
 | `LLM.Call` | Call LLM Gateway | model allowlist, token budgets | No |
+| `Search.Web` | Web search via Tavily API | — | No |
+| `Code.Execute` | Execute Python code | `allowedLanguages`, `maxExecutionTimeSeconds`, `allowCodeNetwork` | Usually yes |
 
 > Full policy bundle structure and LLM policy fields: [services/policy-service.md](services/policy-service.md)
 >
@@ -447,7 +449,7 @@ Used consistently across local IPC responses and all backend HTTP error response
 }
 ```
 
-**Error codes:** `INVALID_REQUEST`, `UNAUTHORIZED`, `SESSION_NOT_FOUND`, `SESSION_EXPIRED`, `POLICY_BUNDLE_INVALID`, `POLICY_EXPIRED`, `CAPABILITY_DENIED`, `APPROVAL_REQUIRED`, `APPROVAL_DENIED`, `TOOL_NOT_FOUND`, `TOOL_EXECUTION_FAILED`, `TOOL_EXECUTION_TIMEOUT`, `FILE_NOT_FOUND`, `FILE_TOO_LARGE`, `PERMISSION_DENIED`, `LLM_GUARDRAIL_BLOCKED`, `LLM_BUDGET_EXCEEDED`, `WORKSPACE_UPLOAD_FAILED`, `RATE_LIMITED`, `INTERNAL_ERROR`
+**Error codes:** `INVALID_REQUEST`, `UNAUTHORIZED`, `SESSION_NOT_FOUND`, `SESSION_EXPIRED`, `POLICY_BUNDLE_INVALID`, `POLICY_EXPIRED`, `CAPABILITY_DENIED`, `APPROVAL_REQUIRED`, `APPROVAL_DENIED`, `TOOL_NOT_FOUND`, `TOOL_EXECUTION_FAILED`, `TOOL_EXECUTION_TIMEOUT`, `FILE_NOT_FOUND`, `FILE_TOO_LARGE`, `PERMISSION_DENIED`, `LLM_GUARDRAIL_BLOCKED`, `LLM_BUDGET_EXCEEDED`, `WORKSPACE_UPLOAD_FAILED`, `RATE_LIMITED`, `INTERNAL_ERROR`, `CODE_EXECUTION_TIMEOUT`
 
 ---
 

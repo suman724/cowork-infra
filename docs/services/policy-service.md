@@ -105,6 +105,8 @@ Capabilities define what the agent is permitted to do. Each capability has a nam
 | `Workspace.Upload` | Upload artifacts | Workspace id, size limits | Usually no | Local Agent Host |
 | `BackendTool.Invoke` | Invoke remote-only tools | Tool names | Sometimes | Local Agent Host, Policy Service |
 | `LLM.Call` | Call LLM Gateway | Model allowlist, token budgets | No | LLM Gateway, Policy Service |
+| `Search.Web` | Web search | — | No | Local Tool Runtime |
+| `Code.Execute` | Execute Python code | Language allowlist, timeout, network flag | Usually yes | Local Policy Enforcer, Local Tool Runtime |
 
 ### Scope Fields
 
@@ -121,6 +123,9 @@ Capability entries can include any of these scope constraints:
 | `maxOutputBytes` | Shell.Exec, tool outputs |
 | `requiresApproval` | All capabilities |
 | `approvalRuleId` | All capabilities where requiresApproval is true |
+| `allowedLanguages` | Code.Execute |
+| `maxExecutionTimeSeconds` | Code.Execute |
+| `allowCodeNetwork` | Code.Execute |
 
 > **Workspace path enrichment:** The Policy Service does **not** inject workspace-specific paths into `allowedPaths`. That is the responsibility of the Local Agent Host, which appends the session's workspace directory to file-operation capabilities after receiving the policy bundle. This keeps the Policy Service workspace-agnostic and reusable across desktop and backend execution environments. See [components/local-agent-host.md](../components/local-agent-host.md), Section 8.1.
 
