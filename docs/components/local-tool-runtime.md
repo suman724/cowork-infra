@@ -125,18 +125,21 @@ On startup, the router builds a registry of available tools:
 
 ```
 registry = {
-  "ReadFile":       FileReadTool,
-  "WriteFile":      FileWriteTool,
-  "DeleteFile":     FileDeleteTool,
-  "EditFile":       FileEditTool,
-  "ListDirectory":  ListDirectoryTool,
-  "FindFiles":      FindFilesTool,
-  "GrepFiles":      GrepFilesTool,
-  "ViewImage":      ViewImageTool,
-  "RunCommand":     ShellExecTool,
-  "HttpRequest":    NetworkHttpTool,
-  "FetchUrl":       FetchUrlTool,
-  "WebSearch":      WebSearchTool,
+  "ReadFile":          FileReadTool,
+  "WriteFile":         FileWriteTool,
+  "DeleteFile":        FileDeleteTool,
+  "EditFile":          FileEditTool,
+  "MultiEdit":         MultiEditTool,
+  "CreateDirectory":   CreateDirectoryTool,
+  "MoveFile":          MoveFileTool,
+  "ListDirectory":     ListDirectoryTool,
+  "FindFiles":         FindFilesTool,
+  "GrepFiles":         GrepFilesTool,
+  "ViewImage":         ViewImageTool,
+  "RunCommand":        ShellExecTool,
+  "HttpRequest":       NetworkHttpTool,
+  "FetchUrl":          FetchUrlTool,
+  "WebSearch":         WebSearchTool,
 }
 ```
 
@@ -271,6 +274,7 @@ The agent-host's `routing/` module filters this list to only include tools whose
 | Argument | Type | Required | Description |
 |----------|------|----------|-------------|
 | `command` | string | yes | Shell command to execute |
+| `description` | string | yes | Brief explanation of what the command does (e.g., "Install project dependencies") |
 | `cwd` | string | no | Working directory. Default: workspace root |
 | `timeout` | integer | no | Timeout in seconds. Default: 300 |
 | `stdin` | string | no | Standard input to pipe to the command |
@@ -282,17 +286,20 @@ The agent-host's `routing/` module filters this list to only include tools whose
 4. Capture stdout and stderr separately
 5. Wait for the process to exit or timeout
 6. On timeout: kill the process tree, return error `TOOL_EXECUTION_TIMEOUT`
-7. Return exit code, stdout, and stderr
+7. Return exit code, stdout, and stderr with description prepended
 
 **Output format:**
 
 ```
+# {description}
 Exit code: 0
 --- stdout ---
 {stdout content}
 --- stderr ---
 {stderr content}
 ```
+
+> **Note:** The `description` parameter forces the LLM to explain every command before execution. The description flows into audit events via the `arguments` dict and appears in conversation history.
 
 **Output truncation:** If combined stdout + stderr exceeds `maxOutputBytes` (from policy scope, default 100KB), truncate with a `[Output truncated — {total} bytes, showing first {limit} bytes]` marker.
 
@@ -363,7 +370,94 @@ Content-Length: {contentLength}
 
 ---
 
-### 4.7 ListDirectory
+### 4.7 MultiEdit
+
+**Capability:** `File.Write`
+
+**Arguments:**
+
+| Argument | Type | Required | Description |
+|----------|------|----------|-------------|
+| `path` | string | yes | Absolute path to the file to edit |
+| `edits` | array | yes | Ordered list of `{old_text, new_text}` edits to apply |
+
+Each item in `edits`:
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `old_text` | string | yes | Exact text to find (must appear exactly once) |
+| `new_text` | string | yes | Replacement text |
+
+**Behavior:**
+1. Validate path (absolute, no null bytes), resolve symlinks, verify file exists
+2. Read file content
+3. **Validation pass** — before any mutation, verify each `old_text`:
+   - Appears exactly once in the current content
+   - No two edits target overlapping text ranges
+4. **Apply edits** sequentially in array order:
+   - For each edit: `content = content.replace(old_text, new_text, 1)`
+   - After each replace, re-validate remaining edits still match exactly once
+5. Atomic write (tempfile + rename)
+6. Generate single unified diff (original → final)
+7. Return diff as output (artifact if >10KB)
+
+**Edge cases:**
+- Empty edits array → `INVALID_REQUEST`
+- `old_text == new_text` → skip (no-op), don't error
+- All edits are no-ops → return `"No changes needed"` without writing
+
+**Error cases:** `edits[i].old_text` not found → `TOOL_EXECUTION_FAILED`; multiple matches → `TOOL_EXECUTION_FAILED`; overlapping ranges → `TOOL_EXECUTION_FAILED`.
+
+---
+
+### 4.8 CreateDirectory
+
+**Capability:** `File.Write`
+
+**Arguments:**
+
+| Argument | Type | Required | Description |
+|----------|------|----------|-------------|
+| `path` | string | yes | Absolute path to the directory to create |
+| `create_parents` | boolean | no | Create parent directories if needed. Default: `true` |
+
+**Behavior:**
+1. Validate path (absolute, no null bytes), resolve symlinks on parent
+2. If already exists and is a directory → return `"Directory already exists: {path}"`
+3. If already exists but is a file → error `TOOL_EXECUTION_FAILED`
+4. Create directory (with parents if `create_parents=true`)
+
+**Error cases:** Path is a file → `TOOL_EXECUTION_FAILED`; parent missing with `create_parents=false` → `TOOL_EXECUTION_FAILED`.
+
+---
+
+### 4.9 MoveFile
+
+**Capability:** `File.Write`
+
+**Arguments:**
+
+| Argument | Type | Required | Description |
+|----------|------|----------|-------------|
+| `source` | string | yes | Absolute path to the file or directory to move |
+| `destination` | string | yes | Absolute path to move to |
+| `overwrite` | boolean | no | Replace destination if it already exists. Default: `false` |
+
+**Behavior:**
+1. Validate both paths (absolute, no null bytes), resolve symlinks
+2. Verify source exists (file or directory)
+3. If destination exists and `overwrite=false` → error
+4. Create destination parent directories if needed
+5. Move via `shutil.move()` (works cross-filesystem, handles files and directories)
+6. Return `"Moved: {source} → {destination}"`
+
+**File change tracking:** Records as delete at source + write at destination for patch preview.
+
+**Error cases:** Source not found → `FILE_NOT_FOUND`; destination exists without `overwrite=true` → `TOOL_EXECUTION_FAILED`.
+
+---
+
+### 4.10 ListDirectory
 
 **Capability:** `File.Read`
 
@@ -381,7 +475,7 @@ Content-Length: {contentLength}
 
 ---
 
-### 4.8 FindFiles
+### 4.11 FindFiles
 
 **Capability:** `File.Read`
 
@@ -400,7 +494,7 @@ Content-Length: {contentLength}
 
 ---
 
-### 4.9 GrepFiles
+### 4.12 GrepFiles
 
 **Capability:** `File.Read`
 
@@ -422,7 +516,7 @@ Content-Length: {contentLength}
 
 ---
 
-### 4.10 ViewImage
+### 4.13 ViewImage
 
 **Capability:** `File.Read`
 
@@ -443,7 +537,7 @@ Content-Length: {contentLength}
 
 ---
 
-### 4.11 FetchUrl
+### 4.14 FetchUrl
 
 **Capability:** `Network.Http`
 
@@ -466,7 +560,7 @@ Content-Length: {contentLength}
 
 ---
 
-### 4.12 WebSearch
+### 4.15 WebSearch
 
 **Capability:** `Search.Web` (new capability)
 
@@ -512,11 +606,14 @@ Full definitions for each built-in tool:
 | `WriteFile` | `File.Write` | Create or overwrite a file with the given content |
 | `DeleteFile` | `File.Delete` | Delete a file at the given path |
 | `EditFile` | `File.Write` | Edit a file by finding and replacing an exact text match |
+| `MultiEdit` | `File.Write` | Apply multiple find-and-replace edits to a single file atomically |
+| `CreateDirectory` | `File.Write` | Create a directory at the given absolute path |
+| `MoveFile` | `File.Write` | Move or rename a file or directory |
 | `ListDirectory` | `File.Read` | List files and directories at a given path |
 | `FindFiles` | `File.Read` | Find files matching a glob pattern recursively in a directory |
 | `GrepFiles` | `File.Read` | Search for a regex pattern across files in a directory |
 | `ViewImage` | `File.Read` | Read an image file and return it for visual analysis (multimodal) |
-| `RunCommand` | `Shell.Exec` | Execute a shell command and return stdout, stderr, and exit code |
+| `RunCommand` | `Shell.Exec` | Execute a shell command and return stdout, stderr, and exit code (requires description) |
 | `HttpRequest` | `Network.Http` | Make an HTTP request and return the response |
 | `FetchUrl` | `Network.Http` | Fetch a URL and extract readable text (HTML→markdown) |
 | `WebSearch` | `Search.Web` | Search the web using Tavily API |
