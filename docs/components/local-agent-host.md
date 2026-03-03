@@ -78,7 +78,7 @@ agent-host/
   llm/             — LLM Gateway streaming client (openai SDK), response models, error classifier
   thread/          — Message thread management, context compaction, token counting
   memory/          — Working memory: task tracker, plan, notes (injected per-turn)
-  skills/          — Skill definitions, loader (built-in/YAML/policy), executor
+  skills/          — Skill definitions, loader (built-in/markdown/policy), executor
   policy/          — Local Policy Enforcer (capability checks, path/command enforcement, risk assessment)
   budget/          — Token budget tracking (pre-check + record_usage)
   approval/        — Approval gate (asyncio Futures for user approval flow)
@@ -533,36 +533,58 @@ Each sub-agent receives:
 
 ### 4.9 Skills System
 
-The skills system (`skills/`) provides formalized multi-step workflows that the agent can invoke as tools.
+The skills system (`skills/`) provides formalized multi-step workflows that the agent can invoke as tools. Skills use **directory-based Markdown format** with progressive disclosure.
 
 **Skill Definition:**
 
 ```python
-@dataclass
+@dataclass(frozen=True)
 class SkillDefinition:
     name: str                              # e.g., "search_codebase"
     description: str                       # Shown to LLM as tool description
-    system_prompt_additions: str           # Extra instructions for the skill's sub-conversation
-    tool_subset: list[str] | None          # Restrict available tools (None = all)
-    input_schema: dict[str, Any]           # JSON Schema for skill parameters
+    prompt_content: str = ""               # SKILL.md body + supporting files (lazy-loaded)
+    source_dir: str | None = None          # Skill directory path (None for built-in)
+    tool_subset: list[str] | None = None   # Restrict available tools (None = all)
+    input_schema: dict[str, Any] = {}      # JSON Schema for skill parameters
+    max_steps: int = 15                    # Step limit for skill execution
+    disable_model_invocation: bool = False # True = LLM cannot auto-trigger
+    user_invocable: bool = True            # False = hidden from user menus
 ```
+
+**Skill Format:**
+
+Each skill is a directory containing a `SKILL.md` file with YAML frontmatter and a markdown body, plus optional supporting `.md` files:
+
+```
+~/.cowork/skills/deploy-staging/
+  SKILL.md          # Required: YAML frontmatter + markdown instructions
+  reference.md      # Optional: auto-appended on invocation
+  examples.md       # Optional: auto-appended on invocation
+```
+
+**Progressive Disclosure:**
+
+- **Stage 1 (metadata):** At session start, only frontmatter is parsed (~100 tokens per skill). Skills are registered as tools with the LLM.
+- **Stage 2 (full content):** On invocation, `SkillLoader.load_skill_content()` reads the full `SKILL.md` body + supporting `.md` files. `$ARGUMENTS` substitution is applied.
 
 **Skill Loading:**
 
 `SkillLoader` discovers skills from three sources (in priority order):
-1. **Built-in Python** — hardcoded skills (e.g., `search_codebase`, `edit_and_verify`, `debug_error`)
-2. **Workspace YAML** — `{workspace_dir}/.cowork/skills/*.yaml` files authored by users
+1. **Built-in markdown** — embedded markdown strings parsed with the same frontmatter parser
+2. **User directories** — `~/.cowork/skills/<name>/SKILL.md` authored by users
 3. **Policy bundle** — skills provided via the policy bundle from the Policy Service
 
 **Skill Execution:**
 
 `SkillExecutor` runs each skill as a focused sub-conversation via `AgentLoop`:
-1. Create a fresh `MessageThread` with the skill's `system_prompt_additions` appended to the system prompt
-2. Restrict available tools to `tool_subset` (if specified)
-3. Run the agent loop with the skill's input as the user prompt
-4. Return the agent's final text response as the tool result
+1. Stage 2: Load full `prompt_content` via `SkillLoader.load_skill_content()`
+2. Apply `$ARGUMENTS` substitution to `prompt_content`
+3. Create a fresh `MessageThread` with the skill's `prompt_content` in the system prompt
+4. Restrict available tools to `tool_subset` (if specified)
+5. Run the agent loop with the skill's input as the user prompt
+6. Return the agent's final text response as the tool result
 
-Skills are registered as `Skill_{name}` tools in `AgentToolHandler` and appear alongside regular tools in the LLM's tool list.
+Skills are registered as `Skill_{name}` tools in `AgentToolHandler`. Skills with `disable_model_invocation=True` are excluded from the LLM's tool list but can still be invoked explicitly.
 
 ---
 
