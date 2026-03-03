@@ -397,7 +397,12 @@ All audit and telemetry events share one envelope. The `component` field identif
   "component": "LocalAgentHost",
   "boundedContext": "AgentExecution",
   "severity": "info",
-  "payload": {}
+  "payload": {
+    "toolCallId": "call_abc",
+    "toolName": "ReadFile",
+    "status": "success",
+    "toolType": "tool"
+  }
 }
 ```
 

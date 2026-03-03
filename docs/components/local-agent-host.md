@@ -495,11 +495,14 @@ Steps:
 
 The agent modifies working memory via three internal tools that are handled by `AgentToolHandler` without going through the PolicyEnforcer:
 
-| Tool | Purpose |
-|------|---------|
-| `TaskTracker` | Create, update status, and list tasks |
-| `CreatePlan` | Set a goal with ordered steps |
-| `SpawnAgent` | Spawn a sub-agent (see [Section 4.8](#48-sub-agents)) |
+| Tool | Purpose | `toolType` |
+|------|---------|------------|
+| `TaskTracker` | Create, update status, and list tasks | `agent` |
+| `CreatePlan` | Set a goal with ordered steps | `agent` |
+| `SpawnAgent` | Spawn a sub-agent (see [Section 4.8](#48-sub-agents)) | `sub_agent` |
+| `Skill_*` | Execute a formalized multi-step skill workflow | `skill` |
+
+Agent-internal tools now emit `tool_requested` and `tool_completed` events (with the appropriate `toolType` classification), enabling the Desktop App to display them as distinct tool call cards. They still bypass PolicyEnforcer — events are informational only.
 
 **Persistence:** Working memory is serialized into `SessionCheckpoint.working_memory` via `to_checkpoint()`/`from_checkpoint()`. On session resume, the full working memory state (tasks, plan, notes) is restored.
 
@@ -609,8 +612,9 @@ Each message carries:
 On each LLM call, the `thread/` module assembles the request payload:
 
 1. **System prompt** — static instructions for the agent persona, tool usage guidance, workspace context (project paths, OS family). Built once at session start, reused across all LLM calls.
-2. **Conversation history** — all user, assistant, and tool messages accumulated so far (subject to context window management — see [Section 5.4](#54-context-window-management)).
-3. **Tool definitions** — the set of tools available to the agent, derived from the policy bundle's capabilities. Only tools with granted capabilities are included. Formatted per the LLM provider's expected schema.
+2. **User message with workspace prefix** — each user prompt is prefixed with `[Workspace: /path/to/dir]\n\n{user_prompt}` when a workspace directory is known. This ensures the LLM always has access to the working directory even after context compaction drops earlier system messages. The original prompt (without prefix) is used for session history uploads.
+3. **Conversation history** — all user, assistant, and tool messages accumulated so far (subject to context window management — see [Section 5.4](#54-context-window-management)).
+4. **Tool definitions** — the set of tools available to the agent, derived from the policy bundle's capabilities. Only tools with granted capabilities are included. Formatted per the LLM provider's expected schema.
 
 ### 5.3 Token Counting
 
@@ -1141,13 +1145,15 @@ The `events/` module provides a fire-and-forget event emitter. Events are emitte
 | `text_chunk` | As each text chunk arrives from the LLM stream | `text` (the chunk content) |
 | `llm_request_started` | Before sending to LLM Gateway | `model`, `estimatedInputTokens` |
 | `llm_request_completed` | After full LLM response received | `model`, `inputTokens`, `outputTokens`, `latencyMs` |
-| `tool_requested` | Before dispatching a tool call | `toolName`, `capability` |
-| `tool_completed` | After tool result received | `toolName`, `status`, `latencyMs` |
+| `tool_requested` | Before dispatching a tool call (including agent-internal tools) | `toolName`, `capability`, `arguments`, `toolType` |
+| `tool_completed` | After tool result received (including agent-internal tools) | `toolName`, `status`, `toolType`, `result`, `error`, `latencyMs` |
 | `approval_requested` | When approval is needed | `approvalId`, `riskLevel` |
 | `approval_resolved` | After user responds | `approvalId`, `decision`, `latencyMs` |
 | `policy_expired` | When policy bundle expiry is detected | — |
 
 All events carry the full ID chain: `workspaceId`, `sessionId`, `taskId`, `stepId`.
+
+**`toolType` values:** `"tool"` (external tools via ToolRouter), `"agent"` (TaskTracker, CreatePlan), `"sub_agent"` (SpawnAgent), `"skill"` (Skill_* workflows). Default is `"tool"` for backward compatibility.
 
 > Event envelope schema: [architecture.md, Section 6.3](../architecture.md#63-event-envelope--any-component--audit-service--telemetry-service)
 

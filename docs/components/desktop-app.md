@@ -216,7 +216,7 @@ The primary view during an active session. Shows the live conversation and agent
 |---------|--------|-------------|
 | Message list | `state/` — accumulated from `SessionEvent` notifications | Scroll, select to copy |
 | Streaming text | `SessionEvent` with `eventType: "text_chunk"` | Renders incrementally as chunks arrive |
-| Tool call cards | `SessionEvent` with `eventType: "tool_requested"` / `"tool_completed"` | Shows tool name, arguments, status, expand for output |
+| Tool call cards | `SessionEvent` with `eventType: "tool_requested"` / `"tool_completed"` | Shows category icon, tool name, category badge, status badge, collapsible arguments, and live result output. Categories: File (`FileText`, blue), Shell (`Terminal`, amber), Network (`Globe`, purple), Agent (`Brain`, slate), Sub-Agent (`GitFork`, indigo), Skill (`Sparkles`, emerald). Category resolved from `toolType` field first, then inferred from `toolName` for backward compat. |
 | Step counter | `SessionEvent` with `eventType: "step_started"` | Shows `stepCount / maxSteps` |
 | Step limit warning | `SessionEvent` with `eventType: "step_limit_approaching"` | Highlighted counter when 80% reached |
 | Prompt input | User types and submits | Sends `StartTask` JSON-RPC |
