@@ -194,6 +194,21 @@ Called by the Desktop App to show the conversation history list for a project. S
 
 ---
 
+### DELETE /workspaces/{workspaceId}/sessions/{sessionId} — Delete Session History
+
+Called by the Desktop App to delete all artifacts for a specific session within a workspace. Used for sidebar "Delete session" functionality.
+
+**Response:** `204 No Content`
+
+**Behavior:**
+- Queries all artifacts for the session using the `sessionId-type-index` GSI
+- Deletes artifact metadata from DynamoDB first (metadata-first ordering)
+- Best-effort cleanup of S3 objects (logs failures but does not raise)
+- Returns 204 even if no artifacts exist for the session (idempotent)
+- Returns 404 if the workspace does not exist
+
+---
+
 ## Workspace Lifecycle
 
 ```
