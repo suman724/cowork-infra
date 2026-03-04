@@ -970,50 +970,67 @@ The Local State Store is a **transient crash-recovery buffer**. It is NOT canoni
 
 ```json
 {
-  "checkpointVersion": "1.0",
-  "sessionId": "sess_789",
-  "workspaceId": "ws_456",
-  "tenantId": "tenant_abc",
-  "userId": "user_123",
-  "sessionStatus": "SESSION_RUNNING",
-  "task": {
-    "taskId": "task_001",
-    "prompt": "Refactor the API client and add tests",
-    "status": "running",
-    "stepCount": 3,
-    "maxSteps": 40
-  },
-  "stepCursor": "step_003",
-  "thread": [
+  "session_id": "sess_789",
+  "workspace_id": "ws_456",
+  "tenant_id": "tenant_abc",
+  "user_id": "user_123",
+  "token_input_used": 8540,
+  "token_output_used": 4000,
+  "session_messages": [
     {
-      "messageId": "msg_001",
-      "role": "system",
-      "content": "...",
-      "tokenCount": 150,
-      "timestamp": "2026-02-21T15:00:00Z"
+      "messageId": "task_001-user",
+      "sessionId": "sess_789",
+      "taskId": "task_001",
+      "role": "user",
+      "content": "Refactor the API client and add tests"
     }
   ],
-  "sessionTokensUsed": 12540,
-  "policyBundleVersion": "2026-02-21.1",
-  "checkpointedAt": "2026-02-21T15:10:00Z"
+  "thread": [
+    {
+      "role": "system",
+      "content": "..."
+    },
+    {
+      "role": "user",
+      "content": "Refactor the API client and add tests"
+    }
+  ],
+  "working_memory": {
+    "tasks": [{"id": "t1", "status": "in_progress", "content": "Refactor API client"}],
+    "notes": []
+  },
+  "checkpointed_at": "2026-02-21T15:10:00Z",
+  "active_task_id": "task_001",
+  "active_task_prompt": "Refactor the API client and add tests",
+  "active_task_step": 3,
+  "active_task_max_steps": 40,
+  "last_workspace_sync_step": 0
 }
 ```
 
 | Field | Purpose |
 |-------|---------|
-| `checkpointVersion` | Schema version for forward compatibility |
-| `sessionId`, `workspaceId`, `tenantId`, `userId` | Identify the session for resume |
-| `task` | Current task state (needed to reconstruct task-level state machine) |
-| `stepCursor` | Last completed step ID — on resume, execution resumes from the step after this |
-| `thread` | Full message thread at checkpoint time |
-| `sessionTokensUsed` | Cumulative token count (needed to enforce budget on resume) |
-| `policyBundleVersion` | So Session Service can detect if policy changed since the checkpoint |
+| `session_id`, `workspace_id`, `tenant_id`, `user_id` | Identify the session for resume |
+| `token_input_used`, `token_output_used` | Cumulative token counts (needed to enforce budget on resume) |
+| `session_messages` | Cumulative ConversationMessage dicts for history upload |
+| `thread` | Full MessageThread state at checkpoint time |
+| `working_memory` | WorkingMemory state (tasks, plan, notes) |
+| `checkpointed_at` | ISO 8601 timestamp of checkpoint write |
+| `active_task_id` | Non-null when a task is in progress (null after task completes) |
+| `active_task_prompt` | The user prompt for the in-progress task |
+| `active_task_step` | Last completed step number for the in-progress task |
+| `active_task_max_steps` | Max steps configured for the in-progress task |
+| `last_workspace_sync_step` | Last step that triggered a periodic workspace sync |
+
+All `active_task_*` and `last_workspace_sync_step` fields have backward-compatible defaults (null/0) so old checkpoints load without error.
 
 ### 9.3 Write Timing
 
-- Checkpoint is written **after each completed step** — after tool results are added to the thread and before the next LLM call
+- Checkpoint is written **after each completed step** via the `on_step_complete` callback — after tool results are added to the thread and before the next LLM call
 - Write is **synchronous** relative to the loop — the next step does not begin until the checkpoint is flushed to disk
-- Write is **atomic** — write to a temp file, then rename to the checkpoint path. This prevents corruption from partial writes if the process is killed mid-write.
+- Write is **atomic** — write to a temp file, then rename to the checkpoint path. This prevents corruption from partial writes if the process is killed mid-write
+- **Periodic workspace sync** — every N steps (configurable via `WORKSPACE_SYNC_INTERVAL`, default 5, 0 = disabled), session history is uploaded to the Workspace Service for machine-level durability. Sync is best-effort; failures are logged but do not affect the loop
+- At **task completion** (finally block), checkpoint is written with `active_task_id=null` to mark the task as complete
 
 ### 9.4 Storage Location
 
@@ -1030,18 +1047,28 @@ Only one checkpoint file exists at a time (one session per process). The file is
 sequenceDiagram
   participant Process as agent-runtime process
   participant FS as Local Filesystem
+  participant WS as Workspace Service
   participant SS as Session Service
 
   Process->>FS: Check checkpoints directory
-  FS-->>Process: checkpoint file found
-  Process->>FS: Read and parse checkpoint
-  FS-->>Process: Checkpoint data
-  Process->>Process: Validate checkpointVersion
-  Process->>SS: POST /sessions/{sessionId}/resume<br/>(checkpointCursor: step_003)
+  alt Checkpoint found
+    FS-->>Process: checkpoint file
+    Process->>FS: Read and parse checkpoint
+    FS-->>Process: Checkpoint data
+    Process->>Process: Restore: token budget, thread,<br/>working memory, session messages
+    alt active_task_id is set
+      Process->>Process: Store incompleteTask for resume UI
+    end
+  else No checkpoint (corrupt/missing)
+    Process->>WS: get_session_history (fallback)
+    WS-->>Process: ConversationMessages (best-effort)
+    Note over Process: Thread, working memory, token budget<br/>not recoverable from workspace
+  end
+
+  Process->>SS: POST /sessions/{sessionId}/resume
   SS-->>Process: Refreshed policy bundle + session metadata
   Process->>Process: Validate refreshed policy bundle
-  Process->>Process: Reconstruct in-memory state:<br/>thread, token counts, task state
-  Process->>Process: Resume agent loop from step after stepCursor
+  Process->>Process: Resume or start fresh
 ```
 
 ### 9.6 Cleanup
@@ -1055,9 +1082,10 @@ sequenceDiagram
 If the checkpoint file is corrupt or unreadable:
 
 1. Validate JSON structure — if parse fails, the file is corrupt
-2. Validate `checkpointVersion` — if unknown, the file is from an incompatible version
-3. **On corruption:** delete the file, log the error, notify the Desktop App that crash recovery failed
-4. The user can start a fresh session — the Workspace Service still has the `session_history` artifact from the last completed task
+2. **On corruption:** delete the file, log the error
+3. **Workspace fallback:** attempt to fetch conversation history from the Workspace Service via `get_session_history()`. This recovers cumulative conversation messages from prior completed tasks and any periodic mid-task syncs
+4. **What workspace fallback cannot recover:** thread state (raw LLM message format), working memory, token budget — those are only in local checkpoints. The session continues with conversation context but the LLM won't see the raw thread history from the in-progress task
+5. If workspace fallback also fails, the user starts a fresh session
 
 ---
 
