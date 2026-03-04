@@ -539,6 +539,13 @@ The `memory/` module also provides persistent memory that survives across sessio
 
 **Tools:** `SaveMemory`, `RecallMemory`, `ListMemories`, `DeleteMemory` — handled by `AgentToolHandler`, bypassing PolicyEnforcer.
 
+**Auto-Indexing:** When a topic file is saved or deleted, `PersistentMemory` automatically maintains an index section in `MEMORY.md` so that `render_memory_context()` always returns awareness of existing topic files — even when `MEMORY.md` was not manually written by the agent. The index section is delimited by `<!-- AUTO-INDEX:START -->` / `<!-- AUTO-INDEX:END -->` markers and lists each topic file with its size. Key behaviors:
+- Saving a topic file adds/updates its entry in the auto-index section.
+- Deleting a topic file removes its entry. If no entries remain, the auto-index section is removed entirely.
+- Saving `MEMORY.md` directly does **not** trigger auto-indexing (only topic files do).
+- Manual content in `MEMORY.md` outside the markers is always preserved.
+- Auto-index updates are best-effort — failures are logged but do not fail the underlying save/delete operation.
+
 **Crash Recovery:** `SessionCheckpoint.workspace_dir` is persisted so that `MemoryManager` can be re-created on session resume even when the workspace hint is lost.
 
 ### 4.8 Sub-Agents
