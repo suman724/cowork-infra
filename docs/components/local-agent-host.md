@@ -77,7 +77,7 @@ agent-host/
   loop/            — Core agent loop, tool executor, agent-internal tools, error recovery, sub-agents
   llm/             — LLM Gateway streaming client (openai SDK), response models, error classifier
   thread/          — Message thread management, context compaction, token counting
-  memory/          — Working memory: task tracker, plan, notes (injected per-turn)
+  memory/          — Working memory (task tracker, plan, notes) + persistent memory (project instructions, auto-memory)
   skills/          — Skill definitions, loader (built-in/markdown/policy), executor
   policy/          — Local Policy Enforcer (capability checks, path/command enforcement, risk assessment)
   budget/          — Token budget tracking (pre-check + record_usage)
@@ -500,12 +500,46 @@ The agent modifies working memory via three internal tools that are handled by `
 |------|---------|------------|
 | `TaskTracker` | Create, update status, and list tasks | `agent` |
 | `CreatePlan` | Set a goal with ordered steps | `agent` |
+| `SaveMemory` | Write/update a persistent memory file | `agent` |
+| `RecallMemory` | Read a specific memory topic file | `agent` |
+| `ListMemories` | List all persistent memory files with sizes | `agent` |
+| `DeleteMemory` | Remove an outdated memory topic file | `agent` |
 | `SpawnAgent` | Spawn a sub-agent (see [Section 4.8](#48-sub-agents)) | `sub_agent` |
 | `Skill_*` | Execute a formalized multi-step skill workflow | `skill` |
 
 Agent-internal tools now emit `tool_requested` and `tool_completed` events (with the appropriate `toolType` classification), enabling the Desktop App to display them as distinct tool call cards. They still bypass PolicyEnforcer — events are informational only.
 
 **Persistence:** Working memory is serialized into `SessionCheckpoint.working_memory` via `to_checkpoint()`/`from_checkpoint()`. On session resume, the full working memory state (tasks, plan, notes) is restored.
+
+### 4.7.1 Persistent Memory
+
+The `memory/` module also provides persistent memory that survives across sessions. This is a two-tier system:
+
+**Tier 1 — Project Instructions (read-only):**
+- `ProjectInstructionsLoader` loads `COWORK.md` and `COWORK.local.md` from the workspace directory (no ancestor walk).
+- Injected into the static system prompt at session init.
+
+**Tier 2 — Auto-Memory (read-write):**
+- `PersistentMemory` manages AI-writable `.md` files in `~/.cowork/projects/<hash>/memory/`.
+- `<hash>` is SHA-256 (first 16 hex chars) of the resolved workspace path.
+- `MEMORY.md` is the index file, loaded automatically every turn (capped at 200 lines).
+- Topic files (e.g., `debugging.md`, `patterns.md`) are read on-demand via `RecallMemory`.
+
+**Resource Limits:**
+- Max file size: 100 KB per file (configurable via `MEMORY_MAX_FILE_SIZE`)
+- Max file count: 50 files per workspace (configurable via `MEMORY_MAX_FILE_COUNT`)
+- Max filename length: 64 characters
+- `MEMORY.md` cannot be deleted (only overwritten)
+
+**Context Injection Order:**
+1. Static system prompt (includes project instructions and memory guidance)
+2. Persistent memory (`MEMORY.md` content, re-read each turn)
+3. Working memory (task tracker, plan, notes)
+4. Conversation history
+
+**Tools:** `SaveMemory`, `RecallMemory`, `ListMemories`, `DeleteMemory` — handled by `AgentToolHandler`, bypassing PolicyEnforcer.
+
+**Crash Recovery:** `SessionCheckpoint.workspace_dir` is persisted so that `MemoryManager` can be re-created on session resume even when the workspace hint is lost.
 
 ### 4.8 Sub-Agents
 
