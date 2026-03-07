@@ -337,7 +337,34 @@ flowchart TD
 
 ### 4.2 Parallel Tool Execution
 
-When the LLM returns multiple tool calls in a single response, they are executed in parallel.
+When the LLM returns multiple tool calls in a single response, `ToolExecutor` partitions them into ordered groups. Calls within a group run concurrently via `asyncio.gather()`; groups are executed sequentially to preserve dependency ordering.
+
+**Parallelization rules:**
+
+| Tool Category | Parallelizable? |
+|--------------|-----------------|
+| ReadFile, ListDirectory, FindFiles, GrepFiles, ViewImage, FetchUrl, WebSearch | Always — safe read-only operations |
+| WriteFile, EditFile, MultiEdit | Only if targeting different file paths |
+| DeleteFile, CreateDirectory, MoveFile | Never — filesystem structure changes |
+| RunCommand, ExecuteCode | Never — unpredictable side effects |
+| HttpRequest | Never — could be POST/PUT/DELETE |
+
+**Grouping algorithm (`_partition_parallel_groups`):**
+
+```
+Input:  [ReadFile("/a"), ReadFile("/b"), RunCommand("ls"), ReadFile("/c")]
+Output: [
+  Group 1: [ReadFile("/a"), ReadFile("/b")]  ← parallel (asyncio.gather)
+  Group 2: [RunCommand("ls")]                ← serial
+  Group 3: [ReadFile("/c")]                  ← serial (single item)
+]
+```
+
+1. Iterate tool calls in order, accumulating parallelizable calls into a batch
+2. When hitting a non-parallelizable call, flush the current batch as a group, then emit the serial call as its own group
+3. Special case: multiple File.Write calls to *different* paths can share a batch; same-path writes are serialized
+
+**Agent-internal tools** (TaskTracker, CreatePlan, EnterPlanMode, etc.) are always executed sequentially in `ReactLoop._execute_tools()` since they mutate shared WorkingMemory state.
 
 ```
 function processToolCalls(toolCalls, stepId):
@@ -347,9 +374,16 @@ function processToolCalls(toolCalls, stepId):
     policyResult = policyEnforcer.check(call)
     checkedCalls.append({ call, policyResult })
 
-  // Phase 2: Approval gates (concurrent — each waits independently)
-  // Phase 3: Execution (concurrent — approved tools run in parallel)
-  results = parallelExecute(checkedCalls)
+  // Phase 2: Partition into parallel groups
+  groups = partitionParallelGroups(checkedCalls)
+
+  // Phase 3: Execute groups sequentially, calls within each group concurrently
+  results = []
+  for each group in groups:
+    if group.length == 1:
+      results.append(executeSingle(group[0]))
+    else:
+      results.extend(asyncio.gather(*[executeSingle(c) for c in group]))
 
   // Results are returned in the original tool call order (stable ordering)
   return results ordered by original index
@@ -413,6 +447,75 @@ The LLM signals task completion by returning a response with **text content only
 | `max_tokens` | None | LLM was truncated — continue loop to get more output |
 | `max_tokens` | Present | Execute tools, continue loop |
 | `tool_use` | Present | Execute tools, continue loop |
+
+**Important:** The natural termination check (no tool calls + stop reason) runs **before** the hard step limit check. This allows the verification phase (see below) to extend the step budget before the limit is enforced.
+
+#### 4.4.1 Verification Phase
+
+When the agent signals task completion and verification is enabled, a **self-verification prompt** is injected before the task is finalized. This gives the LLM a chance to review its own work.
+
+**Configuration:** `VerificationConfig` (`loop/verification.py`):
+- `enabled: bool = True` — global toggle (env var `VERIFICATION_ENABLED`)
+- `max_verify_steps: int = 3` — additional steps budget for verification (env var `VERIFICATION_MAX_STEPS`)
+- `custom_instructions: str = ""` — task-specific verification instructions
+
+**Flow:**
+
+1. Agent signals completion (no tool calls, `stop_reason="stop"`)
+2. If verification is enabled and not yet injected:
+   - Inject verification prompt as system message into the thread
+   - Extend `max_steps` by `max_verify_steps`
+   - Emit `verification_started` event
+   - `continue` — re-enter loop so the LLM can verify
+3. On subsequent completion (no tool calls again):
+   - Emit `verification_completed(passed=true)` event
+   - Return `TASK_COMPLETED`
+4. If the agent uses tools during verification (e.g., re-reads files, finds and fixes issues), it continues until either confirming completion or exhausting the extended step budget
+
+**Verification prompt sources (priority order):**
+1. `taskOptions.skipVerification: true` → skip entirely
+2. `taskOptions.verifyInstructions: str` → custom per-task instructions
+3. COWORK.md `## Verification` section → per-workspace instructions
+4. Default prompt → generic check (re-read request, check files, spot-check results)
+
+**Default prompt:**
+```
+VERIFICATION: Before confirming completion, review your work:
+1. Re-read the original request and compare with what you delivered
+2. Check any files you created or modified — verify content is correct
+3. If you performed calculations or data transformations, spot-check the results
+4. Confirm nothing was missed from the original request
+
+Use read-only tools (ReadFile, ListDirectory, etc.) to verify.
+If everything is correct, confirm you are done.
+If you find issues, fix them before completing.
+```
+
+#### 4.4.2 Plan Mode
+
+Plan mode is a **runtime state** that restricts the agent to read-only tools for exploration and planning before making changes.
+
+**Three entry paths:**
+
+| Entry | Mechanism | Behavior |
+|-------|-----------|----------|
+| **User-explicit** | `taskOptions.planOnly: true` in StartTask | Hard lock — agent cannot exit plan mode |
+| **LLM-initiated** | Agent calls `EnterPlanMode` tool | Soft — agent enters/exits plan mode autonomously |
+| **System prompt guided** | Instructions in system prompt | Encourages LLM to use plan mode for complex tasks |
+
+**State transitions:** `EXECUTING` ↔ `PLANNING` (via `EnterPlanMode` / `ExitPlanMode` agent tools). `planOnly=true` starts in `PLANNING` and prevents transition to `EXECUTING`.
+
+**Tool restrictions in plan mode:**
+
+Allowed: `ReadFile`, `ListDirectory`, `FindFiles`, `GrepFiles`, `ViewImage`, `FetchUrl`, `WebSearch` + all agent-internal tools
+
+Blocked: `WriteFile`, `EditFile`, `MultiEdit`, `DeleteFile`, `CreateDirectory`, `MoveFile`, `RunCommand`, `ExecuteCode`, `HttpRequest`
+
+Blocked tools are removed from `get_tool_definitions()` (LLM never sees them). If called anyway, `ToolExecutor` returns `PLAN_MODE_RESTRICTED` denial.
+
+**Agent tools:** `EnterPlanMode` (no args → `{"status": "success", "planMode": true}`) and `ExitPlanMode` (no args → `{"status": "success", "planMode": false}`). Both defined in `AgentToolHandler` (`loop/agent_tools.py`).
+
+**Events:** `plan_mode_changed` with `planMode: bool` and `source: "agent" | "user"` payload.
 
 ### 4.5 Cancellation Model
 
@@ -668,12 +771,27 @@ Each message carries:
 
 ### 5.2 Thread Construction for LLM Requests
 
-On each LLM call, the `thread/` module assembles the request payload:
+On each LLM call, `ReactLoop._build_messages()` assembles the request payload. Message ordering is **optimized for LLM provider prompt caching** — stable content at the front, volatile content at the end. LLM providers cache the longest matching prefix of the message list; any change in the prefix invalidates everything after it.
 
-1. **System prompt** — static instructions for the agent persona, tool usage guidance, workspace context (project paths, OS family). Built once at session start, reused across all LLM calls.
-2. **User message with workspace prefix** — each user prompt is prefixed with `[Workspace: /path/to/dir]\n\n{user_prompt}` when a workspace directory is known. This ensures the LLM always has access to the working directory even after context compaction drops earlier system messages. The original prompt (without prefix) is used for session history uploads.
-3. **Conversation history** — all user, assistant, and tool messages accumulated so far (subject to context window management — see [Section 5.4](#54-context-window-management)).
-4. **Tool definitions** — the set of tools available to the agent, derived from the policy bundle's capabilities. Only tools with granted capabilities are included. Formatted per the LLM provider's expected schema.
+**Ordering (stable prefix first, volatile last):**
+
+```
+[1. System prompt]                    ← STABLE (set at session start, never changes mid-task)
+[2. Persistent memory (MEMORY.md)]    ← SEMI-STABLE (changes only on SaveMemory calls)
+[3. Conversation history]             ← GROWS (prefix is stable, new messages appended)
+[4. Working memory]                   ← VOLATILE (changes every turn — at the END)
+[5. Error recovery prompts]           ← CONDITIONAL (only when triggered — at the very end)
+```
+
+Assembly steps:
+1. **System prompt** — static instructions for the agent persona, tool usage guidance, workspace context. Built once at session start, reused across all LLM calls.
+2. **Persistent memory** — MEMORY.md content, injected at position 1 (right after system prompt). Semi-stable — only changes when the agent calls SaveMemory.
+3. **Conversation history** — all user, assistant, and tool messages (subject to context window management — see [Section 5.4](#54-context-window-management)). Compacted to fit within token budget minus injection overhead.
+4. **Working memory** — task tracker, plan, notes. Appended at the **end** of the message list (volatile — changes every turn, placed last to avoid breaking the cache prefix).
+5. **Error recovery prompts** — loop-break and reflection prompts (conditional, at the very end).
+6. **Tool definitions** — passed as a separate `tools` parameter (not in the message list). Derived from the policy bundle's capabilities; filtered for plan mode if active.
+
+**User message workspace prefix:** Each user prompt is prefixed with `[Workspace: /path/to/dir]\n\n{user_prompt}` when a workspace directory is known. This ensures the LLM always has access to the working directory even after context compaction drops earlier system messages.
 
 ### 5.3 Token Counting
 
@@ -711,20 +829,40 @@ When the thread exceeds `llmPolicy.maxInputTokens`, the `thread/` module applies
 4. If the thread exceeds the budget after including system prompt + tools + recency window: drop the oldest messages from the middle of the thread
 5. Insert a `[Earlier conversation truncated — {count} messages removed]` marker at the truncation point
 
-**Phase 1 implementation (`DropOldestCompactor`):**
+**Compaction strategies (`thread/compactor.py`):**
 
-The `thread/compactor.py` module implements the Phase 1 strategy:
+Two strategies available, configured via `COMPACTION_STRATEGY` env var (default: `"hybrid"`):
 
-- **Trigger condition:** `thread.total_token_estimate() > max_context_tokens * 0.9` (checked before each LLM call)
+**1. `DropOldestCompactor`** — simple, no LLM cost:
+
 - **Recency window:** Configurable via `RECENCY_WINDOW` env var (default: 20 messages)
 - **Algorithm:** Keep system prompt (first message) + last N messages (recency window), drop everything in between
 - **Marker insertion:** `{"role": "system", "content": "[... {dropped} earlier messages omitted ...]"}` inserted at the truncation point
+
+**2. `HybridCompactor`** — observation masking + optional LLM summarization:
+
+Two-phase approach that preserves more context:
+
+*Phase 1 — Observation Masking* (no LLM call, always applied first):
+- Replace old tool *result* messages (outside recency window) with one-line summaries
+- Preserve assistant messages (the LLM needs to see *what* it decided to do)
+- Example: `{"role": "tool", "content": "{200 lines of code}"}` → `[ReadFile: success, 200 lines / 5432 chars]`
+- Typically achieves 50-70% compression (tool outputs are the largest messages)
+- Masking heuristics: success → `[ToolName: status, N lines / N chars]`, failed → `[ToolName: failed — error message]`, denied → `[ToolName: denied]`
+
+*Phase 2 — LLM Summarization* (only when masking isn't enough):
+- When masked messages still exceed the token budget, generate a structured summary via LLM call
+- Summary replaces the oldest masked messages with a single system message
+- Summary is pre-computed asynchronously (`precompute_summary()`) before the synchronous `compact()` is called
+- Cached and reused until more messages accumulate
+- Configurable: disabled with `COMPACTION_LLM_SUMMARY=false` or `mask_only=True`
+
+*Fallback:* If masking isn't enough and no cached summary exists, falls back to `DropOldestCompactor` behavior.
+
+**Common behavior:**
+- **Trigger condition:** `thread.total_token_estimate() > max_context_tokens * 0.9` (checked before each LLM call)
 - **Event emission:** `context_compacted` event with `messagesDropped`, `tokensBefore`, `tokensAfter` payload — notifies the Desktop App that context was reduced
 - **Post-compaction:** The agent continues normally with the reduced thread. Working memory (injected per-turn) is not affected by compaction.
-
-**Phase 2+ — LLM-based summarization:**
-
-Replace the dropped messages with a condensed summary generated by an LLM call. More expensive (extra LLM call, tokens from the session budget) but preserves context better.
 
 ### 5.5 Serialization
 
@@ -1264,6 +1402,9 @@ The `events/` module provides a fire-and-forget event emitter. Events are emitte
 | `approval_requested` | When approval is needed | `approvalId`, `riskLevel` |
 | `approval_resolved` | After user responds | `approvalId`, `decision`, `latencyMs` |
 | `policy_expired` | When policy bundle expiry is detected | — |
+| `plan_mode_changed` | When agent enters/exits plan mode | `planMode`, `source` (`"agent"` or `"user"`) |
+| `verification_started` | When verification phase begins after agent signals completion | — |
+| `verification_completed` | When verification phase finishes | `passed` (boolean) |
 
 All events carry the full ID chain: `workspaceId`, `sessionId`, `taskId`, `stepId`.
 
@@ -1281,7 +1422,7 @@ All events carry the full ID chain: `workspaceId`, `sessionId`, `taskId`, `stepI
 | Question | Context | Recommendation |
 |----------|---------|----------------|
 | Force cancellation of long-running tools | A shell command could block cancellation indefinitely | Defer to Phase 2 — add a configurable hard timeout that kills the tool process |
-| Context window summarization | Drop-oldest loses context; LLM summarization costs tokens | Phase 1: drop-oldest. Phase 2: evaluate LLM summarization cost vs. benefit |
+| Context window summarization | Drop-oldest loses context; LLM summarization costs tokens | **Implemented:** `HybridCompactor` with observation masking + optional LLM summarization. See [Section 5.4](#54-context-window-management) |
 | Shell command argument inspection | `rm -rf /` and `rm temp.txt` both match base command `rm` | Current model is sufficient for Phase 1 (allowlisted commands are trusted). Phase 2: consider argument patterns |
 | Multi-model selection strategy | `llmPolicy.allowedModels` can list multiple models | Phase 1: always use first model. Phase 2: selection based on task complexity or user preference |
 | Approval timeout behavior | 5 min timeout → deny. Should it pause the session instead? | Keep deny as default — the LLM can adjust. Add configurable timeout in policy bundle later |
