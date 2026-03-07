@@ -74,11 +74,11 @@ flowchart LR
 agent-host/
   server/          — JSON-RPC 2.0 server (parse, serialize, dispatch, handlers)
   session/         — Session/Workspace HTTP clients, checkpoint manager, SessionManager
-  loop/            — Core agent loop, tool executor, agent-internal tools, error recovery, sub-agents
+  loop/            — LoopRuntime (infrastructure) + LoopStrategy protocol (orchestration), agent-internal tools, error recovery
   llm/             — LLM Gateway streaming client (openai SDK), response models, error classifier
   thread/          — Message thread management, context compaction, token counting
   memory/          — Working memory (task tracker, plan, notes) + persistent memory (project instructions, auto-memory)
-  skills/          — Skill definitions, loader (built-in/markdown/policy), executor
+  skills/          — Skill definitions, loader (built-in/markdown/policy)
   policy/          — Local Policy Enforcer (capability checks, path/command enforcement, risk assessment)
   budget/          — Token budget tracking (pre-check + record_usage)
   approval/        — Approval gate (asyncio Futures for user approval flow)
@@ -240,6 +240,8 @@ Step-by-step algorithm for `Shutdown`:
 ---
 
 ## 4. Agent Loop
+
+The loop layer is decomposed into two parts: **`LoopRuntime`** (`loop/loop_runtime.py`) provides infrastructure (LLM client, tool routing, policy enforcement, budget tracking, checkpointing, event emission), while **`LoopStrategy`** (`loop/strategy.py`) is a protocol that defines how a single task is orchestrated. The default strategy is **`ReactLoop`** (`loop/react_loop.py`), which implements the classic ReAct (Reason + Act) cycle. `LoopRuntime` also handles sub-agent spawning and skill execution by constructing child `LoopRuntime` instances. See [loop-strategy.md](loop-strategy.md) for the full design.
 
 ### 4.1 Step Execution Algorithm
 
@@ -562,7 +564,7 @@ The `memory/` module also provides persistent memory that survives across sessio
 
 ### 4.8 Sub-Agents
 
-The `SubAgentManager` (`loop/sub_agents.py`) allows the main agent to spawn focused sub-agents for independent subtasks via the `SpawnAgent` tool.
+Sub-agent spawning is handled by `LoopRuntime.spawn_sub_agent()` (`loop/loop_runtime.py`). The main agent spawns focused sub-agents for independent subtasks via the `SpawnAgent` tool.
 
 **Isolation model:**
 
@@ -570,21 +572,23 @@ Each sub-agent receives:
 - A fresh `MessageThread` (no access to parent conversation history)
 - The parent's `ToolRouter` (same tool execution pipeline)
 - A restricted tool set (no `SpawnAgent` — depth=1, no recursive spawning)
-- The parent's `TokenBudget` reference (shared — safe because asyncio is single-threaded cooperative)
+- The parent's `TokenBudget` and `PolicyEnforcer` references (shared — safe because asyncio is single-threaded cooperative)
 
 **Concurrency:**
 
-- `asyncio.Semaphore(5)` limits concurrent sub-agents
+- `asyncio.Semaphore(5)` inside `LoopRuntime` limits concurrent sub-agents (private implementation detail)
 - Each sub-agent has a reduced `max_steps=10` (prevents runaway subtasks)
 - Sub-agent results are truncated to 2,048 tokens before being returned to the parent
 
 **Execution flow:**
 
 1. Parent calls `SpawnAgent(task="...", context="...")`
-2. `SubAgentManager` creates isolated `AgentLoop` instance with fresh thread
-3. Sub-agent runs to completion (or max_steps/budget exhaustion)
-4. Result text is truncated and returned as the tool result to the parent
-5. Parent continues with the sub-agent's findings
+2. `AgentToolHandler` delegates to the `LoopRuntime.spawn_sub_agent()` callback
+3. `LoopRuntime` builds a child `LoopRuntime` with a fresh `MessageThread`, shared `TokenBudget`/`PolicyEnforcer`, and no `agent_tool_handler` (preventing recursive spawning)
+4. `LoopRuntime` creates a `ReactLoop` strategy for the child and runs it
+5. Sub-agent runs to completion (or max_steps/budget exhaustion)
+6. Result text is truncated and returned as the tool result to the parent
+7. Parent continues with the sub-agent's findings
 
 **Error handling:** Sub-agent failures do not crash the parent. If a sub-agent fails (LLM error, budget exhaustion, max_steps), the failure message is returned as a tool result and the parent decides how to proceed.
 
@@ -633,13 +637,14 @@ Each skill is a directory containing a `SKILL.md` file with YAML frontmatter and
 
 **Skill Execution:**
 
-`SkillExecutor` runs each skill as a focused sub-conversation via `AgentLoop`:
-1. Stage 2: Load full `prompt_content` via `SkillLoader.load_skill_content()`
-2. Apply `$ARGUMENTS` substitution to `prompt_content`
-3. Create a fresh `MessageThread` with the skill's `prompt_content` in the system prompt
-4. Restrict available tools to `tool_subset` (if specified)
-5. Run the agent loop with the skill's input as the user prompt
-6. Return the agent's final text response as the tool result
+Skill execution is handled by `LoopRuntime.execute_skill()` (`loop/loop_runtime.py`), which runs each skill as a focused sub-conversation:
+1. `AgentToolHandler` delegates to the `LoopRuntime.execute_skill()` callback
+2. Stage 2: Load full `prompt_content` via `SkillLoader.load_skill_content()`
+3. Apply `$ARGUMENTS` substitution to `prompt_content`
+4. `LoopRuntime` builds a child `LoopRuntime` with a fresh `MessageThread` and the skill's `prompt_content` in the system message
+5. Restrict available tools to `tool_subset` (if specified)
+6. `LoopRuntime` creates a `ReactLoop` strategy for the child and runs it
+7. Return the agent's final text response as the tool result
 
 Skills are registered as `Skill_{name}` tools in `AgentToolHandler`. Skills with `disable_model_invocation=True` are excluded from the LLM's tool list but can still be invoked explicitly.
 
