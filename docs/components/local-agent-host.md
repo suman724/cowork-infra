@@ -243,8 +243,19 @@ Step-by-step algorithm for `Shutdown`:
 
 ### 4.1 Step Execution Algorithm
 
+**Step ID generation:** Each step generates a UUID v4 `stepId` at the top of the loop iteration. This `stepId` is propagated to all events, tool calls, and messages within that step, enabling step-level audit correlation and debugging. The `stepId` is distinct from the ordinal `stepCount` — it is a globally unique identifier, while `stepCount` is a sequential counter scoped to the task.
+
+**Task lifecycle reporting:** The agent loop reports task creation and completion to the Session Service for backend persistence. These calls are best-effort (fire-and-forget) — failures are logged but do not block task execution.
+
+- At the start of `runTask`: call `SessionClient.create_task(sessionId, taskId, prompt, maxSteps)` and emit `task_started` event
+- On task completion (success, failure, or cancellation): call `SessionClient.complete_task(sessionId, taskId, status, stepCount, completionReason)`
+
+**Auto-naming:** On the first task in a session (when the session has no name), the agent loop auto-generates a human-readable session name from the user's prompt. The name is the first 60 characters of the prompt, truncated at a word boundary with `...` appended. This name is sent to the Session Service via `PATCH /sessions/{sessionId}/name` as a best-effort fire-and-forget call. The Desktop App also sets the name locally for instant UI feedback.
+
 ```
 function runTask(task):
+  reportTaskStarted(task)  // best-effort → Session Service
+  autoNameSession(task.prompt)  // best-effort, first task only
   addMessage(role: "user", content: task.prompt)
   stepCount = 0
 
@@ -252,10 +263,11 @@ function runTask(task):
 
     if cancellationRequested:
       uploadSessionHistory()
+      reportTaskCompleted(task, "cancelled", stepCount)
       return TASK_CANCELLED
 
     // --- Step begins ---
-    stepId = generateStepId()
+    stepId = uuid4()  // UUID v4 — unique per step, propagated to all events and tool calls
     emitEvent("step_started", { stepId })
 
     // 1. Build LLM request
@@ -1231,8 +1243,10 @@ The `events/` module provides a fire-and-forget event emitter. Events are emitte
 | `session_started` | After successful session init | `executionEnvironment` |
 | `session_completed` | On clean session shutdown (`Shutdown` RPC) | `taskCount`, `totalTokens`, `durationMs` |
 | `session_failed` | On session failure | `reason` |
+| `task_started` | At the beginning of task execution | `taskId`, `prompt` |
 | `task_completed` | After a single task (user prompt) finishes successfully | `taskId` |
 | `task_failed` | After a single task fails | `taskId`, `message`, `errorCode`, `errorType`, `isRecoverable` |
+| `task_cancelled` | After a task is cancelled by the user | `taskId` |
 | `llm_retry` | Before each LLM retry attempt | `attempt`, `maxRetries`, `errorMessage`, `delaySeconds` |
 | `step_started` | Before each LLM call | `stepId`, `stepCount` |
 | `step_completed` | After all tool results collected and checkpoint written | `stepId`, `stepCount` |

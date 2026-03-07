@@ -74,6 +74,7 @@ Called by the Local Agent Host at startup to establish a new session.
 {
   "sessionId": "sess_789",
   "workspaceId": "ws_456",
+  "name": "",
   "compatibilityStatus": "compatible",
   "policyBundle": { ... },
   "featureFlags": {
@@ -128,6 +129,83 @@ Called by the Local Agent Host after a desktop restart when a checkpoint exists 
 
 ---
 
+### PATCH /sessions/{sessionId}/name — Update Session Name
+
+Called by the Local Agent Host to auto-name sessions from the first user prompt.
+
+**Request:**
+```json
+{
+  "name": "Fix login bug in auth module",
+  "autoNamed": true
+}
+```
+
+**Response:** `200 OK` (empty body)
+
+---
+
+### POST /sessions/{sessionId}/tasks — Create Task
+
+Reports task creation to the Session Service for persistence and history.
+
+**Request:**
+```json
+{
+  "taskId": "task-1234567890",
+  "prompt": "Fix the authentication bug",
+  "maxSteps": 50
+}
+```
+
+**Response:** `201 Created` (empty body)
+
+---
+
+### POST /sessions/{sessionId}/tasks/{taskId}/complete — Complete Task
+
+Reports task completion (success, failure, or cancellation).
+
+**Request:**
+```json
+{
+  "status": "completed",
+  "stepCount": 12,
+  "completionReason": "Natural completion"
+}
+```
+
+**Response:** `200 OK` (empty body)
+
+---
+
+### GET /sessions/{sessionId}/tasks — List Tasks
+
+Returns all tasks for a session, ordered by creation time.
+
+**Response:**
+```json
+[
+  {
+    "taskId": "task-1",
+    "sessionId": "sess_789",
+    "prompt": "Fix the bug",
+    "status": "completed",
+    "stepCount": 12,
+    "createdAt": "2026-02-21T14:01:00Z",
+    "completedAt": "2026-02-21T14:05:00Z"
+  }
+]
+```
+
+---
+
+### GET /sessions/{sessionId}/tasks/{taskId} — Get Task
+
+Returns a single task by ID.
+
+---
+
 ### GET /sessions/{sessionId} — Get Session Metadata
 
 **Response:**
@@ -139,6 +217,8 @@ Called by the Local Agent Host after a desktop restart when a checkpoint exists 
   "userId": "user_123",
   "executionEnvironment": "desktop",
   "status": "SESSION_RUNNING",
+  "name": "Fix login bug in auth module",
+  "autoNamed": true,
   "createdAt": "2026-02-21T14:00:00Z",
   "expiresAt": "2026-02-21T18:30:00Z"
 }
@@ -216,7 +296,26 @@ sequenceDiagram
 
 ### Stored attributes
 
-`sessionId`, `tenantId`, `userId`, `workspaceId`, `executionEnvironment`, `status`, `createdAt`, `expiresAt`, `ttl`, `clientInfo`
+`sessionId`, `tenantId`, `userId`, `workspaceId`, `executionEnvironment`, `status`, `name`, `autoNamed`, `createdAt`, `expiresAt`, `ttl`, `clientInfo`
+
+---
+
+### Tasks Table
+
+**Database:** DynamoDB table `{env}-tasks`
+
+| Key | Value |
+|-----|-------|
+| Partition key | `taskId` (String) |
+| TTL attribute | `ttl` (Number, Unix epoch) — set from parent session's `expiresAt` |
+
+**GSI:**
+
+| GSI | Partition key | Sort key | Use |
+|-----|--------------|----------|-----|
+| `sessionId-index` | `sessionId` | `createdAt` | List tasks for a session, sorted by creation time |
+
+**Stored attributes:** `taskId`, `sessionId`, `workspaceId`, `tenantId`, `userId`, `prompt`, `status`, `stepCount`, `maxSteps`, `completionReason`, `createdAt`, `completedAt`, `updatedAt`, `ttl`
 
 ### Testing
 
