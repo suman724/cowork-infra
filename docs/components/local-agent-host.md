@@ -617,6 +617,7 @@ The agent modifies working memory via three internal tools that are handled by `
 |------|---------|------------|
 | `TaskTracker` | Create, update status, and list tasks | `agent` |
 | `CreatePlan` | Set a goal with ordered steps | `agent` |
+| `UpdatePlanStep` | Mark a plan step as `in_progress`, `completed`, or `skipped` (params: `stepIndex: int`, `status: enum`) | `agent` |
 | `SaveMemory` | Write/update a persistent memory file | `agent` |
 | `RecallMemory` | Read a specific memory topic file | `agent` |
 | `ListMemories` | List all persistent memory files with sizes | `agent` |
@@ -625,6 +626,8 @@ The agent modifies working memory via three internal tools that are handled by `
 | `Skill_*` | Execute a formalized multi-step skill workflow | `skill` |
 
 Agent-internal tools now emit `tool_requested` and `tool_completed` events (with the appropriate `toolType` classification), enabling the Desktop App to display them as distinct tool call cards. They still bypass PolicyEnforcer — events are informational only.
+
+**Plan progress callback chain:** When the agent calls `UpdatePlanStep`, `AgentToolHandler._notify_plan_updated()` → `SessionManager._on_plan_updated()` → `EventEmitter.emit_plan_updated(task_id, goal, steps)`, emitting a `plan_updated` event with the full plan state. The system prompt guides the agent to call `UpdatePlanStep` as it progresses through a plan.
 
 **Persistence:** Working memory is serialized into `SessionCheckpoint.working_memory` via `to_checkpoint()`/`from_checkpoint()`. On session resume, the full working memory state (tasks, plan, notes) is restored.
 
@@ -1403,12 +1406,13 @@ The `events/` module provides a fire-and-forget event emitter. Events are emitte
 | `approval_resolved` | After user responds | `approvalId`, `decision`, `latencyMs` |
 | `policy_expired` | When policy bundle expiry is detected | — |
 | `plan_mode_changed` | When agent enters/exits plan mode | `planMode`, `source` (`"agent"` or `"user"`) |
+| `plan_updated` | When agent calls `UpdatePlanStep` to update plan progress | `goal`, `steps` (array of `{index, description, status}`) |
 | `verification_started` | When verification phase begins after agent signals completion | — |
 | `verification_completed` | When verification phase finishes | `passed` (boolean) |
 
 All events carry the full ID chain: `workspaceId`, `sessionId`, `taskId`, `stepId`.
 
-**`toolType` values:** `"tool"` (external tools via ToolRouter), `"agent"` (TaskTracker, CreatePlan), `"sub_agent"` (SpawnAgent), `"skill"` (Skill_* workflows). Default is `"tool"` for backward compatibility.
+**`toolType` values:** `"tool"` (external tools via ToolRouter), `"agent"` (TaskTracker, CreatePlan, UpdatePlanStep), `"sub_agent"` (SpawnAgent), `"skill"` (Skill_* workflows). Default is `"tool"` for backward compatibility.
 
 > Event envelope schema: [architecture.md, Section 6.3](../architecture.md#63-event-envelope--any-component--audit-service--telemetry-service)
 
