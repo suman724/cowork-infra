@@ -225,7 +225,7 @@ The primary view during an active session. Shows the live conversation and agent
 | Plan mode badge | `SessionEvent` with `eventType: "plan_mode_changed"` | Blue "Planning" badge in header when `planMode: true`; info system message on enter/exit. "Working" badge hidden during plan mode. |
 | Plan panel | `SessionEvent` with `eventType: "plan_updated"` | Collapsible panel between header and message list showing plan goal, progress counter [completed/total], and step list with status icons (spinner=in_progress, check=completed, ban=skipped, circle=pending). Skipped steps shown with strikethrough. Auto-collapses at 7+ steps. |
 | Verification badge | `SessionEvent` with `eventType: "verification_started"` / `"verification_completed"` | Amber pulsing "Verifying" badge in header during verification; info/warning system message on start/complete. Footer shows "· Verifying" label. |
-| Prompt input | User types and submits | Sends `StartTask` JSON-RPC |
+| Prompt input | User types and submits | Sends `StartTask` JSON-RPC. Includes a "Plan first" toggle (checklist icon) that sends `taskOptions.planOnly: true` to lock the agent into read-only plan mode for the task. |
 | Cancel button | User clicks | Sends `CancelTask` JSON-RPC |
 
 **Markdown Rendering:**

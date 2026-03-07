@@ -330,7 +330,7 @@ Capabilities are issued in the policy bundle and enforced by **Local Policy Enfo
   "params": {
     "sessionId": "sess_789", "taskId": "task_001",
     "prompt": "Refactor the API client and add tests",
-    "taskOptions": { "maxSteps": 40, "allowNetwork": true, "approvalMode": "on_risky_actions" }
+    "taskOptions": { "maxSteps": 40, "allowNetwork": true, "approvalMode": "on_risky_actions", "planOnly": false }
   }
 }
 ```
