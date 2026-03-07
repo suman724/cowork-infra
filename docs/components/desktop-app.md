@@ -222,6 +222,8 @@ The primary view during an active session. Shows the live conversation and agent
 | System messages | `SessionEvent` errors/warnings/info | Severity-aware rendering: error (red AlertCircle), warning (yellow AlertTriangle), info (muted Info icon) |
 | Retry button | `task_failed` event with `isRecoverable: true` | Appears in footer when task is not running; re-submits the same prompt via `StartTask`. Cleared on new task start. |
 | LLM retry indicator | `SessionEvent` with `eventType: "llm_retry"` | Warning system message showing retry attempt count |
+| Plan mode badge | `SessionEvent` with `eventType: "plan_mode_changed"` | Blue "Planning" badge in header when `planMode: true`; info system message on enter/exit. "Working" badge hidden during plan mode. |
+| Verification badge | `SessionEvent` with `eventType: "verification_started"` / `"verification_completed"` | Amber pulsing "Verifying" badge in header during verification; info/warning system message on start/complete. Footer shows "· Verifying" label. |
 | Prompt input | User types and submits | Sends `StartTask` JSON-RPC |
 | Cancel button | User clicks | Sends `CancelTask` JSON-RPC |
 
@@ -477,6 +479,10 @@ AppState {
   selectedWorkspace: string | null
   sessionsForWorkspace: SessionSummary[]
 
+  // Agent mode indicators
+  planMode: boolean                  // true when agent is in plan (read-only) mode
+  isVerifying: boolean               // true during post-completion verification phase
+
   // UI
   view: "history" | "conversation" | "settings"
   theme: "light" | "dark" | "system"
@@ -501,7 +507,10 @@ AppState {
 | `SessionEvent: approval_requested` | Add to `pendingApprovals` queue, show modal |
 | User approves/denies | Remove from `pendingApprovals`, send `ApproveAction` |
 | `SessionEvent: step_started` | Increment `session.task.stepCount` |
-| Task completes/fails/cancelled | `session.task → null`, re-enable prompt input |
+| `SessionEvent: plan_mode_changed` | Set `planMode` from payload; add info system message |
+| `SessionEvent: verification_started` | Set `isVerifying → true`; add info system message |
+| `SessionEvent: verification_completed` | Set `isVerifying → false`; add info/warning system message |
+| Task completes/fails/cancelled | `session.task → null`, `planMode → false`, `isVerifying → false`, re-enable prompt input |
 | User clicks "Review changes" | Fetch `GetPatchPreview`, populate `patchPreview` |
 | Agent-runtime process exits | `agentRuntimeStatus → "crashed"`, show recovery dialog |
 | User navigates to history | `view → "history"`, `session → null` |
