@@ -223,6 +223,7 @@ The primary view during an active session. Shows the live conversation and agent
 | Retry button | `task_failed` event with `isRecoverable: true` | Appears in footer when task is not running; re-submits the same prompt via `StartTask`. Cleared on new task start. |
 | LLM retry indicator | `SessionEvent` with `eventType: "llm_retry"` | Warning system message showing retry attempt count |
 | Plan mode badge | `SessionEvent` with `eventType: "plan_mode_changed"` | Blue "Planning" badge in header when `planMode: true`; info system message on enter/exit. "Working" badge hidden during plan mode. |
+| Plan panel | `SessionEvent` with `eventType: "plan_updated"` | Collapsible panel between header and message list showing plan goal, progress counter [completed/total], and step list with status icons (spinner=in_progress, check=completed, ban=skipped, circle=pending). Skipped steps shown with strikethrough. Auto-collapses at 7+ steps. |
 | Verification badge | `SessionEvent` with `eventType: "verification_started"` / `"verification_completed"` | Amber pulsing "Verifying" badge in header during verification; info/warning system message on start/complete. Footer shows "· Verifying" label. |
 | Prompt input | User types and submits | Sends `StartTask` JSON-RPC |
 | Cancel button | User clicks | Sends `CancelTask` JSON-RPC |
@@ -422,6 +423,7 @@ ipcClient.on("approval_requested",    handler)  — approval needed
 ipcClient.on("approval_resolved",     handler)  — approval decision made
 ipcClient.on("step_limit_approaching", handler) — 80% of maxSteps
 ipcClient.on("policy_expired",        handler)  — session paused
+ipcClient.on("plan_updated",          handler)  — plan progress update
 ipcClient.on("error",                 handler)  — agent-level error
 ```
 
@@ -483,6 +485,12 @@ AppState {
   planMode: boolean                  // true when agent is in plan (read-only) mode
   isVerifying: boolean               // true during post-completion verification phase
 
+  // Plan progress (from plan_updated events)
+  plan: {
+    goal: string
+    steps: { index: number, description: string, status: string }[]
+  } | null
+
   // UI
   view: "history" | "conversation" | "settings"
   theme: "light" | "dark" | "system"
@@ -508,9 +516,10 @@ AppState {
 | User approves/denies | Remove from `pendingApprovals`, send `ApproveAction` |
 | `SessionEvent: step_started` | Increment `session.task.stepCount` |
 | `SessionEvent: plan_mode_changed` | Set `planMode` from payload; add info system message |
+| `SessionEvent: plan_updated` | Set `plan` from payload (goal + steps with status); displayed in PlanPanel |
 | `SessionEvent: verification_started` | Set `isVerifying → true`; add info system message |
 | `SessionEvent: verification_completed` | Set `isVerifying → false`; add info/warning system message |
-| Task completes/fails/cancelled | `session.task → null`, `planMode → false`, `isVerifying → false`, re-enable prompt input |
+| Task completes/fails/cancelled | `session.task → null`, `planMode → false`, `isVerifying → false`, `plan → null`, re-enable prompt input |
 | User clicks "Review changes" | Fetch `GetPatchPreview`, populate `patchPreview` |
 | Agent-runtime process exits | `agentRuntimeStatus → "crashed"`, show recovery dialog |
 | User navigates to history | `view → "history"`, `session → null` |
