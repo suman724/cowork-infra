@@ -72,6 +72,8 @@ The governance container for one continuous working period. From the user's pers
 | `workspaceId` | string | Always present — every session has a workspace |
 | `tenantId` | string | Tenant the session belongs to |
 | `userId` | string | User who owns the session |
+| `name` | string | Human-readable session name. Auto-generated from first user prompt if not explicitly set. |
+| `autoNamed` | boolean | Whether the name was auto-generated (true) or explicitly set by the user (false). |
 | `executionEnvironment` | enum | Where the agent is running (see below) |
 | `status` | enum | Current state machine state (see below) |
 | `createdAt` | datetime | Session creation time |
@@ -128,11 +130,18 @@ A single agent work cycle triggered by one user prompt. One session contains one
 |-----------|------|-------------|
 | `taskId` | string | Unique identifier, scoped to the session |
 | `sessionId` | string | Parent session |
+| `workspaceId` | string | Denormalized from parent session for querying |
+| `tenantId` | string | Denormalized from parent session |
+| `userId` | string | Denormalized from parent session |
 | `prompt` | string | The user's instruction |
 | `maxSteps` | integer | Maximum number of agent loop iterations allowed |
+| `stepCount` | integer | Number of steps actually executed |
 | `allowNetwork` | boolean | Whether outbound network tool calls are permitted |
 | `approvalMode` | enum | When to require user approval (`always`, `on_risky_actions`, `never`) |
 | `status` | enum | `running`, `completed`, `failed`, `cancelled` |
+| `completionReason` | string | Why the task ended (e.g., "Natural completion", "Step limit reached") |
+| `createdAt` | datetime | When the task was created |
+| `completedAt` | datetime | When the task finished (null while running) |
 
 **Key behaviours:**
 - Can be cancelled independently without ending the session
