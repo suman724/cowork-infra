@@ -456,6 +456,8 @@ Team mode is an **explicit opt-in by the user**, not a decision the agent makes 
 
 The Desktop App provides a **Team Mode toggle** in the conversation toolbar (similar to Plan Mode). Team Mode is **session-scoped** — it applies only to the current session and defaults to off. When team mode is off, the `CreateTeam` and `CreateTeammate` tools are not available to the agent — it cannot spawn teammates even if the task would benefit from parallelism.
 
+**Workspace restriction:** Team Mode is only available for `local` workspaces (project sessions with a directory). The toggle is hidden or disabled for `general` (single-use chat) sessions, since there is no shared project directory for teammates to work on. `cloud` workspaces will be evaluated in Phase 3+.
+
 If the user disables Team Mode while a team is active, `ShutdownTeam()` is called automatically, gracefully releasing all teammates. The user can re-enable Team Mode later to create a new team in the same session.
 
 ```mermaid
@@ -1216,6 +1218,7 @@ This last point is key: teammates are ephemeral (they exist only for the duratio
 
 | Constraint | Value | Rationale |
 |-----------|-------|-----------|
+| Workspace type | `local` only | Teams require a shared project directory for parallel file work. `general` workspaces have no project dir. `cloud` workspaces deferred to Phase 3+ |
 | Max teammates per team | 8 | Coordination overhead grows superlinearly |
 | Max teams per session | 1 | Prevent nested team complexity |
 | Teammate depth | 0 (no teams) | Teammates cannot spawn their own teams |
@@ -1238,6 +1241,7 @@ These extend the existing error code set from `cowork-platform`:
 | Error Code | When | Handling |
 |-----------|------|----------|
 | `TEAM_MODE_DISABLED` | Lead calls `CreateTeam` but Team Mode is off | Agent receives tool error, cannot create team |
+| `TEAM_WORKSPACE_INVALID` | Team Mode enabled on a `general` or unsupported workspace type | Toggle rejected, user informed teams require a project workspace |
 | `TEAM_ALREADY_ACTIVE` | Lead calls `CreateTeam` when a team already exists | Agent receives tool error (max 1 team per session) |
 | `TEAMMATE_SPAWN_FAILED` | Session Service rejects teammate session creation | Lead notified, can retry or reduce team size |
 | `TEAMMATE_BUDGET_EXCEEDED` | Teammate's `TokenBudget` exhausted | Teammate becomes idle, lead notified via mailbox |
