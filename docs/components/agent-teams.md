@@ -718,7 +718,36 @@ sequenceDiagram
     MB->>A: Queue message in researcher inbox
 ```
 
-### 6.3 Teammate System Prompt
+### 6.3 Lead Wait Behavior
+
+After the lead sets up the team (creates teammates, populates the task list), it typically has nothing to do until teammates complete their work. The lead enters a **wait loop** — similar to the teammate idle loop but watching for coordination events:
+
+```mermaid
+flowchart TD
+    A[Lead finishes team setup] --> B[Wait with backoff 5s..30s]
+    B --> C{Wake condition?}
+    C -- "All tasks completed" --> D[Trigger LLM call for consolidation]
+    C -- "Message from teammate" --> E[Trigger LLM call with message context]
+    C -- "Teammate failed/budget exhausted" --> F[Trigger LLM call for recovery decision]
+    C -- "User sends follow-on message" --> G[Trigger LLM call with user input]
+    C -- "None" --> B
+    D --> H[Lead verifies results, reports to user]
+    E --> I[Lead responds or adjusts plan]
+    F --> J[Lead proposes recovery to user]
+    G --> K[Lead handles user request]
+```
+
+**Wake conditions** (any one triggers an LLM call):
+1. **All tasks completed** — `SharedTaskList` has no `pending`, `in_progress`, or `blocked` tasks
+2. **Incoming message** — teammate sends a message to the lead via `MailboxRouter`
+3. **Teammate failure** — a teammate's task moves to `failed` (budget exhaustion, error, crash)
+4. **User input** — user sends a new message in the lead's conversation panel
+
+Between wake conditions, the lead's loop is dormant — no LLM calls, no token consumption. The `ContextInjectionStrategy` only runs when a wake condition triggers an LLM call, at which point the lead sees the full updated state (task list, messages) in its context.
+
+Note: the lead can also do its own work while teammates run. If the lead has tasks assigned to itself (e.g., a verification task blocked on teammate tasks), it processes those through its normal `ReactLoop` — the wait behavior only applies when the lead has nothing to do.
+
+### 6.4 Teammate System Prompt
 
 ```
 You are a teammate in a multi-agent team working on a shared project.
@@ -745,7 +774,7 @@ assigned tasks. Check the task list to see what others are working on to avoid c
 - If the task list is empty and you have no messages, let the lead know you are idle
 ```
 
-### 6.4 Shutdown
+### 6.5 Shutdown
 
 ```
 Lead calls ShutdownTeammate(name="researcher")
