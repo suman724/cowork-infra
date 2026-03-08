@@ -981,47 +981,359 @@ A teammate can use `SpawnAgent` for quick sub-tasks, just like the lead does tod
 
 ---
 
-## 13. Module Structure
+## 13. Strategy-Based Decoupling
+
+### Problem
+
+Directly embedding team logic into `SessionManager`, `ReactLoop`, `AgentToolHandler`, etc. creates tight coupling — every component needs `if team_active:` branches, team-specific fields, and awareness of team concepts. This makes both team and non-team code harder to evolve independently.
+
+### Approach: Strategy Interfaces at Every Extension Point
+
+We already use this pattern successfully: `LoopStrategy` (see [loop-strategy.md](loop-strategy.md)) decouples orchestration decisions from infrastructure. Agent Teams extends this philosophy across all components that need team awareness, using **strategy interfaces** and **composition** rather than conditionals.
+
+The core principle: **existing components gain new capabilities by accepting strategy objects, not by growing `if team:` branches.**
+
+```mermaid
+flowchart TB
+    subgraph Strategies["Strategy Interfaces (Protocols)"]
+        style Strategies fill:#d4edda
+        CS[CoordinationStrategy]
+        TS[ToolProviderStrategy]
+        CIS[ContextInjectionStrategy]
+        EOS[EventObserverStrategy]
+        CPS[CheckpointStrategy]
+    end
+
+    subgraph Existing["Existing Components (unchanged core)"]
+        style Existing fill:#e9ecef
+        SM[SessionManager]
+        LR[LoopRuntime]
+        ATH[AgentToolHandler]
+        RL[ReactLoop]
+        EE[EventEmitter]
+        CP[CheckpointManager]
+    end
+
+    subgraph TeamImpl["Team Implementations"]
+        style TeamImpl fill:#fff3cd
+        TC[TeamCoordinator]
+        TTP[TeamToolProvider]
+        TMI[TeamContextInjector]
+        TEO[TeamEventObserver]
+        TCP[TeamCheckpointProvider]
+    end
+
+    subgraph SoloImpl["Solo Implementations (current behavior)"]
+        style SoloImpl fill:#e9ecef
+        SC[SoloCoordinator<br/>no-op]
+        STP[SoloToolProvider<br/>no team tools]
+        SMI[SoloContextInjector<br/>no team messages]
+    end
+
+    CS --> SM
+    TS --> ATH
+    CIS --> RL
+    EOS --> EE
+    CPS --> CP
+
+    TC -.->|implements| CS
+    TTP -.->|implements| TS
+    TMI -.->|implements| CIS
+    TEO -.->|implements| EOS
+    TCP -.->|implements| CPS
+
+    SC -.->|implements| CS
+    STP -.->|implements| TS
+    SMI -.->|implements| CIS
+```
+
+### Strategy Interfaces
+
+#### 1. CoordinationStrategy
+
+Controls how the session manages agent coordination. `SessionManager` delegates to this instead of holding team logic directly.
+
+```python
+class CoordinationStrategy(Protocol):
+    """How agents coordinate within a session."""
+
+    async def on_session_start(self, session_id: str, config: dict) -> None:
+        """Called when the session starts. Set up coordination state."""
+
+    async def on_session_shutdown(self) -> None:
+        """Called during session shutdown. Clean up coordination state."""
+
+    async def spawn_agent(
+        self, name: str, role: str, initial_prompt: str, budget: int
+    ) -> AgentInfo:
+        """Spawn a coordinated agent (teammate, specialist, etc.)."""
+
+    async def shutdown_agent(self, name: str) -> None:
+        """Gracefully stop a coordinated agent."""
+
+    async def shutdown_all(self) -> None:
+        """Shut down all coordinated agents."""
+
+    def get_active_agents(self) -> list[AgentInfo]:
+        """List currently active coordinated agents."""
+```
+
+**Solo implementation** (`SoloCoordinator`): all methods are no-ops. No agents to coordinate.
+
+**Team implementation** (`TeamCoordinator`): wraps `TeamManager`, `SharedTaskList`, `MailboxRouter`. Implements teammate lifecycle.
+
+**Future**: could implement `SwarmCoordinator` (dynamic agent spawning), `PipelineCoordinator` (sequential handoffs), etc. without touching `SessionManager`.
+
+#### 2. ToolProviderStrategy
+
+Controls what additional tools are available to the agent. `AgentToolHandler` asks this strategy for extra tool definitions and delegates handling.
+
+```python
+class ToolProviderStrategy(Protocol):
+    """Provides additional tools based on the agent's mode."""
+
+    def get_tool_definitions(self, agent_role: AgentRole) -> list[ToolDefinition]:
+        """Return tool definitions for this agent's role (lead, teammate, solo)."""
+
+    async def handle_tool_call(
+        self, tool_name: str, arguments: dict, agent_name: str
+    ) -> ToolResult:
+        """Handle a tool call for a tool provided by this strategy."""
+
+    def owns_tool(self, tool_name: str) -> bool:
+        """Return True if this strategy handles the given tool name."""
+```
+
+**Solo implementation** (`SoloToolProvider`): returns empty list, owns no tools.
+
+**Team implementation** (`TeamToolProvider`): returns team tools (`CreateTeam`, `CreateTeammate`, `TeamTaskCreate`, `SendTeamMessage`, etc.). Filters by `agent_role` — lead gets creation/shutdown tools, teammates get task and messaging tools only.
+
+**Future**: could implement `MCPToolProvider` (Phase 2 MCP tools), `RemoteToolProvider` (Phase 3 backend tools) using the same interface.
+
+#### 3. ContextInjectionStrategy
+
+Controls what extra context is injected into the LLM's message window each turn. `ReactLoop` (and any future `LoopStrategy`) calls this during context assembly.
+
+```python
+class ContextInjectionStrategy(Protocol):
+    """Injects additional context into the LLM message window."""
+
+    async def get_injections(self, agent_name: str) -> list[ContextInjection]:
+        """Return context blocks to inject before the next LLM call.
+
+        Called by the LoopStrategy during _build_messages().
+        """
+
+    def estimate_overhead_tokens(self) -> int:
+        """Estimated token cost of injections (for compaction budget)."""
+```
+
+```python
+@dataclass
+class ContextInjection:
+    content: str
+    position: Literal["after_system", "before_last_user", "volatile_suffix"]
+    label: str  # e.g. "[Team Messages]", "[Task Status]"
+```
+
+**Solo implementation** (`SoloContextInjector`): returns empty list, zero overhead.
+
+**Team implementation** (`TeamContextInjector`): polls `MailboxRouter` for pending messages, reads `SharedTaskList` for current task status. Injects as:
+```
+[Team Messages]
+From @researcher: "Source data ready in research/raw-data/"
+
+[Current Task]
+"Analyze market trends" (claimed, 2 dependencies completed)
+```
+
+**Future**: could implement `SkillContextInjector`, `RAGContextInjector`, etc.
+
+#### 4. EventObserverStrategy
+
+Controls what events the session emits beyond the standard set. `EventEmitter` delegates to observers for domain-specific events.
+
+```python
+class EventObserverStrategy(Protocol):
+    """Observes agent actions and emits domain-specific events."""
+
+    async def on_agent_spawned(self, agent_info: AgentInfo) -> list[Event]:
+        """Called when a coordinated agent starts. Return events to emit."""
+
+    async def on_agent_shutdown(self, agent_name: str) -> list[Event]:
+        """Called when a coordinated agent stops."""
+
+    async def on_tool_result(
+        self, tool_name: str, result: ToolResult, agent_name: str
+    ) -> list[Event]:
+        """Called after a tool completes. Return domain events to emit."""
+
+    async def on_message_sent(
+        self, from_agent: str, to_agent: str, content: str
+    ) -> list[Event]:
+        """Called when an inter-agent message is sent."""
+```
+
+**Solo implementation**: returns empty lists for all hooks.
+
+**Team implementation** (`TeamEventObserver`): emits `team/teammate_created`, `team/task_updated`, `team/message`, etc. The JSON-RPC server subscribes to these events and forwards them as notifications — no team-specific code in the server.
+
+#### 5. CheckpointStrategy
+
+Controls what additional state is persisted during checkpointing.
+
+```python
+class CheckpointStrategy(Protocol):
+    """Persists and restores additional state during checkpoints."""
+
+    def capture(self) -> dict:
+        """Capture strategy-specific state as a serializable dict."""
+
+    async def restore(self, state: dict) -> None:
+        """Restore strategy state from a previously captured dict."""
+```
+
+**Solo implementation**: returns empty dict, restore is a no-op.
+
+**Team implementation** (`TeamCheckpointProvider`): captures team config, member list, task list snapshot, and teammate message thread snapshots. On restore, recreates `TeamManager` and resumes teammate loops.
+
+### How Strategies Are Wired
+
+`SessionManager` remains the composition root. At session start, it selects the appropriate strategy implementations based on session configuration:
+
+```python
+# In SessionManager.__init__ or _configure_strategies()
+
+if session_config.team_mode_enabled:
+    self._coordination = TeamCoordinator(config=session_config.team_config)
+    self._tool_provider = TeamToolProvider(coordinator=self._coordination)
+    self._context_injector = TeamContextInjector(coordinator=self._coordination)
+    self._event_observer = TeamEventObserver(coordinator=self._coordination)
+    self._checkpoint_strategy = TeamCheckpointProvider(coordinator=self._coordination)
+else:
+    self._coordination = SoloCoordinator()
+    self._tool_provider = SoloToolProvider()
+    self._context_injector = SoloContextInjector()
+    self._event_observer = SoloEventObserver()
+    self._checkpoint_strategy = SoloCheckpointProvider()
+```
+
+Strategy objects are then injected into the components that need them:
+
+```python
+# LoopRuntime receives strategies as constructor arguments
+loop_runtime = LoopRuntime(
+    ...,
+    context_injector=self._context_injector,
+    ...
+)
+
+# AgentToolHandler receives the tool provider
+agent_tool_handler = AgentToolHandler(
+    ...,
+    tool_provider=self._tool_provider,
+    ...
+)
+
+# EventEmitter receives the observer
+event_emitter.register_observer(self._event_observer)
+
+# CheckpointManager receives the checkpoint strategy
+checkpoint_manager = CheckpointManager(
+    ...,
+    extra_strategies=[self._checkpoint_strategy],
+    ...
+)
+```
+
+### What This Achieves
+
+| Benefit | How |
+|---------|-----|
+| **Zero team code in existing components** | `ReactLoop`, `AgentToolHandler`, `EventEmitter`, `CheckpointManager` call strategy interfaces — they don't know about teams |
+| **Solo mode is unchanged** | Solo strategies are no-ops. Zero overhead, zero behavioral change for non-team sessions |
+| **Team logic is cohesive** | All team code lives in `agent_host/teams/`. Strategy implementations compose `TeamManager`, `SharedTaskList`, and `MailboxRouter` internally |
+| **Independent evolution** | Team strategies can add features (task priorities, budget reallocation, idle timeouts) without modifying `ReactLoop` or `SessionManager` |
+| **Testable in isolation** | Test team strategies with mock `LoopRuntime`. Test `ReactLoop` with mock `ContextInjectionStrategy`. Neither needs the other |
+| **Future extensibility** | Same interfaces serve MCP tools, remote tools, RAG injection, pipeline coordination — all without core changes |
+
+### Alignment with Existing Patterns
+
+This follows the same philosophy as `LoopStrategy` / `LoopRuntime`:
+
+| Existing Pattern | New Extension |
+|-----------------|---------------|
+| `LoopStrategy` decouples orchestration from infrastructure | `CoordinationStrategy` decouples agent coordination from session management |
+| `LoopRuntime` provides primitives, strategy makes decisions | `ContextInjectionStrategy` provides injections, `ReactLoop` decides where to place them |
+| `SessionManager` selects `LoopStrategy` at task creation | `SessionManager` selects all strategies at session start |
+| Sub-agent spawning is a `LoopRuntime` primitive | Agent spawning is a `CoordinationStrategy` primitive |
+
+---
+
+## 14. Module Structure
 
 ```
 agent_host/
   teams/
     __init__.py
-    team_manager.py        # TeamManager: lifecycle, coordination
+    strategies.py          # Strategy interface implementations (TeamCoordinator, TeamToolProvider, etc.)
+    team_manager.py        # TeamManager: lifecycle, coordination (internal to strategies)
     task_list.py           # SharedTaskList: in-memory task tracking
     mailbox.py             # MailboxRouter: peer-to-peer messaging
     models.py              # TeamConfig, TeammateInfo, TeamTask, TeamMessage
     teammate_session.py    # TeammateSessionManager: lightweight session for teammates
-    tools.py               # Team-specific agent tool definitions and handlers
+    tools.py               # Team tool definitions (consumed by TeamToolProvider)
+  coordination/
+    __init__.py
+    protocols.py           # Strategy protocols: CoordinationStrategy, ToolProviderStrategy, etc.
+    solo.py                # Solo implementations (no-ops for non-team sessions)
 ```
 
 ### How We Extend Existing Components
 
-Agent Teams is designed to build on top of the existing architecture — no rewrites, only extensions. The diagram below shows what's new (green) vs what's modified (yellow) vs unchanged (grey).
+Agent Teams is designed to build on top of the existing architecture — no rewrites, only strategy injection. The diagram below shows what's new (green) vs what's modified (yellow) vs unchanged (grey).
 
 ```mermaid
 flowchart TB
-    subgraph New["New Modules (agent_host/teams/)"]
+    subgraph New["New Modules"]
         style New fill:#d4edda
-        TM[TeamManager]
-        TL[SharedTaskList]
-        MB[MailboxRouter]
-        TS[TeammateSessionManager]
-        TT[Team Tools]
+        subgraph Protocols["coordination/protocols.py"]
+            CS[CoordinationStrategy]
+            TPS[ToolProviderStrategy]
+            CIS[ContextInjectionStrategy]
+            EOS[EventObserverStrategy]
+            CPS_P[CheckpointStrategy]
+        end
+        subgraph TeamImpl["teams/"]
+            TC[TeamCoordinator]
+            TTP[TeamToolProvider]
+            TMI[TeamContextInjector]
+            TEO[TeamEventObserver]
+            TCP[TeamCheckpointProvider]
+            TM[TeamManager]
+            TL[SharedTaskList]
+            MB[MailboxRouter]
+            TS[TeammateSessionManager]
+        end
+        subgraph SoloImpl["coordination/solo.py"]
+            SC[SoloCoordinator]
+            STP[SoloToolProvider]
+            SMI[SoloContextInjector]
+        end
     end
 
-    subgraph Modified["Modified Existing Modules"]
+    subgraph Modified["Modified (strategy injection only)"]
         style Modified fill:#fff3cd
-        SM[SessionManager<br/>+ holds TeamManager ref<br/>+ forwards team events]
-        ATH[AgentToolHandler<br/>+ registers team tools<br/>+ lead vs teammate check]
-        RL[ReactLoop<br/>+ mailbox poll before LLM call<br/>+ message injection]
-        EE[EventEmitter<br/>+ team event types]
-        JRPC[JSON-RPC Server<br/>+ team notification methods]
-        CP[CheckpointManager<br/>+ persist team state]
+        SM[SessionManager<br/>+ selects & wires strategies]
+        ATH[AgentToolHandler<br/>+ delegates to ToolProviderStrategy]
+        LRT[LoopRuntime<br/>+ accepts ContextInjectionStrategy]
+        EE[EventEmitter<br/>+ accepts EventObserverStrategy]
+        CP[CheckpointManager<br/>+ accepts CheckpointStrategy]
     end
 
     subgraph Unchanged["Unchanged"]
         style Unchanged fill:#e9ecef
+        RL[ReactLoop / LoopStrategy]
         LLM[LLMClient]
         PE[PolicyEnforcer]
         TB[TokenBudget]
@@ -1029,58 +1341,68 @@ flowchart TB
         WM[WorkingMemory]
     end
 
-    SM --> TM
-    TM --> TL
-    TM --> MB
-    TM --> TS
-    ATH --> TT
-    RL --> MB
-    TS --> LLM
-    TS --> PE
-    TS --> TR
+    SM --> CS
+    ATH --> TPS
+    LRT --> CIS
+    EE --> EOS
+    CP --> CPS_P
+
+    TC -.->|implements| CS
+    SC -.->|implements| CS
+    TTP -.->|implements| TPS
+    STP -.->|implements| TPS
+    TMI -.->|implements| CIS
+    SMI -.->|implements| CIS
+
+    TC --> TM
+    TC --> TL
+    TC --> MB
+    TC --> TS
 ```
+
+Note: `ReactLoop` is unchanged — it already calls `LoopRuntime` for context assembly, and `LoopRuntime` now delegates to `ContextInjectionStrategy` for extra injections. The team-awareness flows through strategy composition, not through modifications to the loop.
 
 #### `cowork-agent-runtime` — Detailed Changes Per Module
 
 **`SessionManager` (`session/session_manager.py`)**
-- Add `_team_manager: TeamManager | None` instance variable
-- New method: `create_team()` → instantiates `TeamManager`, wires shared resources
-- New method: `shutdown_team()` → delegates to `TeamManager.shutdown_team()`
-- Modify `_run_agent()`: if team active, pass `MailboxRouter` ref to `ReactLoop`
-- Modify `shutdown()`: shutdown team before closing session
-- Forward team events (teammate created/removed, task updates) to `EventEmitter`
+- Add strategy fields: `_coordination`, `_tool_provider`, `_context_injector`, `_event_observer`, `_checkpoint_strategy`
+- New method: `_configure_strategies()` → selects Solo or Team implementations based on session config
+- Inject strategies into `LoopRuntime`, `AgentToolHandler`, `EventEmitter`, `CheckpointManager` at construction time
+- `shutdown()` delegates to `_coordination.shutdown_all()` — no team-specific knowledge needed
 
 **`AgentToolHandler` (`loop/agent_tools.py`)**
-- Add team tool definitions to `get_tool_definitions()` when `TeamManager` is active
-- New handlers: `_handle_create_team()`, `_handle_create_teammate()`, `_handle_shutdown_teammate()`, `_handle_shutdown_team()`, `_handle_team_task_create()`, `_handle_team_task_update()`, `_handle_team_task_list()`, `_handle_send_team_message()`
-- Add `is_lead: bool` flag to control which tools are available (lead-only vs all members)
-- Wire `TeamManager` callbacks similar to existing `_spawn_sub_agent` callback pattern
+- Accept `ToolProviderStrategy` in constructor
+- `get_tool_definitions()` calls `self._tool_provider.get_tool_definitions(agent_role)` and appends results to existing agent tools
+- `_handle_tool_call()` checks `self._tool_provider.owns_tool(name)` before delegating — falls through to existing handlers if not owned
+- No `if team:` branches — the strategy decides what tools exist
 
-**`ReactLoop` (`loop/react_loop.py`)**
-- Modify `_build_messages()`: if `mailbox` ref exists, poll for messages and inject as system message before the volatile suffix
-- Message injection format: `[Team Messages]\nFrom @name: "content"\n...`
-- No changes to tool execution flow — team tools route through `AgentToolHandler` like existing agent tools
+**`LoopRuntime` (`loop/loop_runtime.py`)**
+- Accept `ContextInjectionStrategy` in constructor (optional, defaults to `SoloContextInjector`)
+- New method: `get_context_injections(agent_name)` → delegates to strategy
+- New method: `get_injection_overhead()` → delegates to strategy
+- `ReactLoop._build_messages()` calls these methods alongside existing memory/working-memory injection — same pattern, one more source of context
 
 **`ToolExecutor` (`loop/tool_executor.py`)**
-- No changes needed — teammates share the workspace and use the same `ExecutionContext.workspace_dir` as the lead
+- No changes needed — teammates share the workspace
 
 **`EventEmitter` (`events/event_emitter.py`)**
-- New event types: `team_created`, `teammate_created`, `teammate_removed`, `team_task_updated`, `team_message`, `team_shutdown`
-- Each event carries `team_id` + relevant context
-- Events forwarded to JSON-RPC server as notifications
+- New method: `register_observer(observer: EventObserverStrategy)`
+- Existing `emit_*()` methods call observer hooks at appropriate points
+- Observer returns domain events which the emitter forwards to subscribers (JSON-RPC server)
+- No hardcoded team event types — the observer defines them
 
 **`CheckpointManager` (`session/checkpoint_manager.py`)**
-- Extend `SessionCheckpoint` with optional `team_state: TeamCheckpoint`
-- `TeamCheckpoint` contains: team config, member list, task list snapshot, teammate message thread snapshots
-- On restore: recreate `TeamManager` and resume teammate loops
+- Accept `list[CheckpointStrategy]` in constructor
+- `capture()` calls each strategy's `capture()` and stores under namespaced keys
+- `restore()` calls each strategy's `restore()` with its captured state
+- No knowledge of what's being checkpointed — strategies own their state
 
 **`JSON-RPC Server` (`server/handlers.py`)**
-- New notification methods: `team/created`, `team/teammate_created`, `team/teammate_removed`, `team/task_updated`, `team/message`, `team/teammate_output`
-- Subscribe to `EventEmitter` team events and forward as JSON-RPC notifications
-- No new request methods needed — team operations are tool calls, not direct RPC
+- Subscribe to `EventEmitter` events (already does this for step events)
+- Forward any `team/*` events as JSON-RPC notifications — event-type-based routing, no team-specific handler code
 
 **`config.py`**
-- New env vars: `MAX_TEAMMATES` (default 8), `TEAMMATE_MAX_STEPS` (default 200), `TEAMMATE_IDLE_TIMEOUT` (default 300s), `TEAM_ISOLATION_MODE` (default "auto")
+- New env vars: `MAX_TEAMMATES` (default 8), `TEAMMATE_MAX_STEPS` (default 200), `TEAMMATE_IDLE_TIMEOUT` (default 300s)
 
 #### `cowork-desktop-app` — Required Extensions
 
@@ -1163,48 +1485,56 @@ This is additive — policies without `teamPolicy` use defaults.
 
 ---
 
-## 14. Implementation Plan
+## 15. Implementation Plan
 
-### Phase 3a: Core Team Infrastructure
+### Phase 3a: Strategy Interfaces & Core Infrastructure
 
-1. **SharedTaskList** — in-memory task list with dependencies and locking
-2. **MailboxRouter** — in-memory message queues with poll/send/broadcast
-3. **TeamManager** — teammate lifecycle, wiring shared resources
-5. **TeammateSessionManager** — lightweight session manager variant for teammates
-6. **Team tools** — `CreateTeam`, `CreateTeammate`, `ShutdownTeammate`, `ShutdownTeam`, `TeamTaskCreate`, `TeamTaskUpdate`, `TeamTaskList`, `SendTeamMessage`
-7. **ReactLoop integration** — mailbox polling, message injection
-8. **Unit tests** — all components
+Build the decoupled foundation first, then the team implementation.
+
+1. **Strategy protocols** (`coordination/protocols.py`) — `CoordinationStrategy`, `ToolProviderStrategy`, `ContextInjectionStrategy`, `EventObserverStrategy`, `CheckpointStrategy`
+2. **Solo implementations** (`coordination/solo.py`) — no-op implementations that preserve current behavior exactly
+3. **Strategy injection into existing components** — `SessionManager`, `AgentToolHandler`, `LoopRuntime`, `EventEmitter`, `CheckpointManager` accept strategy objects
+4. **SharedTaskList** — in-memory task list with dependencies and locking
+5. **MailboxRouter** — in-memory message queues with poll/send/broadcast
+6. **TeamManager** — teammate lifecycle, wiring shared resources
+7. **Team strategy implementations** (`teams/strategies.py`) — `TeamCoordinator`, `TeamToolProvider`, `TeamContextInjector`, `TeamEventObserver`, `TeamCheckpointProvider`
+8. **TeammateSessionManager** — lightweight session manager variant for teammates
+9. **Team tools** — `CreateTeam`, `CreateTeammate`, `ShutdownTeammate`, `ShutdownTeam`, `TeamTaskCreate`, `TeamTaskUpdate`, `TeamTaskList`, `SendTeamMessage`
+10. **Unit tests** — all strategy interfaces, solo implementations, team implementations
 
 ### Phase 3b: Desktop App Integration
 
-9. **JSON-RPC notifications** — team events emitted to Desktop App
-10. **Team view UI** — multi-panel layout, per-teammate conversation, shared task board
-11. **Teammate approval UI** — per-panel approval dialogs, batch approve
+11. **JSON-RPC notifications** — team events flow through `EventObserverStrategy` → `EventEmitter` → JSON-RPC
+12. **Team view UI** — multi-panel layout, per-teammate conversation, shared task board
+13. **Teammate approval UI** — per-panel approval dialogs, batch approve
 
 ### Phase 3c: Hardening
 
-12. **Checkpoint/recovery** — persist team state, restore on crash
-13. **Budget reallocation** — lead can redistribute unused teammate budgets
-14. **Idle timeout** — auto-shutdown idle teammates
-15. **Integration tests** — end-to-end team workflows
+14. **Checkpoint/recovery** — `TeamCheckpointProvider` persists team state, restores on crash
+15. **Budget reallocation** — lead can redistribute unused teammate budgets
+16. **Idle timeout** — auto-shutdown idle teammates
+17. **Integration tests** — end-to-end team workflows
 
 ### Estimated Scope
 
 | Component | Effort | Dependencies |
 |-----------|--------|-------------|
+| Strategy protocols | Small | None |
+| Solo implementations | Small | Strategy protocols |
+| Strategy injection (existing components) | Medium | Strategy protocols, Solo implementations |
 | SharedTaskList | Small | None |
 | MailboxRouter | Small | None |
 | TeamManager | Medium | TaskList, Mailbox |
-| TeammateSessionManager | Medium | SessionManager refactor |
+| Team strategy implementations | Medium | Strategy protocols, TeamManager |
+| TeammateSessionManager | Medium | Strategy injection |
 | Team tools | Medium | TeamManager |
-| ReactLoop integration | Small | MailboxRouter |
-| JSON-RPC notifications | Small | EventEmitter |
+| JSON-RPC notifications | Small | EventObserverStrategy |
 | Desktop App team view | Large | JSON-RPC notifications |
-| Checkpoint/recovery | Medium | CheckpointManager |
+| Checkpoint/recovery | Medium | CheckpointStrategy |
 
 ---
 
-## 15. Open Questions
+## 16. Open Questions
 
 1. **Should teammates share the same LLM model, or can the lead assign different models?** A cheaper model for simple tasks (e.g. data extraction, file organization) could reduce costs significantly. The `LLMClient` already takes a model parameter.
 
@@ -1218,7 +1548,7 @@ This is additive — policies without `teamPolicy` use defaults.
 
 ---
 
-## 16. References
+## 17. References
 
 - **Claude Code Agent Teams**: [Official docs](https://code.claude.com/docs/en/agent-teams), announced Feb 2026 with Opus 4.6
 - **"Building a C compiler with a team of parallel Claudes"**: Anthropic engineering blog — 16 agents, 100K lines of Rust, ~$20K
