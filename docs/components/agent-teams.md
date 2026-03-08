@@ -175,7 +175,7 @@ class TeamTask:
     task_id: str
     title: str
     description: str
-    status: Literal["pending", "claimed", "in_progress", "completed", "failed", "blocked"]
+    status: Literal["pending", "in_progress", "completed", "failed", "blocked"]
     assignee: str | None = None         # teammate name
     created_by: str = ""                # teammate name
     blocked_by: list[str] = field(default_factory=list)  # task_ids
@@ -190,7 +190,7 @@ class SharedTaskList:
     _lock: asyncio.Lock
 
     async def create_task(self, title, description, blocked_by=None, created_by="") -> TeamTask: ...
-    async def claim_task(self, task_id: str, assignee: str) -> TeamTask: ...
+    async def assign_task(self, task_id: str, assignee: str) -> TeamTask: ...
     async def update_status(self, task_id: str, status: str, result: str | None = None) -> TeamTask: ...
     async def list_tasks(self, status: str | None = None, assignee: str | None = None) -> list[TeamTask]: ...
     async def get_task(self, task_id: str) -> TeamTask | None: ...
@@ -300,7 +300,7 @@ sequenceDiagram
 
     Note over TL: "Analyze trends" auto-unblocked → status=pending
 
-    A->>TL: claim("Analyze trends")
+    A->>TL: assign("Analyze trends")
     Note over A: Reads task.result to find output location
     A->>WS: Read files from research/raw-data/
     A->>A: Process data...
@@ -398,7 +398,7 @@ New tools added to `AgentToolHandler` when a team is active:
     "name": "TeamTaskUpdate",
     "parameters": {
         "task_id": {"type": "string"},
-        "status": {"type": "string", "enum": ["claimed", "in_progress", "completed", "failed"]},
+        "status": {"type": "string", "enum": ["in_progress", "completed", "failed"]},
         "result": {"type": "string", "description": "Completion summary (when status=completed)"}
     }
 }
@@ -576,10 +576,10 @@ sequenceDiagram
     Lead->>TL: TeamTaskCreate("Write executive summary", blocked_by=[task-1, task-2])
 
     par Parallel Execution
-        T1->>TL: claim("Gather competitor data")
+        T1->>TL: assign("Gather competitor data")
         T1->>T1: Research competitors in shared workspace...
     and
-        T2->>TL: claim("Analyze market trends")
+        T2->>TL: assign("Analyze market trends")
         T2->>T2: Process market data in shared workspace...
     end
 
@@ -587,7 +587,7 @@ sequenceDiagram
     T2->>TL: update(task-2, status="completed")
     Note over TL: "Write executive summary" auto-unblocked
 
-    T1->>TL: claim("Write executive summary")
+    T1->>TL: assign("Write executive summary")
     T1->>T1: Draft summary from research + analysis...
     T1->>TL: update(task-3, status="completed")
 
@@ -732,7 +732,7 @@ assigned tasks. Check the task list to see what others are working on to avoid c
 
 ## Coordination
 - Use TeamTaskList to see what needs to be done
-- Use TeamTaskUpdate to claim tasks and report completion
+- Use TeamTaskUpdate to pick up tasks and report completion
 - Use SendTeamMessage to communicate with teammates or the lead
 - Save your work frequently
 
@@ -1016,9 +1016,8 @@ Checkpointing is **batched by the lead** to avoid excessive I/O:
 
 1. **Teammate step completes** → teammate updates its in-memory state snapshot (thread, working memory, budget, active task)
 2. **Lead step completes** → lead writes a full team checkpoint atomically, capturing all teammates' latest in-memory snapshots
-3. **Periodic flush** — if the lead is idle but teammates are active, a timer (every 30s) triggers a checkpoint write to avoid unbounded data loss
 
-Checkpoint is still **one file per lead session** — teammate state is nested inside. This batching means at most one checkpoint write per lead step (or per 30s timer), regardless of how many teammate steps complete in between. The trade-off: on crash, teammates may lose up to 30s of work beyond their last checkpointed state.
+Checkpoint is still **one file per lead session** — teammate state is nested inside. This batching means at most one checkpoint write per lead step, regardless of how many teammate steps complete in between. On crash, teammates may lose work since their last snapshot was captured by a lead checkpoint.
 
 On recovery, each teammate resumes from whatever state is in the checkpoint — the checkpoint file **is** the recovery point, no separate cursor needed.
 
@@ -1278,7 +1277,6 @@ flowchart TB
         CS[CoordinationStrategy]
         TS[ToolProviderStrategy]
         CIS[ContextInjectionStrategy]
-        EOS[EventObserverStrategy]
         CPS[CheckpointStrategy]
     end
 
@@ -1297,7 +1295,6 @@ flowchart TB
         TC[TeamCoordinator]
         TTP[TeamToolProvider]
         TMI[TeamContextInjector]
-        TEO[TeamEventObserver]
         TCP[TeamCheckpointProvider]
     end
 
@@ -1311,13 +1308,12 @@ flowchart TB
     CS --> SM
     TS --> ATH
     CIS --> RL
-    EOS --> EE
     CPS --> CP
+    TC -->|emits events directly| EE
 
     TC -.->|implements| CS
     TTP -.->|implements| TS
     TMI -.->|implements| CIS
-    TEO -.->|implements| EOS
     TCP -.->|implements| CPS
 
     SC -.->|implements| CS
@@ -1394,29 +1390,23 @@ Controls what extra context is injected into the LLM's message window each turn.
 
 ```python
 class ContextInjectionStrategy(Protocol):
-    """Injects additional context into the LLM message window."""
+    """Injects additional context into the LLM message window.
 
-    async def get_injections(self, agent_name: str) -> list[ContextInjection]:
-        """Return context blocks to inject before the next LLM call.
+    Injections are always placed after working memory, before conversation history.
+    """
+
+    async def get_injections(self, agent_name: str) -> list[str]:
+        """Return context strings to inject before the next LLM call.
 
         Called by the LoopStrategy during _build_messages().
+        Each string becomes a system message inserted after working memory.
         """
 
     def estimate_overhead_tokens(self) -> int:
         """Estimated token cost of injections (for compaction budget)."""
 ```
 
-```python
-@dataclass
-class ContextInjection:
-    content: str
-    position: Literal["after_system", "before_last_user", "volatile_suffix"]
-    label: str  # e.g. "[Team Messages]", "[Task Status]"
-```
-
-**Merge order in `ReactLoop._build_messages()`:**
-
-The `LoopStrategy` calls `context_injector.get_injections()` during context assembly. Injections are placed **after** memory and working memory injection but **before** history compaction budget is calculated. This ensures team context is visible without crowding out conversation history.
+Injections are always placed **after working memory** in the context assembly order:
 
 ```
 1. System prompt (static)
@@ -1437,41 +1427,12 @@ The `estimate_overhead_tokens()` method returns the estimated token cost of inje
 From @researcher: "Source data ready in research/raw-data/"
 
 [Current Task]
-"Analyze market trends" (claimed, 2 dependencies completed)
+"Analyze market trends" (in_progress, 2 dependencies completed)
 ```
 
 **Future**: could implement `SkillContextInjector`, `RAGContextInjector`, etc.
 
-#### 4. EventObserverStrategy
-
-Controls what events the session emits beyond the standard set. `EventEmitter` delegates to observers for domain-specific events.
-
-```python
-class EventObserverStrategy(Protocol):
-    """Observes agent actions and emits domain-specific events."""
-
-    async def on_agent_spawned(self, agent_info: AgentInfo) -> list[Event]:
-        """Called when a coordinated agent starts. Return events to emit."""
-
-    async def on_agent_shutdown(self, agent_name: str) -> list[Event]:
-        """Called when a coordinated agent stops."""
-
-    async def on_tool_result(
-        self, tool_name: str, result: ToolResult, agent_name: str
-    ) -> list[Event]:
-        """Called after a tool completes. Return domain events to emit."""
-
-    async def on_message_sent(
-        self, from_agent: str, to_agent: str, content: str
-    ) -> list[Event]:
-        """Called when an inter-agent message is sent."""
-```
-
-**Solo implementation**: returns empty lists for all hooks.
-
-**Team implementation** (`TeamEventObserver`): emits `team/teammate_created`, `team/task_updated`, `team/message`, etc. The JSON-RPC server subscribes to these events and forwards them as notifications — no team-specific code in the server.
-
-#### 5. CheckpointStrategy
+#### 4. CheckpointStrategy
 
 Controls what additional state is persisted during checkpointing.
 
@@ -1501,13 +1462,11 @@ if session_config.team_mode_enabled:
     self._coordination = TeamCoordinator(config=session_config.team_config)
     self._tool_provider = TeamToolProvider(coordinator=self._coordination)
     self._context_injector = TeamContextInjector(coordinator=self._coordination)
-    self._event_observer = TeamEventObserver(coordinator=self._coordination)
     self._checkpoint_strategy = TeamCheckpointProvider(coordinator=self._coordination)
 else:
     self._coordination = SoloCoordinator()
     self._tool_provider = SoloToolProvider()
     self._context_injector = SoloContextInjector()
-    self._event_observer = SoloEventObserver()
     self._checkpoint_strategy = SoloCheckpointProvider()
 ```
 
@@ -1528,9 +1487,6 @@ agent_tool_handler = AgentToolHandler(
     ...
 )
 
-# EventEmitter receives the observer
-event_emitter.register_observer(self._event_observer)
-
 # CheckpointManager receives the checkpoint strategy
 checkpoint_manager = CheckpointManager(
     ...,
@@ -1543,7 +1499,7 @@ checkpoint_manager = CheckpointManager(
 
 | Benefit | How |
 |---------|-----|
-| **Zero team code in existing components** | `ReactLoop`, `AgentToolHandler`, `EventEmitter`, `CheckpointManager` call strategy interfaces — they don't know about teams |
+| **Zero team code in existing components** | `ReactLoop`, `AgentToolHandler`, `CheckpointManager` call strategy interfaces — they don't know about teams |
 | **Solo mode is unchanged** | Solo strategies are no-ops. Zero overhead, zero behavioral change for non-team sessions |
 | **Team logic is cohesive** | All team code lives in `agent_host/teams/`. Strategy implementations compose `TeamManager`, `SharedTaskList`, and `MailboxRouter` internally |
 | **Independent evolution** | Team strategies can add features (task priorities, budget reallocation, idle timeouts) without modifying `ReactLoop` or `SessionManager` |
@@ -1594,14 +1550,12 @@ flowchart TB
             CS[CoordinationStrategy]
             TPS[ToolProviderStrategy]
             CIS[ContextInjectionStrategy]
-            EOS[EventObserverStrategy]
             CPS_P[CheckpointStrategy]
         end
         subgraph TeamImpl["teams/"]
             TC[TeamCoordinator]
             TTP[TeamToolProvider]
             TMI[TeamContextInjector]
-            TEO[TeamEventObserver]
             TCP[TeamCheckpointProvider]
             TM[TeamManager]
             TL[SharedTaskList]
@@ -1620,7 +1574,6 @@ flowchart TB
         SM[SessionManager<br/>+ selects & wires strategies]
         ATH[AgentToolHandler<br/>+ delegates to ToolProviderStrategy]
         LRT[LoopRuntime<br/>+ accepts ContextInjectionStrategy]
-        EE[EventEmitter<br/>+ accepts EventObserverStrategy]
         CP[CheckpointManager<br/>+ accepts CheckpointStrategy]
     end
 
@@ -1637,7 +1590,6 @@ flowchart TB
     SM --> CS
     ATH --> TPS
     LRT --> CIS
-    EE --> EOS
     CP --> CPS_P
 
     TC -.->|implements| CS
@@ -1658,9 +1610,9 @@ Note: `ReactLoop` is unchanged — it already calls `LoopRuntime` for context as
 #### `cowork-agent-runtime` — Detailed Changes Per Module
 
 **`SessionManager` (`session/session_manager.py`)**
-- Add strategy fields: `_coordination`, `_tool_provider`, `_context_injector`, `_event_observer`, `_checkpoint_strategy`
+- Add strategy fields: `_coordination`, `_tool_provider`, `_context_injector`, `_checkpoint_strategy`
 - New method: `_configure_strategies()` → selects Solo or Team implementations based on session config
-- Inject strategies into `LoopRuntime`, `AgentToolHandler`, `EventEmitter`, `CheckpointManager` at construction time
+- Inject strategies into `LoopRuntime`, `AgentToolHandler`, `CheckpointManager` at construction time
 - `shutdown()` delegates to `_coordination.shutdown_all()` — no team-specific knowledge needed
 
 **`AgentToolHandler` (`loop/agent_tools.py`)**
@@ -1679,10 +1631,8 @@ Note: `ReactLoop` is unchanged — it already calls `LoopRuntime` for context as
 - No changes needed — teammates share the workspace
 
 **`EventEmitter` (`events/event_emitter.py`)**
-- New method: `register_observer(observer: EventObserverStrategy)`
-- Existing `emit_*()` methods call observer hooks at appropriate points
-- Observer returns domain events which the emitter forwards to subscribers (JSON-RPC server)
-- No hardcoded team event types — the observer defines them
+- `TeamCoordinator` emits team events (`team/teammate_created`, `team/task_updated`, `team/message`) directly via `EventEmitter.emit()` — no observer indirection
+- JSON-RPC server subscribes to `team/*` events and forwards as notifications (same subscription pattern as step events)
 
 **`CheckpointManager` (`session/checkpoint_manager.py`)**
 - Accept `list[CheckpointStrategy]` in constructor
@@ -1825,14 +1775,13 @@ The plan is structured as **increments** — each increment produces a working, 
 
 | Step | Repo | What | Test |
 |------|------|------|------|
-| 1.1 | `cowork-agent-runtime` | Create `coordination/protocols.py` — all 5 strategy protocols (`CoordinationStrategy`, `ToolProviderStrategy`, `ContextInjectionStrategy`, `EventObserverStrategy`, `CheckpointStrategy`) | Type-check only (protocols are abstract) |
-| 1.2 | `cowork-agent-runtime` | Create `coordination/solo.py` — Solo implementations for all 5 protocols (no-ops) | Unit tests: each Solo implementation satisfies its protocol |
+| 1.1 | `cowork-agent-runtime` | Create `coordination/protocols.py` — all 4 strategy protocols (`CoordinationStrategy`, `ToolProviderStrategy`, `ContextInjectionStrategy`, `CheckpointStrategy`) | Type-check only (protocols are abstract) |
+| 1.2 | `cowork-agent-runtime` | Create `coordination/solo.py` — Solo implementations for all 4 protocols (no-ops) | Unit tests: each Solo implementation satisfies its protocol |
 | 1.3 | `cowork-agent-runtime` | Modify `SessionManager` — accept strategy objects in constructor, default to Solo implementations, call `_coordination.on_session_start()` / `on_session_shutdown()` | Existing unit + service tests pass unchanged |
 | 1.4 | `cowork-agent-runtime` | Modify `AgentToolHandler` — accept `ToolProviderStrategy`, call `get_tool_definitions()` and `handle_tool_call()` | Existing unit tests pass unchanged |
 | 1.5 | `cowork-agent-runtime` | Modify `LoopRuntime` — accept `ContextInjectionStrategy`, call `get_injections()` in `ReactLoop._build_messages()` | Existing unit tests pass unchanged |
-| 1.6 | `cowork-agent-runtime` | Modify `EventEmitter` — accept `EventObserverStrategy`, call observer hooks | Existing unit tests pass unchanged |
-| 1.7 | `cowork-agent-runtime` | Modify `CheckpointManager` — accept `list[CheckpointStrategy]` | Existing unit tests pass unchanged |
-| 1.8 | `cowork-agent-runtime` | Run full test suite (`make check`) + `make test-chat` | **Gate:** all tests green, zero behavioral change |
+| 1.6 | `cowork-agent-runtime` | Modify `CheckpointManager` — accept `list[CheckpointStrategy]` | Existing unit tests pass unchanged |
+| 1.7 | `cowork-agent-runtime` | Run full test suite (`make check`) + `make test-chat` | **Gate:** all tests green, zero behavioral change |
 
 **Deliverable:** Strategy pattern is in place. All existing tests pass. Solo implementations are the default. Team code doesn't exist yet.
 
@@ -1843,7 +1792,7 @@ The plan is structured as **increments** — each increment produces a working, 
 | Step | Repo | What | Test |
 |------|------|------|------|
 | 2.1 | `cowork-agent-runtime` | Create `teams/models.py` — `TeamConfig`, `TeammateInfo`, `TeamTask`, `TeamMessage`, `AgentRole` enum | Type-check |
-| 2.2 | `cowork-agent-runtime` | Create `teams/task_list.py` — `SharedTaskList` with dependency resolution, `asyncio.Lock`, cycle detection | Unit tests: CRUD, claiming, dependency unblocking, cycle rejection, concurrent access |
+| 2.2 | `cowork-agent-runtime` | Create `teams/task_list.py` — `SharedTaskList` with dependency resolution, `asyncio.Lock`, cycle detection | Unit tests: CRUD, assignment, dependency unblocking, cycle rejection, concurrent access |
 | 2.3 | `cowork-agent-runtime` | Create `teams/mailbox.py` — `MailboxRouter` with per-agent queues, `asyncio.Queue`, broadcast | Unit tests: send, poll, broadcast, register/unregister, empty poll |
 | 2.4 | `cowork-agent-runtime` | Create `teams/team_manager.py` — `TeamManager` lifecycle (create/shutdown teammates), wires TaskList + Mailbox | Unit tests: create team, add teammates, shutdown individual, shutdown all, enforce limits |
 | 2.5 | `cowork-agent-runtime` | Run `make check` | **Gate:** all tests green, new modules tested in isolation |
@@ -1860,9 +1809,8 @@ The plan is structured as **increments** — each increment produces a working, 
 | 3.2 | `cowork-agent-runtime` | Create `teams/tools.py` — team tool definitions (`CreateTeam`, `CreateTeammate`, `ShutdownTeammate`, `ShutdownTeam`, `TeamTaskCreate`, `TeamTaskUpdate`, `TeamTaskList`, `SendTeamMessage`) | Unit tests: tool schema validation |
 | 3.3 | `cowork-agent-runtime` | Add `TeamToolProvider` to `teams/strategies.py` — implements `ToolProviderStrategy`, filters tools by `AgentRole` | Unit tests: lead gets all tools, teammate gets subset, solo gets none |
 | 3.4 | `cowork-agent-runtime` | Add `TeamContextInjector` to `teams/strategies.py` — implements `ContextInjectionStrategy`, polls mailbox + task status | Unit tests: returns injections when messages pending, empty when not |
-| 3.5 | `cowork-agent-runtime` | Add `TeamEventObserver` to `teams/strategies.py` — implements `EventObserverStrategy`, emits team events | Unit tests: events emitted for teammate spawn, task update, message |
-| 3.6 | `cowork-agent-runtime` | Modify `SessionManager._configure_strategies()` — select Team implementations when `team_mode_enabled` in session config | Unit test: correct strategies selected based on config |
-| 3.7 | `cowork-agent-runtime` | Run `make check` | **Gate:** all tests green |
+| 3.5 | `cowork-agent-runtime` | Modify `SessionManager._configure_strategies()` — select Team implementations when `team_mode_enabled` in session config | Unit test: correct strategies selected based on config |
+| 3.6 | `cowork-agent-runtime` | Run `make check` | **Gate:** all tests green |
 
 **Deliverable:** Strategy implementations ready. `SessionManager` can select Team mode. No actual teammate agent loops yet.
 
@@ -1879,7 +1827,7 @@ The plan is structured as **increments** — each increment produces a working, 
 | 4.5 | `cowork-agent-runtime` | Wire shutdown flow — `ShutdownTeam` → `TeamCoordinator.shutdown_all()` → graceful + timeout + force-cancel | Integration test: shutdown with and without timeout |
 | 4.6 | `cowork-platform` | Add team error codes to shared error schema: `TEAM_MODE_DISABLED`, `TEAMMATE_BUDGET_EXCEEDED`, `TASK_DEPENDENCY_CYCLE`, etc. | Schema validation tests |
 | 4.7 | `cowork-session-service` | Add `teamId`, `parentSessionId`, `sessionType` fields to Session model. Add `teamId-index` GSI. | Service tests: create teammate session, query by teamId |
-| 4.8 | `cowork-agent-runtime` | End-to-end test: lead creates team → creates 2 teammates → teammates claim and complete tasks → lead verifies → shutdown | `make test-chat` extended with team scenario |
+| 4.8 | `cowork-agent-runtime` | End-to-end test: lead creates team → creates 2 teammates → teammates pick up and complete tasks → lead verifies → shutdown | `make test-chat` extended with team scenario |
 
 **Deliverable:** Teams work end-to-end in the agent runtime. Lead spawns teammates, they execute tasks, communicate via mailbox, and shut down cleanly.
 
@@ -1890,7 +1838,7 @@ The plan is structured as **increments** — each increment produces a working, 
 | Step | Repo | What | Test |
 |------|------|------|------|
 | 5.1 | `cowork-agent-runtime` | Add `TeamCheckpointProvider` to `teams/strategies.py` — implements `CheckpointStrategy`, captures/restores team state (members, task list, mailbox queues) | Unit tests: capture, restore, round-trip |
-| 5.2 | `cowork-agent-runtime` | Wire checkpoint timing — batched writes (lead step + 30s timer), teammate in-memory snapshots | Integration test: verify checkpoint file contains team state after teammate step |
+| 5.2 | `cowork-agent-runtime` | Wire checkpoint timing — batched writes (lead checkpoints after its own steps, capturing all teammate snapshots) | Integration test: verify checkpoint file contains team state after teammate step |
 | 5.3 | `cowork-agent-runtime` | Wire crash recovery — `TeamCheckpointProvider.restore()` → recreate `TeamManager`, resume teammate loops, call `POST /sessions/{id}/resume` for each | Integration test: kill process, restart, verify team resumes from checkpoint |
 | 5.4 | `cowork-agent-runtime` | Wire session history upload — each teammate uploads `session_history` artifact on task completion; lead uploads summary on team shutdown | Integration test: verify artifacts exist in Workspace Service after team shutdown |
 | 5.5 | `cowork-agent-runtime` | Run `make check` + `make test-chat` | **Gate:** all tests green, crash recovery verified |
@@ -1903,7 +1851,7 @@ The plan is structured as **increments** — each increment produces a working, 
 
 | Step | Repo | What | Test |
 |------|------|------|------|
-| 6.1 | `cowork-agent-runtime` | Wire JSON-RPC notifications — `TeamEventObserver` events → `EventEmitter` → JSON-RPC server → Desktop App | Unit test: events forwarded as JSON-RPC notifications |
+| 6.1 | `cowork-agent-runtime` | Wire JSON-RPC notifications — `TeamCoordinator` emits `team/*` events via `EventEmitter` → JSON-RPC server → Desktop App | Unit test: events forwarded as JSON-RPC notifications |
 | 6.2 | `cowork-desktop-app` | Add `TeamState` slice to state management — team config, members, task list, per-teammate conversation buffers | Unit test: state updates on team events |
 | 6.3 | `cowork-desktop-app` | Add IPC handlers for `team/*` notification methods | Unit test: handlers registered, state updated |
 | 6.4 | `cowork-desktop-app` | Create `TeamView` — multi-panel container that splits screen into lead + teammate panels + task board | Visual test: layout renders correctly with 1, 2, 4 teammates |
