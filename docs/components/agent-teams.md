@@ -273,6 +273,57 @@ This is the same coordination model humans use — you don't lock files, you div
 
 If two teammates do write the same file (rare with good task decomposition), the later write wins. The lead can detect this during verification and fix it.
 
+#### Inter-Teammate Data Flow
+
+When one teammate's work depends on another's output (e.g. an analyst waiting on a researcher's data), three mechanisms work together:
+
+```mermaid
+sequenceDiagram
+    participant R as Teammate: researcher
+    participant TL as SharedTaskList
+    participant WS as Shared Workspace
+    participant A as Teammate: analyst
+
+    Note over A: Task "Analyze trends" blocked_by=["gather-data"]
+
+    R->>WS: Write files to research/raw-data/
+    R->>TL: TeamTaskUpdate("gather-data", status="completed", result="Data in research/raw-data/, 12 files")
+
+    Note over TL: "Analyze trends" auto-unblocked → status=pending
+
+    A->>TL: claim("Analyze trends")
+    Note over A: Reads task.result to find output location
+    A->>WS: Read files from research/raw-data/
+    A->>A: Process data...
+```
+
+**1. SharedTaskList dependencies (sequencing)** — The analyst's task has `blocked_by=["gather-data"]`. It stays blocked until the researcher marks their task completed. This ensures the analyst doesn't start before the data exists.
+
+**2. Workspace files (data transfer)** — The researcher writes output to the shared workspace. The analyst reads those files directly. This is the primary mechanism for transferring substantial data between teammates.
+
+**3. Task result field (location discovery)** — When the researcher completes a task, the `result` field includes where the output lives: `"Data in research/raw-data/, 12 files"`. The analyst reads this from the task list to know where to look.
+
+**Convention:** The lead agent establishes the data flow when creating tasks. Each task's `description` specifies:
+- **Where to write output** — so the producer knows the expected location
+- **Where to read input** — so the consumer knows where to look
+- **What format to expect** — so the consumer can parse without guessing
+
+Example task descriptions from the lead:
+
+```
+Task: "Gather competitor data"
+  Description: "Research the top 8 competitors. Save one file per competitor
+    in research/competitors/{name}.md. Each file should have sections:
+    Overview, Products, Pricing, Market Share."
+
+Task: "Analyze market trends" (blocked_by: gather-data)
+  Description: "Read competitor profiles from research/competitors/.
+    Produce trend analysis in data/analysis/trends.md and comparison
+    charts in reports/charts/. Use the competitor data as primary source."
+```
+
+For lightweight coordination that doesn't need task dependencies (e.g. a tip or status update mid-task), teammates use **MailboxRouter messages** directly. Messages are injected into the recipient's LLM context before their next call, so they're seen promptly but don't interrupt work in progress.
+
 #### Future Enhancement: Git Worktrees (Phase 3c)
 
 For git repositories where true isolation becomes necessary (e.g. teammates experimenting with conflicting approaches), git worktrees can be added as an opt-in mode later. Worktrees are lightweight (shared `.git` objects, no data copy) and provide branch-based isolation with git's merge machinery for consolidation. This is deferred to keep the initial implementation simple.
