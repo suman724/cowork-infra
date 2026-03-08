@@ -1083,7 +1083,72 @@ New notifications from Agent Host → Desktop App:
 
 ---
 
-## 12. Constraints & Guardrails
+## 12. Memory Sharing
+
+### How Memory Works Today (Single Agent)
+
+The agent has two memory systems (see [local-agent-host.md](local-agent-host.md) §4.9):
+
+| Memory | Scope | Lifetime | Purpose |
+|--------|-------|----------|---------|
+| **Working Memory** | Per-session, in-memory | Lives for one session | Task tracker, plan, notes — injected every LLM turn |
+| **Persistent Memory** | Per-workspace, on disk | Survives across sessions | Project patterns, conventions, learned facts — `MEMORY.md` + topic files |
+
+Persistent memory is **workspace-scoped**: stored at `~/.cowork/projects/<hash>/memory/` where `<hash>` is SHA-256 of the resolved workspace path. Since all teammates share the same workspace directory, they share the same persistent memory files.
+
+### What Changes for Teams
+
+**Working Memory: per-teammate (isolated)**
+
+Each teammate gets its own `WorkingMemory` instance, just like today's sub-agents. Teammates cannot access each other's working memory. This is already the case — teammate creation in §6.1 specifies "Fresh: MessageThread, TokenBudget, WorkingMemory".
+
+**Persistent Memory: shared workspace, lead-only writes**
+
+All teammates can **read** persistent memory (`MEMORY.md` and topic files) since it's part of the shared workspace. However, only the **lead** can **write** to persistent memory.
+
+```mermaid
+flowchart LR
+    subgraph PM["Persistent Memory<br/>~/.cowork/projects/&lt;hash&gt;/memory/"]
+        MEM["MEMORY.md"]
+        TF1["patterns.md"]
+        TF2["conventions.md"]
+    end
+
+    Lead["Lead Agent"] -->|read + write| PM
+    T1["Teammate: researcher"] -->|read only| PM
+    T2["Teammate: analyst"] -->|read only| PM
+```
+
+#### Why Lead-Only Writes
+
+- **No concurrent write conflicts** — with multiple teammates writing to `MEMORY.md` simultaneously, the last write wins and earlier writes are silently lost. Restricting writes to the lead eliminates this.
+- **Memory quality** — the lead has full context on the project and team activity. Teammates have narrow, task-focused context. Letting teammates write memories risks polluting the memory space with overly specific or short-lived observations.
+- **Consistent with lead authority** — the lead controls team composition, task decomposition, and result consolidation. Controlling persistent memory follows the same authority model.
+
+#### Implementation
+
+The `AgentToolHandler` already controls tool availability per agent role. For teammates:
+- `SaveMemory`, `DeleteMemory` → **not available** (excluded from teammate tool definitions)
+- `RecallMemory`, `ListMemories` → **available** (read-only access)
+
+The `ContextInjectionStrategy` handles `MEMORY.md` injection for all agents — since teammates share the same workspace path, `PersistentMemory` reads the same `MEMORY.md` file. No special handling needed.
+
+#### What Teammates Use Instead
+
+Teammates use **working memory** and **the shared workspace** for their own state:
+
+| Need | Mechanism |
+|------|-----------|
+| Track my current plan and progress | `WorkingMemory` (per-teammate, in-session) |
+| Share findings with other teammates | Write to workspace files + `SendTeamMessage` (§3.4) |
+| Record a decision for the team | `SendTeamMessage` to lead → lead updates persistent memory if warranted |
+| Remember something across sessions | Not applicable — teammates don't persist across sessions |
+
+This last point is key: teammates are ephemeral (they exist only for the duration of a team). There's no cross-session continuity for a teammate, so persistent memory writes wouldn't benefit them anyway. The lead persists any team learnings that matter for future sessions.
+
+---
+
+## 13. Constraints & Guardrails
 
 ### Hard Limits
 
@@ -1106,7 +1171,7 @@ New notifications from Agent Host → Desktop App:
 
 ---
 
-## 13. Relationship to Existing Sub-Agents
+## 14. Relationship to Existing Sub-Agents
 
 Sub-agents and teammates serve different purposes and **coexist**:
 
@@ -1124,7 +1189,7 @@ A teammate can use `SpawnAgent` for quick sub-tasks, just like the lead does tod
 
 ---
 
-## 14. Strategy-Based Decoupling
+## 15. Strategy-Based Decoupling
 
 ### Problem
 
@@ -1413,7 +1478,7 @@ This follows the same philosophy as `LoopStrategy` / `LoopRuntime`:
 
 ---
 
-## 15. Module Structure
+## 16. Module Structure
 
 ```
 agent_host/
@@ -1663,7 +1728,7 @@ This is additive — policies without `teamPolicy` use defaults.
 
 ---
 
-## 16. Implementation Plan
+## 17. Implementation Plan
 
 ### Phase 3a: Strategy Interfaces & Core Infrastructure
 
@@ -1712,7 +1777,7 @@ Build the decoupled foundation first, then the team implementation.
 
 ---
 
-## 17. Open Questions
+## 18. Open Questions
 
 ### Open
 
@@ -1730,7 +1795,7 @@ Build the decoupled foundation first, then the team implementation.
 
 ---
 
-## 18. References
+## 19. References
 
 - **Claude Code Agent Teams**: [Official docs](https://code.claude.com/docs/en/agent-teams), announced Feb 2026 with Opus 4.6
 - **"Building a C compiler with a team of parallel Claudes"**: Anthropic engineering blog — 16 agents, 100K lines of Rust, ~$20K
