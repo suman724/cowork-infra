@@ -1020,7 +1020,7 @@ Checkpointing is **batched by the lead** to avoid excessive I/O:
 
 Checkpoint is still **one file per lead session** — teammate state is nested inside. This batching means at most one checkpoint write per lead step (or per 30s timer), regardless of how many teammate steps complete in between. The trade-off: on crash, teammates may lose up to 30s of work beyond their last checkpointed state.
 
-Each teammate's checkpoint includes a `last_checkpointed_step: int` field. On recovery, the teammate resumes from this step — any work after it is re-executed.
+On recovery, each teammate resumes from whatever state is in the checkpoint — the checkpoint file **is** the recovery point, no separate cursor needed.
 
 #### Crash Recovery Flow
 
@@ -1053,8 +1053,8 @@ sequenceDiagram
 ```
 
 **Recovery guarantees:**
-- **At-most-once step execution**: a step that was in progress at crash time is lost — the teammate resumes from its `last_checkpointed_step`. This may mean re-doing some work, but prevents duplicate side effects.
-- **Independent resume per teammate**: each teammate's `checkpointCursor` is its own `last_checkpointed_step` — not the lead's step counter. On recovery, each teammate resumes independently from its own cursor.
+- **At-most-once step execution**: a step that was in progress at crash time is lost — the teammate resumes from the state in the checkpoint. This may mean re-doing some work, but prevents duplicate side effects.
+- **Independent resume per teammate**: the checkpoint contains each teammate's full thread and working memory snapshot. On recovery, each teammate resumes from its own snapshot — no shared cursor or step counter needed.
 - **Task list consistency**: restored from checkpoint, not re-derived. If a task was marked completed before the crash, it stays completed.
 - **Pending messages preserved**: mailbox queues are checkpointed, so messages sent before the last checkpoint write are delivered after recovery. Messages sent between the last checkpoint and crash are lost.
 - **Workspace state**: since all work is in the shared workspace (files on disk), workspace changes from completed steps survive the crash. Only in-flight changes from the interrupted step are lost.
