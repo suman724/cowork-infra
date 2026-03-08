@@ -232,8 +232,8 @@ class MailboxRouter:
 - Pending messages are injected as a system message in the context window:
   ```
   [Team Messages]
-  From @backend-dev: "API endpoint is ready at /api/users. Schema: {id, name, email}"
-  From @lead: "Please also add pagination support"
+  From @research-agent: "Found 12 relevant papers on the topic. Summary saved to workspace/research/findings.md"
+  From @lead: "Please also check for contradicting studies from the last 2 years"
   ```
 - This approach avoids interrupting the agent mid-step
 
@@ -257,15 +257,15 @@ Conflicts are prevented by **task decomposition**, not enforcement. The lead age
 ```mermaid
 flowchart LR
     subgraph Workspace["/project/ (shared by all)"]
-        F1["src/billing/"]
-        F2["src/invoicing/"]
-        F3["tests/"]
+        F1["research/"]
+        F2["reports/"]
+        F3["data/"]
     end
 
-    T1["billing-dev<br/>Task: billing service"] -->|works on| F1
-    T2["invoicing-dev<br/>Task: invoicing service"] -->|works on| F2
-    T3["test-dev<br/>Task: write tests"] -->|works on| F3
-    T1 -.->|can read| F2
+    T1["researcher<br/>Task: gather sources"] -->|works on| F1
+    T2["writer<br/>Task: draft report"] -->|works on| F2
+    T3["analyst<br/>Task: process data"] -->|works on| F3
+    T1 -.->|can read| F3
     T2 -.->|can read| F1
 ```
 
@@ -299,7 +299,7 @@ New tools added to `AgentToolHandler` when a team is active:
 {
     "name": "CreateTeammate",
     "parameters": {
-        "name": {"type": "string", "description": "Short identifier (e.g. 'backend-dev')"},
+        "name": {"type": "string", "description": "Short identifier (e.g. 'researcher')"},
         "role": {"type": "string", "description": "Role description for context"},
         "initial_prompt": {"type": "string", "description": "First instruction for the teammate"}
     }
@@ -414,22 +414,22 @@ When team mode is enabled, the lead agent **proposes** a team composition before
 
 ```
 User enables Team Mode, then types:
-  "Refactor the payment module into billing, invoicing, and notification services"
+  "Research and write a comprehensive market analysis report for Q4"
 
 Lead agent proposes:
   "I'd like to set up a team of 3 for this:
-   - billing-dev: Extract billing logic into standalone service
-   - invoicing-dev: Extract invoicing logic into standalone service
-   - notif-dev: Extract notification handling into standalone service
+   - researcher: Gather market data, competitor info, and industry trends
+   - analyst: Process data, create charts, and compute key metrics
+   - writer: Draft the final report with executive summary and recommendations
 
-   I'll create tasks with dependencies so integration tests run after all 3 are done.
+   I'll create tasks with dependencies so the final report runs after research and analysis.
    Shall I proceed?"
 
-User: "Yes, go ahead" (or "Drop notif-dev, I'll handle that myself")
+User: "Yes, go ahead" (or "Drop analyst, I'll handle the numbers myself")
 
-Lead agent → CreateTeam(name="payment-refactor", ...)
-Lead agent → CreateTeammate(name="billing-dev", ...)
-Lead agent → CreateTeammate(name="invoicing-dev", ...)
+Lead agent → CreateTeam(name="q4-market-analysis", ...)
+Lead agent → CreateTeammate(name="researcher", ...)
+Lead agent → CreateTeammate(name="analyst", ...)
 ...
 ```
 
@@ -440,11 +440,11 @@ This two-step flow (propose → confirm) gives the user full control over cost a
 The user can skip the proposal step and specify exactly what they want:
 
 ```
-User: "Team mode. 2 agents: one for backend API, one for frontend React components."
+User: "Team mode. 2 agents: one for research, one for writing the proposal."
 
-Lead agent → CreateTeam(name="feature-build", ...)
-Lead agent → CreateTeammate(name="backend", role="Backend API development", ...)
-Lead agent → CreateTeammate(name="frontend", role="Frontend UI development", ...)
+Lead agent → CreateTeam(name="grant-proposal", ...)
+Lead agent → CreateTeammate(name="researcher", role="Literature review and data gathering", ...)
+Lead agent → CreateTeammate(name="writer", role="Draft and format the proposal document", ...)
 ```
 
 ### 5.3 Agent Can Suggest Team Mode
@@ -452,11 +452,11 @@ Lead agent → CreateTeammate(name="frontend", role="Frontend UI development", .
 When team mode is off, the agent can **suggest** (but not activate) team mode if the task would benefit:
 
 ```
-User: "Refactor all 8 microservices to use the new auth library"
+User: "Organize and summarize all 8 quarterly reports from last year into a single annual review"
 
-Agent: "This involves 8 independent service updates that could run in parallel.
+Agent: "This involves 8 independent report summaries that could run in parallel.
         Would you like to enable Team Mode? I'd suggest 4 teammates,
-        each handling 2 services."
+        each handling 2 quarterly reports."
 
 User: [enables Team Mode toggle] "Go for it"
 ```
@@ -473,8 +473,8 @@ When team mode is enabled, the lead agent's system prompt includes guidance for 
 When the user enables Team Mode, propose a team composition before spawning:
 
 Sizing:
-- 2-3 teammates: Most common. Good for frontend/backend splits, parallel file processing.
-- 4-6 teammates: Large refactors, multi-service changes, comprehensive test suites.
+- 2-3 teammates: Most common. Good for research/writing splits, parallel document processing.
+- 4-6 teammates: Large projects with many independent workstreams (e.g. multi-topic research, batch file processing).
 - 7-8 teammates: Rare. Only for truly large-scale parallel work.
 
 Always propose the team to the user first. Wait for confirmation before calling
@@ -490,43 +490,43 @@ sequenceDiagram
     participant TM as TeamManager
     participant MB as MailboxRouter
     participant TL as SharedTaskList
-    participant T1 as Teammate: billing
-    participant T2 as Teammate: invoicing
+    participant T1 as Teammate: researcher
+    participant T2 as Teammate: analyst
 
-    User->>Lead: "Refactor payment module into billing + invoicing services"
+    User->>Lead: "Create a Q4 market analysis with competitor research and data analysis"
     Note over Lead: Analyzes task, decides team is needed
 
-    Lead->>TM: CreateTeam(name="payment-refactor")
+    Lead->>TM: CreateTeam(name="q4-market-analysis")
     TM-->>Lead: team_id
 
-    Lead->>TM: CreateTeammate(name="billing", role="...", prompt="...")
-    TM->>MB: register("billing")
+    Lead->>TM: CreateTeammate(name="researcher", role="...", prompt="...")
+    TM->>MB: register("researcher")
     TM->>T1: start agent loop (initial_prompt)
-    TM-->>Lead: {status: "created", name: "billing"}
+    TM-->>Lead: {status: "created", name: "researcher"}
 
-    Lead->>TM: CreateTeammate(name="invoicing", role="...", prompt="...")
-    TM->>MB: register("invoicing")
+    Lead->>TM: CreateTeammate(name="analyst", role="...", prompt="...")
+    TM->>MB: register("analyst")
     TM->>T2: start agent loop (initial_prompt)
-    TM-->>Lead: {status: "created", name: "invoicing"}
+    TM-->>Lead: {status: "created", name: "analyst"}
 
-    Lead->>TL: TeamTaskCreate("Extract billing service")
-    Lead->>TL: TeamTaskCreate("Extract invoicing service")
-    Lead->>TL: TeamTaskCreate("Integration tests", blocked_by=[task-1, task-2])
+    Lead->>TL: TeamTaskCreate("Gather competitor data")
+    Lead->>TL: TeamTaskCreate("Analyze market trends")
+    Lead->>TL: TeamTaskCreate("Write executive summary", blocked_by=[task-1, task-2])
 
     par Parallel Execution
-        T1->>TL: claim("Extract billing service")
-        T1->>T1: Work on billing service in shared workspace...
+        T1->>TL: claim("Gather competitor data")
+        T1->>T1: Research competitors in shared workspace...
     and
-        T2->>TL: claim("Extract invoicing service")
-        T2->>T2: Work on invoicing service in shared workspace...
+        T2->>TL: claim("Analyze market trends")
+        T2->>T2: Process market data in shared workspace...
     end
 
     T1->>TL: update(task-1, status="completed")
     T2->>TL: update(task-2, status="completed")
-    Note over TL: "Integration tests" auto-unblocked
+    Note over TL: "Write executive summary" auto-unblocked
 
-    T1->>TL: claim("Integration tests")
-    T1->>T1: Write integration tests...
+    T1->>TL: claim("Write executive summary")
+    T1->>T1: Draft summary from research + analysis...
     T1->>TL: update(task-3, status="completed")
 
     Lead->>TM: ShutdownTeam()
@@ -537,7 +537,7 @@ sequenceDiagram
     TM-->>Lead: team shut down
 
     Lead->>Lead: Verify results in shared workspace
-    Lead-->>User: "Refactoring complete. Created billing and invoicing services."
+    Lead-->>User: "Market analysis complete. Report ready for review."
 ```
 
 ### 5.5 Team Templates (Future Enhancement)
@@ -546,17 +546,17 @@ In a later phase, users or organizations could define reusable team templates:
 
 ```json
 {
-  "name": "fullstack-feature",
-  "description": "Standard template for fullstack feature development",
+  "name": "research-report",
+  "description": "Standard template for research-driven report generation",
   "teammates": [
-    {"name": "backend", "role": "Backend API and database changes"},
-    {"name": "frontend", "role": "Frontend UI components and state management"},
-    {"name": "tests", "role": "Write unit and integration tests for the feature"}
+    {"name": "researcher", "role": "Gather sources, data, and reference materials"},
+    {"name": "analyst", "role": "Process data, create visualizations, compute metrics"},
+    {"name": "writer", "role": "Draft final report with findings and recommendations"}
   ],
   "task_patterns": [
-    {"title": "Implement API endpoints", "assignee": "backend"},
-    {"title": "Build UI components", "assignee": "frontend"},
-    {"title": "Write tests", "blocked_by": ["task-1", "task-2"], "assignee": "tests"}
+    {"title": "Collect and organize source materials", "assignee": "researcher"},
+    {"title": "Analyze data and generate charts", "assignee": "analyst"},
+    {"title": "Write final report", "blocked_by": ["task-1", "task-2"], "assignee": "writer"}
   ]
 }
 ```
@@ -570,10 +570,10 @@ This is **not part of the initial implementation** — the prompt-driven approac
 ### 5.1 Creation
 
 ```
-Lead calls CreateTeammate(name="backend-dev", role="...", initial_prompt="...")
+Lead calls CreateTeammate(name="researcher", role="...", initial_prompt="...")
   │
   ├─ TeamManager.create_teammate()
-  │   ├─ MailboxRouter.register("backend-dev")
+  │   ├─ MailboxRouter.register("researcher")
   │   │
   │   ├─ Create TeammateSessionManager (lightweight variant of SessionManager)
   │   │     → Shares: LLMClient, PolicyEnforcer, PolicyBundle, workspace directory
@@ -581,7 +581,7 @@ Lead calls CreateTeammate(name="backend-dev", role="...", initial_prompt="...")
   │   │
   │   └─ Start agent loop: asyncio.create_task(teammate.run(initial_prompt))
   │
-  └─ Return to lead: {"status": "created", "name": "backend-dev"}
+  └─ Return to lead: {"status": "created", "name": "researcher"}
 ```
 
 ### 6.2 Execution Loop (per Teammate)
@@ -623,27 +623,27 @@ flowchart TD
 
 ```mermaid
 sequenceDiagram
-    participant A as Teammate: backend
+    participant A as Teammate: researcher
     participant MB as MailboxRouter
-    participant B as Teammate: frontend
+    participant B as Teammate: analyst
     participant Lead as Lead Agent
 
-    A->>MB: SendTeamMessage(to="frontend", "API ready at /api/users")
-    MB->>B: Queue message in frontend inbox
+    A->>MB: SendTeamMessage(to="analyst", "Source data ready in research/raw-data/")
+    MB->>B: Queue message in analyst inbox
 
     Note over B: Before next LLM call, polls inbox
-    B->>MB: poll("frontend")
-    MB-->>B: [Message from @backend: "API ready at /api/users"]
+    B->>MB: poll("analyst")
+    MB-->>B: [Message from @researcher: "Source data ready in research/raw-data/"]
     Note over B: Message injected into LLM context
 
-    B->>MB: SendTeamMessage(to="all", "Frontend build passing")
-    MB->>A: Queue broadcast in backend inbox
+    B->>MB: SendTeamMessage(to="all", "Analysis complete, charts in reports/charts/")
+    MB->>A: Queue broadcast in researcher inbox
     MB->>Lead: Queue broadcast in lead inbox
 
-    A->>MB: SendTeamMessage(to="lead", "Blocked: need DB schema decision")
+    A->>MB: SendTeamMessage(to="lead", "Blocked: need clarification on date range")
     MB->>Lead: Queue message in lead inbox
-    Lead->>MB: SendTeamMessage(to="backend", "Use schema v2, see /docs/schema.md")
-    MB->>A: Queue message in backend inbox
+    Lead->>MB: SendTeamMessage(to="researcher", "Use Q4 2025 only, Oct-Dec")
+    MB->>A: Queue message in researcher inbox
 ```
 
 ### 6.3 Teammate System Prompt
@@ -676,9 +676,9 @@ assigned tasks. Check the task list to see what others are working on to avoid c
 ### 6.4 Shutdown
 
 ```
-Lead calls ShutdownTeammate(name="backend-dev")
+Lead calls ShutdownTeammate(name="researcher")
   │
-  ├─ MailboxRouter.send(to="backend-dev", type="shutdown_request")
+  ├─ MailboxRouter.send(to="researcher", type="shutdown_request")
   │
   ├─ Teammate receives shutdown_request in next message poll
   │   ├─ Finishes current step
@@ -688,7 +688,7 @@ Lead calls ShutdownTeammate(name="backend-dev")
   ├─ TeamManager waits for loop completion (timeout: 60s)
   │   └─ If timeout: force-cancel the teammate task
   │
-  └─ MailboxRouter.unregister("backend-dev")
+  └─ MailboxRouter.unregister("researcher")
 ```
 
 ---
@@ -701,23 +701,20 @@ When teammates complete their work, the lead agent verifies and reports the resu
 
 ```mermaid
 sequenceDiagram
-    participant T1 as Teammate: billing
-    participant T2 as Teammate: invoicing
+    participant T1 as Teammate: researcher
+    participant T2 as Teammate: analyst
     participant TL as SharedTaskList
     participant Lead as Lead Agent
     participant User
 
-    T1->>TL: update(task-1, status="completed", result="Created billing service...")
-    T2->>TL: update(task-2, status="completed", result="Created invoicing service...")
+    T1->>TL: update(task-1, status="completed", result="Gathered competitor data...")
+    T2->>TL: update(task-2, status="completed", result="Analyzed market trends...")
 
     Note over Lead: All tasks completed, begin consolidation
 
     Lead->>TL: TeamTaskList() → reviews all completed tasks and results
-    Lead->>Lead: Verify results in workspace (read key files, run tests)
-    Lead->>User: "Refactoring complete. Summary:
-    - billing-dev: Created billing service (5 files)
-    - invoicing-dev: Created invoicing service (4 files)
-    - All tests passing"
+    Lead->>Lead: Verify results in workspace (read key files, check completeness)
+    Lead->>User: Market analysis complete (see consolidation summary)
 ```
 
 ### 7.2 What the Lead Does
@@ -736,28 +733,25 @@ Since the lead decomposes tasks into non-overlapping areas of the workspace, con
 The lead produces a **consolidation summary** for the user:
 
 ```
-Team "payment-refactor" completed:
+Team "q4-market-analysis" completed:
 
-  billing-dev (3 tasks, 42 steps):
-    - Created src/billing/ service with 5 modules
-    - Added 12 unit tests (all passing)
-    - Modified src/shared/config.py (added billing config section)
+  researcher (3 tasks, 42 steps):
+    - Gathered data on 8 competitors in research/competitors/
+    - Collected 12 industry reports, saved to research/sources/
+    - Created research/summary.md with key findings
 
-  invoicing-dev (2 tasks, 38 steps):
-    - Created src/invoicing/ service with 4 modules
-    - Added 8 unit tests (all passing)
-    - Modified src/shared/config.py (added invoicing config section)
-
-  Resolution:
-    - Merged both changes to src/shared/config.py (no conflict, different sections)
+  analyst (2 tasks, 38 steps):
+    - Processed quarterly revenue data into data/analysis/
+    - Generated 5 trend charts in reports/charts/
+    - Created data/metrics.md with computed KPIs
 
   Verification:
-    - All 20 new tests passing
-    - Existing test suite: 145/145 passing
-    - No lint errors
+    - All source files present and cross-referenced
+    - Executive summary covers all research findings
+    - Charts match the underlying data
 ```
 
-The user can then review the changes in the Desktop App's patch preview, just like any other agent output.
+The user can then review the outputs in the Desktop App, just like any other agent output.
 
 ### 7.4 Partial Failure Handling
 
@@ -770,9 +764,9 @@ If a teammate fails or is shut down before completing:
 The lead reports partial failures to the user:
 
 ```
-Team "payment-refactor" completed with issues:
-  billing-dev: Completed all tasks successfully
-  invoicing-dev: Failed on "Add invoice templates" (budget exhausted after 2/3 tasks)
+Team "q4-market-analysis" completed with issues:
+  researcher: Completed all tasks successfully
+  analyst: Failed on "Generate forecast models" (budget exhausted after 2/3 tasks)
     - 2 completed tasks applied
     - 1 remaining task reassigned to lead (completing now)
 ```
@@ -803,7 +797,7 @@ class TeamBudgetConfig:
 **Why independent budgets (not shared):**
 - A runaway teammate cannot starve others
 - Budget exhaustion is localized — one teammate hitting its limit doesn't block the team
-- The lead retains enough budget to synthesize results and merge
+- The lead retains enough budget to verify results and report to user
 
 ---
 
@@ -850,9 +844,9 @@ When a team is active, the Desktop App switches to a **team view**:
 
 ```
 ┌──────────────────────────────────────────────────────────────────┐
-│  Team: "Backend Refactor"                          [Shutdown Team]│
+│  Team: "Q4 Market Analysis"                        [Shutdown Team]│
 ├──────────────────┬──────────────────┬────────────────────────────┤
-│  Lead            │  backend-dev     │  frontend-dev              │
+│  Lead            │  researcher      │  analyst                   │
 │  ─────────────── │  ─────────────── │  ──────────────────────── │
 │  Conversation    │  Conversation    │  Conversation              │
 │  messages...     │  messages...     │  messages...               │
@@ -862,10 +856,10 @@ When a team is active, the Desktop App switches to a **team view**:
 │                  │                  │                            │
 ├──────────────────┴──────────────────┴────────────────────────────┤
 │  Shared Tasks                                                    │
-│  ☑ Set up API routes (backend-dev) — completed                  │
-│  ▶ Build user form (frontend-dev) — in_progress                 │
-│  ⏸ Write integration tests — blocked by: task-1, task-2         │
-│  ○ Deploy to staging — pending                                   │
+│  ☑ Gather competitor data (researcher) — completed               │
+│  ▶ Analyze market trends (analyst) — in_progress                │
+│  ⏸ Write executive summary — blocked by: task-1, task-2         │
+│  ○ Final review and formatting — pending                         │
 └──────────────────────────────────────────────────────────────────┘
 ```
 
@@ -878,19 +872,19 @@ New notifications from Agent Host → Desktop App:
 {"jsonrpc": "2.0", "method": "team/created", "params": {"teamId": "...", "name": "..."}}
 
 // Teammate spawned
-{"jsonrpc": "2.0", "method": "team/teammate_created", "params": {"teamId": "...", "name": "backend-dev", "role": "..."}}
+{"jsonrpc": "2.0", "method": "team/teammate_created", "params": {"teamId": "...", "name": "researcher", "role": "..."}}
 
 // Teammate shut down
-{"jsonrpc": "2.0", "method": "team/teammate_removed", "params": {"teamId": "...", "name": "backend-dev"}}
+{"jsonrpc": "2.0", "method": "team/teammate_removed", "params": {"teamId": "...", "name": "researcher"}}
 
 // Task list updated
 {"jsonrpc": "2.0", "method": "team/task_updated", "params": {"teamId": "...", "task": {...}}}
 
 // Team message sent (for UI display)
-{"jsonrpc": "2.0", "method": "team/message", "params": {"teamId": "...", "from": "backend-dev", "to": "lead", "content": "..."}}
+{"jsonrpc": "2.0", "method": "team/message", "params": {"teamId": "...", "from": "researcher", "to": "lead", "content": "..."}}
 
 // Teammate conversation update (stream to UI panel)
-{"jsonrpc": "2.0", "method": "team/teammate_output", "params": {"teamId": "...", "name": "backend-dev", "content": "..."}}
+{"jsonrpc": "2.0", "method": "team/teammate_output", "params": {"teamId": "...", "name": "researcher", "content": "..."}}
 ```
 
 ---
@@ -924,7 +918,7 @@ Sub-agents and teammates serve different purposes and **coexist**:
 
 | Aspect | Sub-Agents | Teammates |
 |--------|-----------|-----------|
-| **Scope** | Quick focused task (e.g. "search for X") | Extended workstream (e.g. "build the API") |
+| **Scope** | Quick focused task (e.g. "search for X") | Extended workstream (e.g. "research and analyze market data") |
 | **Lifetime** | Single tool call (seconds) | Minutes to hours |
 | **Budget** | Shared with parent | Independent allocation |
 | **File isolation** | None (same directory) | Shared workspace (task-based coordination) |
@@ -1161,11 +1155,11 @@ This is additive — policies without `teamPolicy` use defaults.
 
 ## 15. Open Questions
 
-1. **Should teammates share the same LLM model, or can the lead assign different models?** A cheaper model for simple tasks (e.g. file formatting) could reduce costs significantly. The `LLMClient` already takes a model parameter.
+1. **Should teammates share the same LLM model, or can the lead assign different models?** A cheaper model for simple tasks (e.g. data extraction, file organization) could reduce costs significantly. The `LLMClient` already takes a model parameter.
 
 2. **Should the shared task list be persisted to the Session Service?** Currently in-memory only. Persisting would enable crash recovery and team history, but adds backend coupling. Recommendation: persist to checkpoint file first (like `WorkingMemory`), consider backend persistence later.
 
-3. **How should merge conflicts be handled?** When the lead merges teammate changes back, conflicts may arise (two teammates modified the same file). Options: (a) let the lead agent resolve via its tools, (b) spawn a dedicated sub-agent to resolve, (c) in `shared` mode, use the task list to prevent overlapping file edits. Recommendation: (c) as the default prevention mechanism, with (a) as fallback.
+3. **How should file conflicts be handled?** If two teammates write to the same file (rare with good task decomposition), the later write wins. Options: (a) let the lead detect and fix during verification, (b) add advisory file tracking to the task list so teammates can see who's working where. Recommendation: (a) for simplicity, since good task decomposition prevents most conflicts.
 
 4. **Should teammates be able to request more budget from the lead?** This adds complexity but prevents premature shutdown of productive teammates. Recommendation: implement in Phase 3c with a `BudgetRequest` message type.
 
