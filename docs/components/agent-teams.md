@@ -929,23 +929,28 @@ This is additive to policy — it only skips the user approval UI for actions th
 
 ## 10. Checkpointing & Crash Recovery
 
-### How Checkpointing Works Today (Single Agent)
+### How It Works Today (Single Agent)
 
-The existing checkpoint system (see [local-agent-host.md](local-agent-host.md) §9.2) writes a JSON file after each completed step:
+The existing system has two durability layers (see [local-agent-host.md](local-agent-host.md) §9):
 
-```
-~/Library/Application Support/{AppName}/agent-runtime/checkpoints/{sessionId}.json
-```
+1. **Local checkpoint** — JSON file written after each step. Contains full session state (thread, working memory, token counts, active task). Enables fast, exact resume on crash. Deleted on clean session end.
+2. **Workspace Service sync** — every N steps (default 5) and on task completion, `session_messages` are uploaded as a `session_history` artifact. This is the permanent record.
 
-Contains: session metadata, full message thread, working memory, token usage, active task state. Written atomically (temp file → rename). Deleted on clean session end. On crash, the Agent Host restores from this file and calls `POST /sessions/{sessionId}/resume` to refresh the policy bundle.
+On crash recovery, the Agent Host reads the local checkpoint for exact state. If the checkpoint is corrupt, it falls back to fetching session history from Workspace Service and reconstructing the thread.
 
-Additionally, after each task completes, the full conversation thread is uploaded to the Workspace Service as a `session_history` artifact for permanent storage.
+### Key Insight: Session History Is Sufficient for Resume
+
+The local checkpoint provides a **fast, exact** resume. But session history alone is **functionally sufficient** — the thread can be rebuilt from conversation messages, working memory re-derived from context, and token counts re-estimated. The checkpoint is an optimization, not a necessity.
+
+This insight simplifies the team checkpoint model significantly.
 
 ### What Changes for Teams
 
-Teams introduce multiple concurrent agent loops, each with its own message thread and working memory. The `TeamCheckpointProvider` (implementing `CheckpointStrategy`) extends the existing checkpoint with team state.
+Each teammate is a separate Session entity with its own `sessionId`. Each teammate **independently syncs its own session history** to Workspace Service using the same mechanism the single agent uses today (every N steps + on task completion). No changes to Workspace Service needed — these are just additional `session_history` artifacts keyed by different `sessionId`s in the same workspace.
 
-#### Checkpoint Structure
+The lead's local checkpoint only stores **coordination state** — not full teammate threads:
+
+#### Lead Checkpoint Structure (team_state extension)
 
 ```json
 {
@@ -970,8 +975,6 @@ Teams introduce multiple concurrent agent loops, each with its own message threa
         "role": "Gather market data and competitor info",
         "status": "running",
         "token_budget_remaining": 82000,
-        "thread": [...],
-        "working_memory": {...},
         "active_task_id": "ttask_002"
       },
       "analyst": {
@@ -979,8 +982,6 @@ Teams introduce multiple concurrent agent loops, each with its own message threa
         "role": "Process data and generate charts",
         "status": "idle",
         "token_budget_remaining": 130000,
-        "thread": [...],
-        "working_memory": {...},
         "active_task_id": null
       }
     },
@@ -1010,16 +1011,19 @@ Teams introduce multiple concurrent agent loops, each with its own message threa
 }
 ```
 
+Note what's **not** in `team_state.members`: no `thread`, no `working_memory`, no `session_messages`. Those live in each teammate's own session history in Workspace Service.
+
+#### Durability Model
+
+| Agent | Local checkpoint | Workspace Service sync | What's durable |
+|-------|-----------------|----------------------|----------------|
+| **Lead** | Full state after each lead step (existing behavior) | Every N steps + task completion | Lead conversation + coordination |
+| **Teammates** | Not in lead checkpoint (only metadata) | Each teammate syncs independently every N steps + task completion | Teammate conversations |
+| **Coordination** | Task list, mailbox queues, member list in lead checkpoint | Task list snapshot in lead's final summary artifact | Team coordination state |
+
 #### Checkpoint Write Timing
 
-Checkpointing is **batched by the lead** to avoid excessive I/O:
-
-1. **Teammate step completes** → teammate updates its in-memory state snapshot (thread, working memory, budget, active task)
-2. **Lead step completes** → lead writes a full team checkpoint atomically, capturing all teammates' latest in-memory snapshots
-
-Checkpoint is still **one file per lead session** — teammate state is nested inside. This batching means at most one checkpoint write per lead step, regardless of how many teammate steps complete in between. On crash, teammates may lose work since their last snapshot was captured by a lead checkpoint.
-
-On recovery, each teammate resumes from whatever state is in the checkpoint — the checkpoint file **is** the recovery point, no separate cursor needed.
+Unchanged from single-agent — the lead checkpoints after each of its own completed steps. The `TeamCheckpointProvider` adds coordination state (`team_state`) to the lead's checkpoint. Teammates do not trigger lead checkpoints — they sync their own history to Workspace Service independently.
 
 #### Crash Recovery Flow
 
@@ -1029,6 +1033,7 @@ sequenceDiagram
     participant CP as CheckpointManager
     participant TCP as TeamCheckpointProvider
     participant SS as Session Service
+    participant WS as Workspace Service
     participant TS as TeammateSessionManagers
 
     AH->>CP: restore(checkpoint_file)
@@ -1038,40 +1043,42 @@ sequenceDiagram
     TCP->>SS: POST /sessions/{lead_sessionId}/resume
     SS-->>TCP: Refreshed PolicyBundle
 
-    loop For each teammate in team_state.members
-        TCP->>SS: POST /sessions/{teammate_sessionId}/resume
-        SS-->>TCP: Refreshed PolicyBundle
-        TCP->>TS: Create TeammateSessionManager from snapshot
-        Note over TS: Restore thread, working_memory, budget
-    end
-
     TCP->>TCP: Restore SharedTaskList from task_list snapshot
     TCP->>TCP: Restore MailboxRouter queues from mailbox_queues
 
-    Note over AH: Resume all teammate loops from last checkpointed step
+    loop For each teammate in team_state.members
+        TCP->>SS: POST /sessions/{teammate_sessionId}/resume
+        SS-->>TCP: Refreshed PolicyBundle
+        TCP->>WS: GET session_history for teammate_sessionId
+        WS-->>TCP: Teammate's conversation messages
+        TCP->>TS: Create TeammateSessionManager
+        Note over TS: Rebuild thread from session_history,<br/>re-derive working memory from context
+    end
+
+    Note over AH: Resume all teammate loops
 ```
 
 **Recovery guarantees:**
-- **At-most-once step execution**: a step that was in progress at crash time is lost — the teammate resumes from the state in the checkpoint. This may mean re-doing some work, but prevents duplicate side effects.
-- **Independent resume per teammate**: the checkpoint contains each teammate's full thread and working memory snapshot. On recovery, each teammate resumes from its own snapshot — no shared cursor or step counter needed.
-- **Task list consistency**: restored from checkpoint, not re-derived. If a task was marked completed before the crash, it stays completed.
-- **Pending messages preserved**: mailbox queues are checkpointed, so messages sent before the last checkpoint write are delivered after recovery. Messages sent between the last checkpoint and crash are lost.
-- **Workspace state**: since all work is in the shared workspace (files on disk), workspace changes from completed steps survive the crash. Only in-flight changes from the interrupted step are lost.
-- **Policy refresh**: each teammate calls `POST /sessions/{sessionId}/resume` independently on recovery, receiving a refreshed `PolicyBundle` that the lead propagates to all.
+- **Lead state**: exact resume from local checkpoint (same as single agent)
+- **Teammate state**: reconstructed from Workspace Service session history. Thread is rebuilt, working memory re-derived. Resume is not byte-identical but functionally equivalent — the teammate picks up where it left off with full conversation context
+- **Coordination state**: task list, mailbox queues, and member metadata restored from lead checkpoint. If a task was completed before crash, it stays completed. Pending messages from before the last lead checkpoint are preserved
+- **Workspace files**: survive the crash (files on disk). Only in-flight changes from interrupted steps are lost
+- **Data loss window**: teammate conversation since their last Workspace Service sync (every N steps, default 5). At most ~5 steps of teammate work may need to be re-executed. This is significantly better than the previous design where teammates could lose all work since the last lead step
 
-#### Session History Upload
+#### Session History & Follow-On Tasks
 
-Team session history follows the existing pattern with one addition:
+Each agent's session history is stored independently in Workspace Service:
 
 | Event | What's uploaded | Where |
 |-------|----------------|-------|
+| Every N teammate steps | Teammate's `session_history` artifact (incremental) | Workspace Service (keyed by teammate's `sessionId`) |
+| Teammate task completes | Teammate's `session_history` artifact (final) | Workspace Service (keyed by teammate's `sessionId`) |
 | Lead task completes | Lead's `session_history` artifact | Workspace Service (keyed by lead's `sessionId`) |
-| Teammate task completes | Teammate's `session_history` artifact | Workspace Service (keyed by teammate's `sessionId`) |
 | Team shuts down | Lead uploads final summary + links to teammate sessions | Workspace Service |
 
-Each teammate's history is a separate artifact because each has its own `sessionId`. The lead's history references teammate sessions via `teamId`, enabling the Desktop App to reconstruct the full team conversation when browsing history.
+**Follow-on tasks** in the same session use **lead history only**. The lead's thread contains the full narrative — user prompts, team creation, task definitions, task results from `TeamTaskList`, consolidation summary. Teammate detailed histories are not injected into the lead's context. If the user needs teammate details, they can browse the teammate's panel in History View, or the lead can read workspace files the teammates produced.
 
-**Team task persistence:** `TeamTask` records are **ephemeral** — they live in the `SharedTaskList` (in-memory) and are checkpointed locally. They are **not** persisted to Session Service as `Task` records. Each teammate's real work is tracked via its Session Service `Task` (one per teammate agent loop invocation), while `TeamTask` is a coordination-only concept. The task list state is captured in the checkpoint and in the lead's final `session_history` artifact summary.
+**Team task persistence:** `TeamTask` records are **ephemeral** — they live in the `SharedTaskList` (in-memory) and are included in the lead's local checkpoint. They are **not** persisted to Session Service as `Task` records. Each teammate's real work is tracked via its Session Service `Task` (one per teammate agent loop invocation), while `TeamTask` is a coordination-only concept. The task list state is captured in the lead checkpoint and in the lead's final `session_history` artifact summary.
 
 **History browsing query pattern:**
 1. Desktop App loads lead session from History View
@@ -1079,7 +1086,7 @@ Each teammate's history is a separate artifact because each has its own `session
 3. For each teammate, queries Workspace Service `sessionId-type-index` → `session_history` artifact
 4. Merges all conversations for display with lead as primary, teammates as expandable panels
 
-Note: Workspace Service has no `teamId` index — team history always requires the Session Service hop first. This is acceptable for user-initiated browsing. If performance becomes an issue, a batch artifact fetch endpoint can be added later.
+Note: Workspace Service has no `teamId` index — team history always requires the Session Service hop first. This is acceptable for user-initiated browsing.
 
 ---
 
@@ -1449,7 +1456,7 @@ class CheckpointStrategy(Protocol):
 
 **Solo implementation**: returns empty dict, restore is a no-op.
 
-**Team implementation** (`TeamCheckpointProvider`): captures team config, member list, task list snapshot, and teammate message thread snapshots. On restore, recreates `TeamManager` and resumes teammate loops.
+**Team implementation** (`TeamCheckpointProvider`): captures coordination state only — team config, member metadata (sessionId, role, status, budget), task list snapshot, and mailbox queues. Does **not** capture teammate threads or working memory (those are durable via each teammate's own Workspace Service sync). On restore, recreates `TeamManager`, fetches teammate session histories from Workspace Service, rebuilds threads, and resumes teammate loops.
 
 ### How Strategies Are Wired
 
@@ -1837,13 +1844,13 @@ The plan is structured as **increments** — each increment produces a working, 
 
 | Step | Repo | What | Test |
 |------|------|------|------|
-| 5.1 | `cowork-agent-runtime` | Add `TeamCheckpointProvider` to `teams/strategies.py` — implements `CheckpointStrategy`, captures/restores team state (members, task list, mailbox queues) | Unit tests: capture, restore, round-trip |
-| 5.2 | `cowork-agent-runtime` | Wire checkpoint timing — batched writes (lead checkpoints after its own steps, capturing all teammate snapshots) | Integration test: verify checkpoint file contains team state after teammate step |
-| 5.3 | `cowork-agent-runtime` | Wire crash recovery — `TeamCheckpointProvider.restore()` → recreate `TeamManager`, resume teammate loops, call `POST /sessions/{id}/resume` for each | Integration test: kill process, restart, verify team resumes from checkpoint |
-| 5.4 | `cowork-agent-runtime` | Wire session history upload — each teammate uploads `session_history` artifact on task completion; lead uploads summary on team shutdown | Integration test: verify artifacts exist in Workspace Service after team shutdown |
+| 5.1 | `cowork-agent-runtime` | Wire teammate session history sync — each teammate uploads `session_history` artifact to Workspace Service every N steps + on task completion (reuse existing sync mechanism) | Integration test: verify teammate artifacts exist in Workspace Service |
+| 5.2 | `cowork-agent-runtime` | Add `TeamCheckpointProvider` to `teams/strategies.py` — implements `CheckpointStrategy`, captures coordination state only (member metadata, task list, mailbox queues — no teammate threads) | Unit tests: capture, restore, round-trip |
+| 5.3 | `cowork-agent-runtime` | Wire crash recovery — `TeamCheckpointProvider.restore()` → restore coordination state from checkpoint, fetch teammate histories from Workspace Service, rebuild threads, recreate `TeamManager`, resume loops | Integration test: kill process, restart, verify team resumes |
+| 5.4 | `cowork-agent-runtime` | Wire lead summary upload — lead uploads final summary + teammate session links on team shutdown | Integration test: verify summary artifact references teammate sessions |
 | 5.5 | `cowork-agent-runtime` | Run `make check` + `make test-chat` | **Gate:** all tests green, crash recovery verified |
 
-**Deliverable:** Teams are resilient. Crash recovery works. History is persisted for browsing.
+**Deliverable:** Teams are resilient. Each teammate owns its own durability via Workspace Service sync. Crash recovery rebuilds teammate state from session history. Lead checkpoint only stores coordination metadata.
 
 ### Increment 6: Desktop App — Team View
 
@@ -1888,7 +1895,7 @@ The plan is structured as **increments** — each increment produces a working, 
 | 2 | Core primitives | agent-runtime | **Zero** — isolated new modules |
 | 3 | Team strategies | agent-runtime | **Low** — new code behind strategy interfaces |
 | 4 | Agent loops + backend | agent-runtime, platform, session-service | **Medium** — first real integration |
-| 5 | Checkpointing | agent-runtime | **Low** — extends existing checkpoint |
+| 5 | Durability & recovery | agent-runtime | **Low** — reuses existing sync mechanism, extends checkpoint with coordination metadata only |
 | 6 | Desktop App | desktop-app, agent-runtime | **Medium** — new UI views + IPC |
 | 7 | Hardening | all | **Low** — polish and optimization |
 
