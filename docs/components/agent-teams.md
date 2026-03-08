@@ -240,7 +240,7 @@ class MailboxRouter:
 
 New module: `agent_host/teams/workspace_isolation.py`
 
-Provides file-level isolation between teammates. Cowork is a general-purpose agent — not all workspaces are git repos — so isolation is **directory-based by default** with git worktrees as an optional optimization when a repo is detected.
+Provides file-level isolation between teammates. The key design constraint: **workspaces can be very large** (multi-GB repos, data directories, media files). Copying the entire workspace per teammate is not practical. The isolation strategy must be lightweight.
 
 ```python
 class IsolationStrategy(Protocol):
@@ -251,12 +251,16 @@ class IsolationStrategy(Protocol):
     async def cleanup(self, teammate_name: str) -> None: ...
     async def cleanup_all(self) -> None: ...
 
-class DirectorySandbox:
-    """Default strategy: copy workspace into a sandboxed directory."""
+class SharedWithFileReservation:
+    """Default strategy: shared workspace + file reservation via task list."""
+    ...
+
+class CopyOnWriteOverlay:
+    """Delta-based isolation: reads from original, writes to overlay directory."""
     ...
 
 class GitWorktreeSandbox:
-    """Optimization for git repos: use lightweight worktrees instead of full copies."""
+    """For git repos: lightweight worktrees (shared .git objects, no data copy)."""
     ...
 
 class WorkspaceIsolation:
@@ -266,8 +270,8 @@ class WorkspaceIsolation:
     _sandboxes: dict[str, SandboxInfo]  # teammate_name → info
 
     @classmethod
-    def create(cls, workspace_dir: Path) -> WorkspaceIsolation:
-        """Auto-detect strategy: GitWorktreeSandbox if git repo, else DirectorySandbox."""
+    def create(cls, workspace_dir: Path, config: TeamConfig) -> WorkspaceIsolation:
+        """Select strategy based on config and workspace type."""
         ...
 
     async def create_sandbox(self, teammate_name: str) -> Path: ...
@@ -276,62 +280,163 @@ class WorkspaceIsolation:
     async def cleanup_all(self) -> None: ...
 ```
 
-#### DirectorySandbox (Default)
+#### Why Not Copy the Workspace?
 
-Used when the workspace is not a git repo, or for non-code workloads (data processing, file management, research).
+A naive directory copy is problematic:
+- A typical project workspace can be 1-10 GB (node_modules, .venv, data files, media)
+- Spawning 4 teammates = 4-40 GB of copies before any work starts
+- Copy time delays teammate startup significantly
+- Disk space on user machines is finite
 
-**Creation:**
-- Sandbox directory: `{workspace}/.cowork-sandboxes/{teammate_name}/`
-- Copies the workspace directory into the sandbox (respecting `.gitignore`-style exclusion patterns to skip large/irrelevant files like `node_modules/`, `.venv/`, build artifacts)
-- Configurable exclusion list via `TeamConfig.sandbox_exclude_patterns`
-- For large workspaces, uses a **lazy copy** approach: symlink read-only files, copy-on-write for files the teammate modifies (via platform filesystem APIs where available, else fall back to full copy)
+Instead, we use three strategies — none of which require a full workspace copy.
+
+#### Strategy 1: SharedWithFileReservation (Default)
+
+**The simplest and most practical approach.** All teammates share the original workspace directory. Conflicts are prevented by **file reservation** — each teammate declares which files/directories it will modify, and the `ToolExecutor` enforces non-overlapping access for writes.
+
+```mermaid
+flowchart LR
+    subgraph Workspace["/project/ (shared)"]
+        F1["src/billing/"]
+        F2["src/invoicing/"]
+        F3["src/shared/"]
+        F4["tests/"]
+    end
+
+    T1["billing-dev<br/>Reserved: src/billing/"] -->|read+write| F1
+    T1 -->|read-only| F2
+    T1 -->|read-only| F3
+
+    T2["invoicing-dev<br/>Reserved: src/invoicing/"] -->|read+write| F2
+    T2 -->|read-only| F1
+    T2 -->|read-only| F3
+
+    T3["test-dev<br/>Reserved: tests/"] -->|read+write| F4
+    T3 -->|read-only| F1
+    T3 -->|read-only| F2
+```
+
+**How it works:**
+- When the lead creates tasks, each task specifies `file_scope` — the files/directories that task will modify
+- When a teammate claims a task, those paths are **reserved** for that teammate
+- `ToolExecutor` allows writes only to reserved paths; all other paths are read-only
+- Multiple teammates can read any file — only writes are restricted
+- The `SharedTaskList` tracks reservations and prevents overlapping claims
+
+```python
+@dataclass
+class TeamTask:
+    task_id: str
+    title: str
+    description: str
+    file_scope: list[str] = field(default_factory=list)  # paths this task may modify
+    # ... other fields
+```
+
+**Advantages:**
+- Zero copy, zero disk overhead
+- Instant teammate startup
+- Works with any workspace size
+- Teammates see each other's changes in real-time (useful for shared config files)
+
+**Trade-offs:**
+- Teammates can accidentally read stale data if another teammate is mid-write to a shared file
+- Requires the lead to correctly decompose work into non-overlapping file scopes
+- No rollback if a teammate makes a mistake — changes are live
+
+**Conflict prevention enforcement:**
+
+```python
+# In ToolExecutor, when teammate tries to write:
+async def _check_file_reservation(self, path: str, teammate_name: str) -> bool:
+    """Returns True if this teammate has write access to the path."""
+    reservations = self._task_list.get_reservations()
+    for reserved_path, owner in reservations.items():
+        if path.startswith(reserved_path) and owner != teammate_name:
+            return False  # Another teammate owns this path
+    return True  # Path is unreserved or owned by this teammate
+```
+
+#### Strategy 2: CopyOnWriteOverlay (Opt-in for Full Isolation)
+
+For cases where teammates need true isolation (e.g. two teammates experimenting with conflicting approaches to the same files), a **copy-on-write overlay** provides isolation without copying the full workspace.
+
+**How it works:**
+- Each teammate gets a small **delta directory**: `{workspace}/.cowork-deltas/{teammate_name}/`
+- **Reads**: Teammate reads from the original workspace (no copy)
+- **Writes**: `ToolExecutor` intercepts writes and redirects them to the delta directory, preserving the relative path structure
+- The teammate's view is: delta files override original files (overlay semantics)
+- Delta directories are typically tiny — only the files the teammate actually modified
+
+```
+/project/                          ← original workspace (read-only base)
+/project/.cowork-deltas/
+  billing-dev/
+    src/billing/service.py         ← teammate's modified version
+    src/billing/models.py          ← teammate's new file
+  invoicing-dev/
+    src/invoicing/handler.py       ← teammate's modified version
+```
+
+**File resolution for reads:**
+```python
+def resolve_path(self, path: str, teammate_name: str) -> Path:
+    delta_path = self._delta_dir / teammate_name / path
+    if delta_path.exists():
+        return delta_path          # Teammate's modified version
+    return self._workspace_dir / path  # Original version
+```
 
 **Merge back:**
-- When a teammate completes, diff the sandbox against the original workspace
-- Produce a list of changed/created/deleted files
-- The lead reviews and selectively applies changes (or applies all)
-- Conflicts (same file modified by multiple teammates) are flagged for lead resolution
+- Walk the delta directory, produce a list of changed/new/deleted files
+- Lead reviews the diff and applies changes to the original workspace
+- Conflicts (two teammates modified the same file) are flagged for lead resolution
 
-**Cleanup:**
-- Delete the sandbox directory
-- If no changes were made, cleanup is silent
-- If changes exist but weren't merged, warn the lead before deleting
+**Advantages:**
+- True isolation — teammates can modify the same files independently
+- Disk usage proportional to changes, not workspace size (typically KB-MB, not GB)
+- Supports rollback — delete the delta directory to discard all changes
 
-#### GitWorktreeSandbox (Auto-detected for Git Repos)
+**Trade-offs:**
+- Slightly more complex file resolution
+- Requires `ToolExecutor` integration to intercept reads and writes
+- Teammates don't see each other's changes until merge
 
-Used when the workspace root contains a `.git` directory. Provides the same interface as `DirectorySandbox` but uses git's native worktree mechanism for efficiency.
+#### Strategy 3: GitWorktreeSandbox (Auto-detected for Git Repos)
 
-**Creation:**
+When the workspace is a git repository, git worktrees provide the best isolation with zero data copy (shared `.git` objects).
+
+**How it works:**
 - `git worktree add .cowork-sandboxes/{teammate_name} -b team/{team_id}/{teammate_name}`
-- Lightweight: shares `.git` objects with the main repo
-- Each teammate gets its own branch
+- Each teammate gets a full working tree on its own branch
+- Shares `.git` objects — no file duplication
+- Instant creation (milliseconds, not minutes)
 
 **Merge back:**
-- Teammate commits their changes to their branch
+- Teammate commits changes to its branch
 - Lead merges branches via git (fast-forward, merge commit, or rebase)
-- Conflicts handled through git's merge machinery
+- Git's merge machinery handles conflicts
 
 **Cleanup:**
 - `git worktree remove .cowork-sandboxes/{teammate_name}`
-- If branch has unmerged commits, preserve it; otherwise delete
+- Branches with unmerged commits are preserved; clean branches are deleted
 
-#### Shared-Workspace Mode (No Isolation)
-
-For tasks where teammates operate on **disjoint file sets** (e.g. one teammate writes reports, another processes data in a different directory), isolation may be unnecessary overhead. The lead can opt out:
+#### Strategy Selection
 
 ```python
 class TeamConfig:
-    isolation_mode: Literal["auto", "sandbox", "worktree", "shared"] = "auto"
-    # auto     → GitWorktreeSandbox if git repo, else DirectorySandbox
-    # sandbox  → Force DirectorySandbox
-    # worktree → Force GitWorktreeSandbox (fails if not a git repo)
-    # shared   → No isolation, all teammates share the lead's workspace
-    sandbox_exclude_patterns: list[str] = field(default_factory=lambda: [
-        "node_modules", ".venv", "__pycache__", ".git", "build", "dist",
-    ])
+    isolation_mode: Literal["auto", "shared", "overlay", "worktree"] = "auto"
+    # auto     → GitWorktreeSandbox if git repo, else SharedWithFileReservation
+    # shared   → SharedWithFileReservation (no isolation, file reservation only)
+    # overlay  → CopyOnWriteOverlay (delta-based isolation)
+    # worktree → GitWorktreeSandbox (fails if not a git repo)
 ```
 
-In `shared` mode, the `PolicyEnforcer` path restrictions are the only guard against teammates stepping on each other's files. The lead takes responsibility for coordinating who touches what via the shared task list.
+**Auto-detection logic:**
+1. If workspace has `.git/` → `GitWorktreeSandbox`
+2. Otherwise → `SharedWithFileReservation`
+
+The `overlay` mode is opt-in for cases where teammates need to work on the same files independently. In practice, most teams will use either `auto` (git worktree) or `shared` (file reservation).
 
 ---
 
@@ -436,74 +541,105 @@ Teammates retain access to all existing tools (`ReadFile`, `WriteFile`, `RunComm
 
 ---
 
-## 5. Team Creation & Composition
+## 5. Team Mode & Composition
 
-Teams are **prompt-driven** — there is no schema file, workflow definition, or pre-configured team template. The user describes what they want in natural language, and the lead agent decides the team composition.
+### 5.1 Team Mode is User-Controlled
 
-### 5.1 User-Driven Flow (Primary)
+Team mode is an **explicit opt-in by the user**, not a decision the agent makes on its own. This is because teams:
 
-The most common flow: the user asks for something complex, and the lead agent decides a team is appropriate.
+- Cost significantly more tokens (each teammate is a full agent loop with independent budget)
+- Change the UI layout from single conversation to multi-panel
+- Take longer to set up and coordinate than solo execution
+
+**The agent never creates a team unless the user has enabled team mode.**
+
+#### Desktop App: Team Mode Toggle
+
+The Desktop App provides a **Team Mode toggle** in the conversation toolbar (similar to Plan Mode). When team mode is off, the `CreateTeam` and `CreateTeammate` tools are not available to the agent — it cannot spawn teammates even if the task would benefit from parallelism.
+
+```mermaid
+stateDiagram-v2
+    [*] --> RegularMode: Session starts
+    RegularMode --> TeamMode: User enables Team Mode toggle
+    TeamMode --> ProposalReview: Lead proposes team composition
+    ProposalReview --> TeamActive: User approves
+    ProposalReview --> ProposalReview: User modifies, lead revises
+    ProposalReview --> RegularMode: User cancels
+    TeamActive --> RegularMode: Lead calls ShutdownTeam
+    TeamActive --> RegularMode: User disables Team Mode toggle
+```
+
+#### Proposal → Approval Flow
+
+When team mode is enabled, the lead agent **proposes** a team composition before spawning anything. The user reviews and can modify the proposal:
 
 ```
-User: "Refactor the payment module — split the monolith into separate services
-       for billing, invoicing, and notifications. Update all tests."
+User enables Team Mode, then types:
+  "Refactor the payment module into billing, invoicing, and notification services"
 
-Lead agent (thinking):
-  - This involves 3 independent workstreams + a test workstream
-  - These can run in parallel with coordination
-  - A team of 3-4 teammates makes sense
+Lead agent proposes:
+  "I'd like to set up a team of 3 for this:
+   - billing-dev: Extract billing logic into standalone service
+   - invoicing-dev: Extract invoicing logic into standalone service
+   - notif-dev: Extract notification handling into standalone service
 
-Lead agent → CreateTeam(name="payment-refactor", description="...")
-Lead agent → CreateTeammate(name="billing", role="Extract billing logic into standalone service", ...)
-Lead agent → CreateTeammate(name="invoicing", role="Extract invoicing logic into standalone service", ...)
-Lead agent → CreateTeammate(name="notifications", role="Extract notification logic into standalone service", ...)
-Lead agent → TeamTaskCreate(title="Extract billing service", blocked_by=[], ...)
-Lead agent → TeamTaskCreate(title="Extract invoicing service", blocked_by=[], ...)
-Lead agent → TeamTaskCreate(title="Extract notification service", blocked_by=[], ...)
-Lead agent → TeamTaskCreate(title="Update integration tests", blocked_by=["task-1", "task-2", "task-3"], ...)
+   I'll create tasks with dependencies so integration tests run after all 3 are done.
+   Shall I proceed?"
+
+User: "Yes, go ahead" (or "Drop notif-dev, I'll handle that myself")
+
+Lead agent → CreateTeam(name="payment-refactor", ...)
+Lead agent → CreateTeammate(name="billing-dev", ...)
+Lead agent → CreateTeammate(name="invoicing-dev", ...)
+...
 ```
 
-The lead agent uses its judgment to:
-- Decide **whether** a team is needed (vs. doing it solo or with sub-agents)
-- Choose **how many** teammates to spawn
-- Define each teammate's **role and initial instructions**
-- Create the **task list** with dependency ordering
-- Assign tasks or let teammates self-claim
+This two-step flow (propose → confirm) gives the user full control over cost and team structure while letting the agent use its judgment for the initial proposal.
 
-### 5.2 Explicit User Request
+### 5.2 User Specifies Composition Directly
 
-The user can explicitly request a team:
+The user can skip the proposal step and specify exactly what they want:
 
 ```
-User: "Use a team for this. I want one agent on the backend API and one on the frontend."
+User: "Team mode. 2 agents: one for backend API, one for frontend React components."
 
 Lead agent → CreateTeam(name="feature-build", ...)
-Lead agent → CreateTeammate(name="backend", role="Backend API development", initial_prompt="Build the REST API for...")
-Lead agent → CreateTeammate(name="frontend", role="Frontend UI development", initial_prompt="Build the React components for...")
+Lead agent → CreateTeammate(name="backend", role="Backend API development", ...)
+Lead agent → CreateTeammate(name="frontend", role="Frontend UI development", ...)
 ```
 
-### 5.3 Lead Decision Heuristics
+### 5.3 Agent Can Suggest Team Mode
 
-The lead agent's system prompt includes guidance for when to use teams:
+When team mode is off, the agent can **suggest** (but not activate) team mode if the task would benefit:
 
 ```
-## When to Use Teams
+User: "Refactor all 8 microservices to use the new auth library"
 
-Use teams when the user's request involves:
-- Multiple independent workstreams that can run in parallel
-- Work that naturally decomposes into separate concerns (backend/frontend, service A/service B)
-- Tasks where one teammate's output feeds into another (dependency chains)
+Agent: "This involves 8 independent service updates that could run in parallel.
+        Would you like to enable Team Mode? I'd suggest 4 teammates,
+        each handling 2 services."
 
-Do NOT use teams when:
-- The task is small enough to do solo (< 30 minutes of work)
-- The work is deeply sequential (each step depends on the previous)
-- There's only one file or module involved
-- A quick sub-agent (SpawnAgent) would suffice
+User: [enables Team Mode toggle] "Go for it"
+```
 
-## Teammate Sizing Guidelines
+The agent never bypasses the user — it suggests, the user decides.
+
+### 5.4 Lead Decision Heuristics
+
+When team mode is enabled, the lead agent's system prompt includes guidance for composition:
+
+```
+## Team Composition Guidelines
+
+When the user enables Team Mode, propose a team composition before spawning:
+
+Sizing:
 - 2-3 teammates: Most common. Good for frontend/backend splits, parallel file processing.
 - 4-6 teammates: Large refactors, multi-service changes, comprehensive test suites.
-- 7-8 teammates: Rare. Only for truly large-scale parallel work. Coordination overhead is significant.
+- 7-8 teammates: Rare. Only for truly large-scale parallel work.
+
+Always propose the team to the user first. Wait for confirmation before calling
+CreateTeam or CreateTeammate. The user may want to adjust the composition.
 ```
 
 ### 5.4 Team Creation Sequence
@@ -738,7 +874,133 @@ Lead calls ShutdownTeammate(name="backend-dev")
 
 ---
 
-## 7. Token Budget Strategy
+## 7. Result Consolidation
+
+When teammates complete their work, the lead agent is responsible for consolidating results back into a coherent whole. The consolidation approach depends on the isolation strategy.
+
+### 7.1 Consolidation Flow
+
+```mermaid
+sequenceDiagram
+    participant T1 as Teammate: billing
+    participant T2 as Teammate: invoicing
+    participant TL as SharedTaskList
+    participant Lead as Lead Agent
+    participant WI as WorkspaceIsolation
+    participant User
+
+    T1->>TL: update(task-1, status="completed", result="Created billing service...")
+    T2->>TL: update(task-2, status="completed", result="Created invoicing service...")
+
+    Note over Lead: All tasks completed, begin consolidation
+
+    Lead->>TL: TeamTaskList() → reviews all completed tasks and results
+    Lead->>WI: merge_back("billing") → MergeResult{changed: [src/billing/...], created: [...]}
+    Lead->>WI: merge_back("invoicing") → MergeResult{changed: [...], conflicts: []}
+
+    alt Conflicts detected
+        Lead->>Lead: Resolve conflicts (read both versions, decide)
+    end
+
+    Lead->>Lead: Verify consolidated result (run tests, check integration)
+    Lead->>WI: cleanup_all() → remove sandboxes/worktrees/deltas
+
+    Lead->>User: "Refactoring complete. Summary:
+    - billing-dev: Created billing service (5 files)
+    - invoicing-dev: Created invoicing service (4 files)
+    - All tests passing"
+```
+
+### 7.2 Per-Strategy Consolidation
+
+#### SharedWithFileReservation (Default)
+
+No merge needed — changes are already in the workspace. Consolidation is just **verification**:
+
+1. Lead reads the `SharedTaskList` to see what each teammate accomplished
+2. Lead verifies the results (runs tests, checks file integrity, reviews key changes)
+3. Lead reports a summary to the user
+4. No cleanup needed (no sandboxes to remove)
+
+This is the simplest path. Since file reservations prevent overlapping writes, there are no conflicts to resolve.
+
+#### CopyOnWriteOverlay
+
+Changes live in delta directories and must be explicitly applied:
+
+1. Lead calls `merge_back(teammate_name)` for each teammate
+2. `WorkspaceIsolation` returns a `MergeResult`:
+   ```python
+   @dataclass
+   class MergeResult:
+       applied: list[str]      # files successfully applied to workspace
+       created: list[str]      # new files added
+       deleted: list[str]      # files removed
+       conflicts: list[str]    # files modified by multiple teammates
+   ```
+3. For conflicts: lead reads both versions, decides which to keep (or combines them)
+4. Lead verifies the consolidated result
+5. Delta directories are cleaned up
+
+#### GitWorktreeSandbox
+
+Git handles the heavy lifting:
+
+1. Lead calls `merge_back(teammate_name)` → executes `git merge team/{team_id}/{teammate_name}`
+2. If fast-forward: automatic, no conflicts
+3. If merge conflicts: lead agent resolves using `ReadFile` on conflicting files + `WriteFile` to resolve
+4. Lead can also spawn a sub-agent to handle conflict resolution
+5. Worktrees and merged branches are cleaned up
+
+### 7.3 What the User Sees
+
+The lead produces a **consolidation summary** for the user:
+
+```
+Team "payment-refactor" completed:
+
+  billing-dev (3 tasks, 42 steps):
+    - Created src/billing/ service with 5 modules
+    - Added 12 unit tests (all passing)
+    - Modified src/shared/config.py (added billing config section)
+
+  invoicing-dev (2 tasks, 38 steps):
+    - Created src/invoicing/ service with 4 modules
+    - Added 8 unit tests (all passing)
+    - Modified src/shared/config.py (added invoicing config section)
+
+  Resolution:
+    - Merged both changes to src/shared/config.py (no conflict, different sections)
+
+  Verification:
+    - All 20 new tests passing
+    - Existing test suite: 145/145 passing
+    - No lint errors
+```
+
+The user can then review the changes in the Desktop App's patch preview, just like any other agent output.
+
+### 7.4 Partial Failure Handling
+
+If a teammate fails or is shut down before completing:
+
+- **Completed tasks**: Results are preserved and consolidated normally
+- **In-progress task**: Marked as `failed` in the task list. Lead can reassign to another teammate or handle it solo
+- **Teammate's workspace changes**: For `shared` mode, partial changes are already in the workspace (may need manual cleanup). For `overlay`/`worktree`, changes are isolated and can be discarded or selectively applied
+
+The lead reports partial failures to the user:
+
+```
+Team "payment-refactor" completed with issues:
+  billing-dev: Completed all tasks successfully
+  invoicing-dev: Failed on "Add invoice templates" (budget exhausted after 2/3 tasks)
+    - 2 completed tasks applied
+    - 1 remaining task reassigned to lead (completing now)
+```
+
+---
+
+## 8. Token Budget Strategy
 
 ### Per-Teammate Budgets
 
@@ -766,7 +1028,7 @@ class TeamBudgetConfig:
 
 ---
 
-## 8. Policy & Approval Handling
+## 9. Policy & Approval Handling
 
 ### Shared Policy Bundle
 
@@ -801,7 +1063,7 @@ This is additive to policy — it only skips the user approval UI for actions th
 
 ---
 
-## 9. Desktop App Integration
+## 10. Desktop App Integration
 
 ### UI Layout
 
@@ -854,7 +1116,7 @@ New notifications from Agent Host → Desktop App:
 
 ---
 
-## 10. Constraints & Guardrails
+## 11. Constraints & Guardrails
 
 ### Hard Limits
 
@@ -877,7 +1139,7 @@ New notifications from Agent Host → Desktop App:
 
 ---
 
-## 11. Relationship to Existing Sub-Agents
+## 12. Relationship to Existing Sub-Agents
 
 Sub-agents and teammates serve different purposes and **coexist**:
 
@@ -895,7 +1157,7 @@ A teammate can use `SpawnAgent` for quick sub-tasks, just like the lead does tod
 
 ---
 
-## 12. Module Structure
+## 13. Module Structure
 
 ```
 agent_host/
@@ -1082,7 +1344,7 @@ This is additive — policies without `teamPolicy` use defaults.
 
 ---
 
-## 13. Implementation Plan
+## 14. Implementation Plan
 
 ### Phase 3a: Core Team Infrastructure
 
@@ -1125,7 +1387,7 @@ This is additive — policies without `teamPolicy` use defaults.
 
 ---
 
-## 14. Open Questions
+## 15. Open Questions
 
 1. **Should teammates share the same LLM model, or can the lead assign different models?** A cheaper model for simple tasks (e.g. file formatting) could reduce costs significantly. The `LLMClient` already takes a model parameter.
 
@@ -1139,7 +1401,7 @@ This is additive — policies without `teamPolicy` use defaults.
 
 ---
 
-## 15. References
+## 16. References
 
 - **Claude Code Agent Teams**: [Official docs](https://code.claude.com/docs/en/agent-teams), announced Feb 2026 with Opus 4.6
 - **"Building a C compiler with a team of parallel Claudes"**: Anthropic engineering blog — 16 agents, 100K lines of Rust, ~$20K
