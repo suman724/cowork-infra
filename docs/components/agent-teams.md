@@ -887,7 +887,150 @@ This is additive to policy — it only skips the user approval UI for actions th
 
 ---
 
-## 10. Desktop App Integration
+## 10. Checkpointing & Crash Recovery
+
+### How Checkpointing Works Today (Single Agent)
+
+The existing checkpoint system (see [local-agent-host.md](local-agent-host.md) §9.2) writes a JSON file after each completed step:
+
+```
+~/Library/Application Support/{AppName}/agent-runtime/checkpoints/{sessionId}.json
+```
+
+Contains: session metadata, full message thread, working memory, token usage, active task state. Written atomically (temp file → rename). Deleted on clean session end. On crash, the Agent Host restores from this file and calls `POST /sessions/{sessionId}/resume` to refresh the policy bundle.
+
+Additionally, after each task completes, the full conversation thread is uploaded to the Workspace Service as a `session_history` artifact for permanent storage.
+
+### What Changes for Teams
+
+Teams introduce multiple concurrent agent loops, each with its own message thread and working memory. The `TeamCheckpointProvider` (implementing `CheckpointStrategy`) extends the existing checkpoint with team state.
+
+#### Checkpoint Structure
+
+```json
+{
+  "session_id": "sess_lead_001",
+  "token_input_used": 12000,
+  "session_messages": [...],
+  "thread": [...],
+  "working_memory": {...},
+  "active_task_id": "task_005",
+  "checkpointed_at": "2026-03-08T14:30:00Z",
+
+  "team_state": {
+    "team_id": "team_q4analysis",
+    "team_name": "q4-market-analysis",
+    "config": {
+      "max_teammates": 8,
+      "auto_approve": ["File.Read"]
+    },
+    "members": {
+      "researcher": {
+        "session_id": "sess_teammate_101",
+        "role": "Gather market data and competitor info",
+        "status": "running",
+        "token_budget_remaining": 82000,
+        "thread": [...],
+        "working_memory": {...},
+        "active_task_id": "ttask_002"
+      },
+      "analyst": {
+        "session_id": "sess_teammate_102",
+        "role": "Process data and generate charts",
+        "status": "idle",
+        "token_budget_remaining": 130000,
+        "thread": [...],
+        "working_memory": {...},
+        "active_task_id": null
+      }
+    },
+    "task_list": [
+      {
+        "task_id": "ttask_001",
+        "title": "Gather competitor data",
+        "status": "completed",
+        "assignee": "researcher",
+        "result": "Data in research/competitors/, 8 files"
+      },
+      {
+        "task_id": "ttask_002",
+        "title": "Analyze market trends",
+        "status": "in_progress",
+        "assignee": "researcher",
+        "blocked_by": []
+      }
+    ],
+    "mailbox_queues": {
+      "researcher": [],
+      "analyst": [
+        {"from": "lead", "content": "Focus on Q4 2025 only", "timestamp": "..."}
+      ]
+    }
+  }
+}
+```
+
+#### Checkpoint Write Timing
+
+The lead's `on_step_complete` callback drives checkpointing for the entire team:
+
+1. **Lead step completes** → lead's checkpoint is written (same as today)
+2. **Teammate step completes** → teammate notifies lead via internal callback → lead writes a full checkpoint including all teammate state
+3. Checkpoint is still **one file per lead session** — teammate state is nested inside
+
+This means the checkpoint frequency scales with team activity (more teammates = more frequent writes), but each write is atomic and captures the full team snapshot.
+
+#### Crash Recovery Flow
+
+```mermaid
+sequenceDiagram
+    participant AH as Agent Host (restart)
+    participant CP as CheckpointManager
+    participant TCP as TeamCheckpointProvider
+    participant SS as Session Service
+    participant TS as TeammateSessionManagers
+
+    AH->>CP: restore(checkpoint_file)
+    CP->>CP: Restore lead session (thread, memory, budget)
+    CP->>TCP: restore(team_state)
+
+    TCP->>SS: POST /sessions/{lead_sessionId}/resume
+    SS-->>TCP: Refreshed PolicyBundle
+
+    loop For each teammate in team_state.members
+        TCP->>SS: POST /sessions/{teammate_sessionId}/resume
+        SS-->>TCP: Refreshed PolicyBundle
+        TCP->>TS: Create TeammateSessionManager from snapshot
+        Note over TS: Restore thread, working_memory, budget
+    end
+
+    TCP->>TCP: Restore SharedTaskList from task_list snapshot
+    TCP->>TCP: Restore MailboxRouter queues from mailbox_queues
+
+    Note over AH: Resume all teammate loops from last checkpointed step
+```
+
+**Recovery guarantees:**
+- **At-most-once step execution**: a step that was in progress at crash time is lost — the teammate resumes from the last completed step. This may mean re-doing some work, but prevents duplicate side effects.
+- **Task list consistency**: restored from checkpoint, not re-derived. If a task was marked completed before the crash, it stays completed.
+- **Pending messages preserved**: mailbox queues are checkpointed, so messages sent before the crash are delivered after recovery.
+- **Workspace state**: since all work is in the shared workspace (files on disk), workspace changes from completed steps survive the crash. Only in-flight changes from the interrupted step are lost.
+
+#### Session History Upload
+
+Team session history follows the existing pattern with one addition:
+
+| Event | What's uploaded | Where |
+|-------|----------------|-------|
+| Lead task completes | Lead's `session_history` artifact | Workspace Service (keyed by lead's `sessionId`) |
+| Teammate task completes | Teammate's `session_history` artifact | Workspace Service (keyed by teammate's `sessionId`) |
+| Team shuts down | Lead uploads final summary + links to teammate sessions | Workspace Service |
+
+Each teammate's history is a separate artifact because each has its own `sessionId`. The lead's history references teammate sessions via `teamId`, enabling the Desktop App to reconstruct the full team conversation when browsing history.
+
+---
+
+## 11. Desktop App Integration
 
 ### UI Layout
 
@@ -940,7 +1083,7 @@ New notifications from Agent Host → Desktop App:
 
 ---
 
-## 11. Constraints & Guardrails
+## 12. Constraints & Guardrails
 
 ### Hard Limits
 
@@ -963,7 +1106,7 @@ New notifications from Agent Host → Desktop App:
 
 ---
 
-## 12. Relationship to Existing Sub-Agents
+## 13. Relationship to Existing Sub-Agents
 
 Sub-agents and teammates serve different purposes and **coexist**:
 
@@ -981,7 +1124,7 @@ A teammate can use `SpawnAgent` for quick sub-tasks, just like the lead does tod
 
 ---
 
-## 13. Strategy-Based Decoupling
+## 14. Strategy-Based Decoupling
 
 ### Problem
 
@@ -1270,7 +1413,7 @@ This follows the same philosophy as `LoopStrategy` / `LoopRuntime`:
 
 ---
 
-## 14. Module Structure
+## 15. Module Structure
 
 ```
 agent_host/
@@ -1456,16 +1599,51 @@ flowchart LR
 - Register handlers for new `team/*` notification methods
 - No new request methods — team operations are initiated by the agent, not the user
 
-#### `cowork-session-service` — Minor Extensions
+#### `cowork-session-service` — Extensions
 
-| Change | Purpose |
-|--------|---------|
-| Add `teamId` field to Session model | Track which sessions are part of a team |
-| Add `parentSessionId` field | Link teammate sessions to lead session |
-| New query: list sessions by `teamId` | Retrieve all teammate sessions for a team |
-| New session type: `"teammate"` | Distinguish lead vs teammate sessions in history |
+**Schema additions** (backward-compatible — existing sessions unaffected):
 
-These are backward-compatible additions — existing sessions are unaffected.
+| Field | Type | Purpose |
+|-------|------|---------|
+| `teamId` | `string \| null` | Groups all sessions (lead + teammates) in a team |
+| `parentSessionId` | `string \| null` | Links teammate session to lead session |
+| `sessionType` | `"standard" \| "teammate"` | Distinguishes lead from teammate sessions |
+
+**New queries:**
+
+| Query | GSI | Purpose |
+|-------|-----|---------|
+| List sessions by `teamId` | `teamId-index` (PK: `teamId`, SK: `createdAt`) | Retrieve all teammate sessions for a team |
+| Get parent session | Direct `GetItem` on `parentSessionId` | Navigate from teammate to lead |
+
+**Session lifecycle for teammates:**
+
+```mermaid
+sequenceDiagram
+    participant Lead as Lead SessionManager
+    participant TC as TeamCoordinator
+    participant SS as Session Service
+    participant TS as Teammate SessionManager
+
+    Lead->>TC: spawn_agent("researcher", ...)
+    TC->>SS: POST /sessions (type="teammate", parentSessionId=lead.sessionId, teamId=team.id)
+    SS-->>TC: teammate session (sessionId, policyBundle)
+    TC->>TS: create TeammateSessionManager(session, budget)
+    TS->>TS: start agent loop
+```
+
+Each teammate gets a **real session** in the Session Service — not a virtual/in-memory-only construct. This means:
+- Teammate sessions appear in session history (grouped under `teamId`)
+- Each teammate's token usage is tracked independently via its session
+- The Session Service can enforce per-session policy expiry on teammates
+- On team shutdown, teammate sessions are marked `SESSION_COMPLETED`
+
+**History browsing:**
+When a user views past team sessions in the Desktop App, the flow is:
+1. Load lead session from History View
+2. Query `teamId-index` to find all teammate sessions
+3. Display lead conversation with expandable teammate panels
+4. Each teammate panel loads its `session_history` artifact from Workspace Service
 
 #### `cowork-workspace-service` — No Changes
 
@@ -1485,7 +1663,7 @@ This is additive — policies without `teamPolicy` use defaults.
 
 ---
 
-## 15. Implementation Plan
+## 16. Implementation Plan
 
 ### Phase 3a: Strategy Interfaces & Core Infrastructure
 
@@ -1534,21 +1712,25 @@ Build the decoupled foundation first, then the team implementation.
 
 ---
 
-## 16. Open Questions
+## 17. Open Questions
+
+### Open
 
 1. **Should teammates share the same LLM model, or can the lead assign different models?** A cheaper model for simple tasks (e.g. data extraction, file organization) could reduce costs significantly. The `LLMClient` already takes a model parameter.
 
-2. **Should the shared task list be persisted to the Session Service?** Currently in-memory only. Persisting would enable crash recovery and team history, but adds backend coupling. Recommendation: persist to checkpoint file first (like `WorkingMemory`), consider backend persistence later.
+2. **Should teammates be able to request more budget from the lead?** This adds complexity but prevents premature shutdown of productive teammates. Recommendation: implement in Phase 3c with a `BudgetRequest` message type.
 
-3. **How should file conflicts be handled?** If two teammates write to the same file (rare with good task decomposition), the later write wins. Options: (a) let the lead detect and fix during verification, (b) add advisory file tracking to the task list so teammates can see who's working where. Recommendation: (a) for simplicity, since good task decomposition prevents most conflicts.
+### Closed
 
-4. **Should teammates be able to request more budget from the lead?** This adds complexity but prevents premature shutdown of productive teammates. Recommendation: implement in Phase 3c with a `BudgetRequest` message type.
+3. ~~**Should the shared task list be persisted to the Session Service?**~~ **Decision:** Task list is checkpointed locally as part of team state (§10). Each teammate's conversation is uploaded to Workspace Service as a `session_history` artifact. No Session Service persistence needed — checkpoint file provides crash recovery, Workspace Service provides permanent history.
 
-5. **What happens when the Desktop App disconnects mid-team?** The Agent Host should pause all teammates (drain current step, then wait). On reconnect, resume. This aligns with the existing session resume design.
+4. ~~**How should file conflicts be handled?**~~ **Decision:** Shared workspace with task decomposition prevents conflicts by design (§3.4). If two teammates do write the same file, the later write wins. The lead detects and fixes during verification. No enforcement layer needed.
+
+5. ~~**What happens when the Desktop App disconnects mid-team?**~~ **Decision:** Covered by crash recovery flow (§10). Agent Host restores from checkpoint file, resumes all teammate sessions via `POST /sessions/{sessionId}/resume`, and re-delivers pending mailbox messages from the checkpoint.
 
 ---
 
-## 17. References
+## 18. References
 
 - **Claude Code Agent Teams**: [Official docs](https://code.claude.com/docs/en/agent-teams), announced Feb 2026 with Opus 4.6
 - **"Building a C compiler with a team of parallel Claudes"**: Anthropic engineering blog — 16 agents, 100K lines of Rust, ~$20K
