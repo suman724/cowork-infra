@@ -1809,19 +1809,41 @@ This is additive — policies without `teamPolicy` use defaults.
 
 The plan is structured as **increments** — each increment produces a working, testable system. No increment breaks existing functionality. Later increments build on earlier ones.
 
+### Branching Strategy
+
+All work is done on a **feature branch per repo**. Nothing merges to `main` until all increments are complete and tested end-to-end.
+
+| Repo | Feature Branch | Created At |
+|------|---------------|------------|
+| `cowork-agent-runtime` | `feature/agent-teams` | Increment 1 |
+| `cowork-platform` | `feature/agent-teams` | Increment 4 |
+| `cowork-session-service` | `feature/agent-teams` | Increment 4 |
+| `cowork-desktop-app` | `feature/agent-teams` | Increment 6 |
+| `cowork-policy-service` | `feature/agent-teams` | Increment 7 |
+| `cowork-infra` | `feature/agent-teams` | Increment 8 |
+
+**Rules:**
+- Same branch name (`feature/agent-teams`) across all repos for traceability
+- Each increment commits to the feature branch with conventional commit messages
+- CI runs on the feature branch (all repos trigger on all branches per project convention)
+- Cross-repo dependencies during development use the feature branch (e.g., `cowork-platform @ git+https://...#feature/agent-teams`)
+- No PR to `main` until Increment 8 (final validation). All repos merge together as a coordinated release
+
 ### Increment 1: Strategy Foundation (no behavioral change)
 
 **Goal:** Introduce strategy interfaces and wire them into existing components with Solo (no-op) implementations. The system behaves exactly as before — this is a pure refactor with zero functional change.
 
 | Step | Repo | What | Test |
 |------|------|------|------|
-| 1.1 | `cowork-agent-runtime` | Create `coordination/protocols.py` — all 4 strategy protocols (`CoordinationStrategy`, `ToolProviderStrategy`, `ContextInjectionStrategy`, `CheckpointStrategy`) | Type-check only (protocols are abstract) |
-| 1.2 | `cowork-agent-runtime` | Create `coordination/solo.py` — Solo implementations for all 4 protocols (no-ops) | Unit tests: each Solo implementation satisfies its protocol |
-| 1.3 | `cowork-agent-runtime` | Modify `SessionManager` — accept strategy objects in constructor, default to Solo implementations, call `_coordination.on_session_start()` / `on_session_shutdown()` | Existing unit + service tests pass unchanged |
-| 1.4 | `cowork-agent-runtime` | Modify `AgentToolHandler` — accept `ToolProviderStrategy`, call `get_tool_definitions()` and `handle_tool_call()` | Existing unit tests pass unchanged |
-| 1.5 | `cowork-agent-runtime` | Modify `LoopRuntime` — accept `ContextInjectionStrategy`, call `get_injections()` in `ReactLoop._build_messages()` | Existing unit tests pass unchanged |
-| 1.6 | `cowork-agent-runtime` | Modify `CheckpointManager` — accept `list[CheckpointStrategy]` | Existing unit tests pass unchanged |
-| 1.7 | `cowork-agent-runtime` | Run full test suite (`make check`) + `make test-chat` | **Gate:** all tests green, zero behavioral change |
+| 1.1 | `cowork-agent-runtime` | Create feature branch `feature/agent-teams` | — |
+| 1.2 | `cowork-agent-runtime` | Create `coordination/protocols.py` — all 4 strategy protocols (`CoordinationStrategy`, `ToolProviderStrategy`, `ContextInjectionStrategy`, `CheckpointStrategy`) | Type-check only (protocols are abstract) |
+| 1.3 | `cowork-agent-runtime` | Create `coordination/solo.py` — Solo implementations for all 4 protocols (no-ops) | Unit tests: each Solo implementation satisfies its protocol |
+| 1.4 | `cowork-agent-runtime` | Modify `SessionManager` — accept strategy objects in constructor, default to Solo implementations, call `_coordination.on_session_start()` / `on_session_shutdown()` | Existing unit + service tests pass unchanged |
+| 1.5 | `cowork-agent-runtime` | Modify `AgentToolHandler` — accept `ToolProviderStrategy`, call `get_tool_definitions()` and `handle_tool_call()` | Existing unit tests pass unchanged |
+| 1.6 | `cowork-agent-runtime` | Modify `LoopRuntime` — accept `ContextInjectionStrategy`, call `get_injections()` in `ReactLoop._build_messages()` | Existing unit tests pass unchanged |
+| 1.7 | `cowork-agent-runtime` | Modify `CheckpointManager` — accept `list[CheckpointStrategy]` | Existing unit tests pass unchanged |
+| 1.8 | `cowork-agent-runtime` | Update `CLAUDE.md` — document strategy pattern, new modules, and coordination directory | — |
+| 1.9 | `cowork-agent-runtime` | Run full test suite (`make check`) + `make test-chat` | **Gate:** all tests green, zero behavioral change |
 
 **Deliverable:** Strategy pattern is in place. All existing tests pass. Solo implementations are the default. Team code doesn't exist yet.
 
@@ -1835,7 +1857,8 @@ The plan is structured as **increments** — each increment produces a working, 
 | 2.2 | `cowork-agent-runtime` | Create `teams/task_list.py` — `SharedTaskList` with dependency resolution, `asyncio.Lock`, cycle detection | Unit tests: CRUD, assignment, dependency unblocking, cycle rejection, concurrent access |
 | 2.3 | `cowork-agent-runtime` | Create `teams/mailbox.py` — `MailboxRouter` with per-agent queues, `asyncio.Queue`, broadcast | Unit tests: send, poll, broadcast, register/unregister, empty poll |
 | 2.4 | `cowork-agent-runtime` | Create `teams/team_manager.py` — `TeamManager` lifecycle (create/shutdown teammates), wires TaskList + Mailbox | Unit tests: create team, add teammates, shutdown individual, shutdown all, enforce limits |
-| 2.5 | `cowork-agent-runtime` | Run `make check` | **Gate:** all tests green, new modules tested in isolation |
+| 2.5 | `cowork-agent-runtime` | Update `CLAUDE.md` — document `teams/` module structure | — |
+| 2.6 | `cowork-agent-runtime` | Run `make check` | **Gate:** all tests green, new modules tested in isolation |
 
 **Deliverable:** Core coordination primitives exist and are tested. No integration with `SessionManager` yet.
 
@@ -1860,18 +1883,23 @@ The plan is structured as **increments** — each increment produces a working, 
 
 | Step | Repo | What | Test |
 |------|------|------|------|
-| 4.1 | `cowork-agent-runtime` | Create `teams/teammate_session.py` — `TeammateSessionManager` (lightweight variant of `SessionManager`). Shares: `LLMClient`, `PolicyEnforcer`, workspace. Fresh: `MessageThread`, `TokenBudget`, `WorkingMemory` | Unit tests: construction, agent role is `teammate`, restricted memory tools |
-| 4.2 | `cowork-agent-runtime` | Wire `TeamCoordinator.spawn_agent()` → creates `TeammateSessionManager` → launches `asyncio.create_task(teammate.run())` | Integration test: spawn teammate, verify it runs and exits on empty task list |
-| 4.3 | `cowork-agent-runtime` | Wire teammate system prompt injection (§6.3) — team name, role, available teammates, instructions | Unit test: system prompt contains expected fields |
-| 4.4 | `cowork-agent-runtime` | Wire teammate execution loop extensions — mailbox poll before LLM call, task list poll after task completion, idle backoff, shutdown signal handling | Integration test: teammate picks up task, completes it, goes idle |
-| 4.5 | `cowork-agent-runtime` | Wire shutdown flow — `ShutdownTeam` → `TeamCoordinator.shutdown_all()` → graceful + timeout + force-cancel | Integration test: shutdown with and without timeout |
-| 4.6 | `cowork-platform` | Add team error codes to shared error schema: `TEAM_MODE_DISABLED`, `TEAMMATE_BUDGET_EXCEEDED`, `TASK_DEPENDENCY_CYCLE`, etc. | Schema validation tests |
-| 4.7 | `cowork-session-service` | Add `teamId`, `parentSessionId`, `sessionType` fields to Session model. Add `teamId-index` GSI. | Service tests: create teammate session, query by teamId |
-| 4.8 | `cowork-agent-runtime` | End-to-end test: lead creates team → creates 2 teammates → teammates pick up and complete tasks → lead verifies → shutdown | `make test-chat` extended with team scenario |
+| 4.1 | `cowork-platform` | Create feature branch `feature/agent-teams` | — |
+| 4.2 | `cowork-platform` | Add team error codes to shared error schema: `TEAM_MODE_DISABLED`, `TEAM_WORKSPACE_INVALID`, `TEAMMATE_BUDGET_EXCEEDED`, `TASK_DEPENDENCY_CYCLE`, etc. | Schema validation tests |
+| 4.3 | `cowork-platform` | Update `CLAUDE.md` and `README.md` — document new error codes | — |
+| 4.4 | `cowork-session-service` | Create feature branch `feature/agent-teams` | — |
+| 4.5 | `cowork-session-service` | Add `teamId`, `parentSessionId`, `sessionType` fields to Session model. Add `teamId-index` GSI | Service tests: create teammate session, query by teamId |
+| 4.6 | `cowork-session-service` | Update `CLAUDE.md` — document new session fields and GSI | — |
+| 4.7 | `cowork-agent-runtime` | Create `teams/teammate_session.py` — `TeammateSessionManager` (lightweight variant of `SessionManager`). Shares: `LLMClient`, `PolicyEnforcer`, workspace. Fresh: `MessageThread`, `TokenBudget`, `WorkingMemory` | Unit tests: construction, agent role is `teammate`, restricted memory tools |
+| 4.8 | `cowork-agent-runtime` | Wire `TeamCoordinator.spawn_agent()` → creates `TeammateSessionManager` → launches `asyncio.create_task(teammate.run())` | Integration test: spawn teammate, verify it runs and exits on empty task list |
+| 4.9 | `cowork-agent-runtime` | Wire teammate system prompt injection (§6.4) — team name, role, available teammates, instructions | Unit test: system prompt contains expected fields |
+| 4.10 | `cowork-agent-runtime` | Wire teammate execution loop extensions — mailbox poll before LLM call, task list poll after task completion, idle backoff, shutdown signal handling | Integration test: teammate picks up task, completes it, goes idle |
+| 4.11 | `cowork-agent-runtime` | Wire lead wait behavior (§6.3) — dormant wait loop after team setup, wake on: all tasks completed, incoming message, teammate failure, user input | Integration test: lead wakes when all tasks complete |
+| 4.12 | `cowork-agent-runtime` | Wire shutdown flow — `ShutdownTeam` → `TeamCoordinator.shutdown_all()` → graceful + timeout + force-cancel | Integration test: shutdown with and without timeout |
+| 4.13 | `cowork-agent-runtime` | End-to-end test: lead creates team → creates 2 teammates → teammates pick up and complete tasks → lead verifies → shutdown | `make test-chat` extended with team scenario |
 
 **Deliverable:** Teams work end-to-end in the agent runtime. Lead spawns teammates, they execute tasks, communicate via mailbox, and shut down cleanly.
 
-### Increment 5: Checkpointing & Session History
+### Increment 5: Durability & Recovery
 
 **Goal:** Team state survives crashes. Teammate histories are persisted for browsing.
 
@@ -1892,15 +1920,17 @@ The plan is structured as **increments** — each increment produces a working, 
 | Step | Repo | What | Test |
 |------|------|------|------|
 | 6.1 | `cowork-agent-runtime` | Wire JSON-RPC notifications — `TeamCoordinator` emits `team/*` events via `EventEmitter` → JSON-RPC server → Desktop App | Unit test: events forwarded as JSON-RPC notifications |
-| 6.2 | `cowork-desktop-app` | Add `TeamState` slice to state management — team config, members, task list, per-teammate conversation buffers | Unit test: state updates on team events |
-| 6.3 | `cowork-desktop-app` | Add IPC handlers for `team/*` notification methods | Unit test: handlers registered, state updated |
-| 6.4 | `cowork-desktop-app` | Create `TeamView` — multi-panel container that splits screen into lead + teammate panels + task board | Visual test: layout renders correctly with 1, 2, 4 teammates |
-| 6.5 | `cowork-desktop-app` | Create `TeammatePanel` — per-teammate conversation stream (mirrors `ConversationView` but scoped) | Visual test: messages stream to correct panel |
-| 6.6 | `cowork-desktop-app` | Create `TaskBoardView` — shared task list with status indicators, assignees, dependency lines | Visual test: tasks update in real-time |
-| 6.7 | `cowork-desktop-app` | Add Team Mode toggle to conversation toolbar | Manual test: toggle enables/disables team tools |
-| 6.8 | `cowork-desktop-app` | Modify `ApprovalView` — show teammate name in approval dialog, batch approve button | Manual test: approve teammate action, batch approve |
-| 6.9 | `cowork-desktop-app` | Modify `HistoryView` — show team sessions with expandable teammate panels | Manual test: browse past team session |
-| 6.10 | `cowork-desktop-app` | Run `make check` | **Gate:** all tests green |
+| 6.2 | `cowork-desktop-app` | Create feature branch `feature/agent-teams` | — |
+| 6.3 | `cowork-desktop-app` | Add `TeamState` slice to state management — team config, members, task list, per-teammate conversation buffers | Unit test: state updates on team events |
+| 6.4 | `cowork-desktop-app` | Add IPC handlers for `team/*` notification methods | Unit test: handlers registered, state updated |
+| 6.5 | `cowork-desktop-app` | Create `TeamView` — multi-panel container that splits screen into lead + teammate panels + task board | Visual test: layout renders correctly with 1, 2, 4 teammates |
+| 6.6 | `cowork-desktop-app` | Create `TeammatePanel` — per-teammate conversation stream (mirrors `ConversationView` but scoped) | Visual test: messages stream to correct panel |
+| 6.7 | `cowork-desktop-app` | Create `TaskBoardView` — shared task list with status indicators, assignees, dependency lines | Visual test: tasks update in real-time |
+| 6.8 | `cowork-desktop-app` | Add Team Mode toggle to conversation toolbar (hidden for `general` workspaces) | Manual test: toggle enables/disables team tools, hidden for general sessions |
+| 6.9 | `cowork-desktop-app` | Modify `ApprovalView` — show teammate name in approval dialog, batch approve button | Manual test: approve teammate action, batch approve |
+| 6.10 | `cowork-desktop-app` | Modify `HistoryView` — show team sessions with expandable teammate panels | Manual test: browse past team session |
+| 6.11 | `cowork-desktop-app` | Update `CLAUDE.md` — document team views, state management, IPC handlers | — |
+| 6.12 | `cowork-desktop-app` | Run `make check` | **Gate:** all tests green |
 
 **Deliverable:** Full Desktop App integration. Users can create teams, watch teammates work, approve actions, and browse team history.
 
@@ -1912,13 +1942,35 @@ The plan is structured as **increments** — each increment produces a working, 
 |------|------|------|------|
 | 7.1 | `cowork-agent-runtime` | Budget reallocation — lead can redistribute unused teammate budgets from completed teammates | Unit + integration test |
 | 7.2 | `cowork-agent-runtime` | Idle timeout — auto-shutdown teammates idle > 5 minutes | Integration test: idle teammate auto-shuts down |
-| 7.3 | `cowork-agent-runtime` | `TeamMessageFeed` view in Desktop App — timeline of inter-agent messages | Visual test |
-| 7.4 | `cowork-policy-service` | Add optional `teamPolicy` section to PolicyBundle | Service test: policy with/without teamPolicy |
-| 7.5 | `cowork-agent-runtime` | Structured logging for team events — `structlog` with `team_id`, `teammate_name` context fields | Log inspection |
-| 7.6 | All repos | End-to-end integration test — full team workflow across all services | `make test-chat` with team scenario against running backend |
-| 7.7 | `cowork-desktop-app` | Performance testing — verify UI handles 8 teammates with streaming output | Manual test |
+| 7.3 | `cowork-desktop-app` | `TeamMessageFeed` view — timeline of inter-agent messages | Visual test |
+| 7.4 | `cowork-policy-service` | Create feature branch `feature/agent-teams` | — |
+| 7.5 | `cowork-policy-service` | Add optional `teamPolicy` section to PolicyBundle | Service test: policy with/without teamPolicy |
+| 7.6 | `cowork-policy-service` | Update `CLAUDE.md` — document teamPolicy extension | — |
+| 7.7 | `cowork-agent-runtime` | Structured logging for team events — `structlog` with `team_id`, `teammate_name` context fields | Log inspection |
+| 7.8 | All repos | End-to-end integration test — full team workflow across all services (all on feature branches) | `make test-chat` with team scenario against running backend |
+| 7.9 | `cowork-desktop-app` | Performance testing — verify UI handles 8 teammates with streaming output | Manual test |
 
 **Deliverable:** Production-quality team functionality.
+
+### Increment 8: Documentation & Merge
+
+**Goal:** Final documentation updates, cross-repo validation, coordinated merge to `main`.
+
+| Step | Repo | What | Test |
+|------|------|------|------|
+| 8.1 | `cowork-infra` | Create feature branch `feature/agent-teams` | — |
+| 8.2 | `cowork-infra` | Update `docs/components/local-agent-host.md` — document strategy interfaces (§4), coordination module, checkpoint extensions, lead wait behavior | Doc review |
+| 8.3 | `cowork-infra` | Update `docs/components/local-tool-runtime.md` — document team tool definitions and ToolProviderStrategy integration | Doc review |
+| 8.4 | `cowork-infra` | Update `docs/components/desktop-app.md` — document TeamView, TeammatePanel, TaskBoardView, Team Mode toggle | Doc review |
+| 8.5 | `cowork-infra` | Update `docs/services/session-service.md` — document `teamId`, `parentSessionId`, `sessionType` fields, `teamId-index` GSI | Doc review |
+| 8.6 | `cowork-infra` | Update `docs/services/policy-service.md` — document `teamPolicy` section in PolicyBundle | Doc review |
+| 8.7 | `cowork-infra` | Update `docs/domain-model.md` — add team entities (TeamTask, TeammateInfo), teammate session type, team workspace constraint | Doc review |
+| 8.8 | `cowork-infra` | Update `docs/architecture.md` — add Agent Teams to architecture overview, capability table, phase plan | Doc review |
+| 8.9 | `cowork-infra` | Update IaC if needed — DynamoDB `teamId-index` GSI for sessions table | `make validate` |
+| 8.10 | All repos | Final cross-repo validation — run `make check` on all feature branches, run full `make test-chat` with team scenario | **Gate:** all tests green across all repos |
+| 8.11 | All repos | Open PRs from `feature/agent-teams` → `main` in all repos. Squash merge in dependency order: `cowork-platform` → `cowork-session-service` → `cowork-policy-service` → `cowork-agent-runtime` → `cowork-desktop-app` → `cowork-infra` | **Gate:** all CI checks pass on PRs |
+
+**Deliverable:** All repos merged to `main`. Design docs, CLAUDE.md files, and IaC updated. Agent Teams is shipped.
 
 ### Increment Summary
 
@@ -1931,6 +1983,7 @@ The plan is structured as **increments** — each increment produces a working, 
 | 5 | Durability & recovery | agent-runtime | **Low** — reuses existing sync mechanism, extends checkpoint with coordination metadata only |
 | 6 | Desktop App | desktop-app, agent-runtime | **Medium** — new UI views + IPC |
 | 7 | Hardening | all | **Low** — polish and optimization |
+| 8 | Documentation & merge | all (especially infra) | **Zero** — docs and merge only |
 
 ### Estimated Scope
 
@@ -1952,6 +2005,9 @@ The plan is structured as **increments** — each increment produces a working, 
 | Desktop App team view | Large | 6 |
 | Budget reallocation + idle timeout | Small | 7 |
 | Policy Service teamPolicy | Small | 7 |
+| Design doc updates (6 docs) | Medium | 8 |
+| IaC updates (DynamoDB GSI) | Small | 8 |
+| Cross-repo merge coordination | Small | 8 |
 
 ---
 
