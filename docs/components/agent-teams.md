@@ -456,6 +456,8 @@ Team mode is an **explicit opt-in by the user**, not a decision the agent makes 
 
 The Desktop App provides a **Team Mode toggle** in the conversation toolbar (similar to Plan Mode). Team Mode is **session-scoped** — it applies only to the current session and defaults to off. When team mode is off, the `CreateTeam` and `CreateTeammate` tools are not available to the agent — it cannot spawn teammates even if the task would benefit from parallelism.
 
+**Workspace restriction:** Team Mode is only available for `local` workspaces (project sessions with a directory). The toggle is hidden or disabled for `general` (single-use chat) sessions, since there is no shared project directory for teammates to work on. `cloud` workspaces will be evaluated in Phase 3+.
+
 If the user disables Team Mode while a team is active, `ShutdownTeam()` is called automatically, gracefully releasing all teammates. The user can re-enable Team Mode later to create a new team in the same session.
 
 ```mermaid
@@ -716,7 +718,36 @@ sequenceDiagram
     MB->>A: Queue message in researcher inbox
 ```
 
-### 6.3 Teammate System Prompt
+### 6.3 Lead Wait Behavior
+
+After the lead sets up the team (creates teammates, populates the task list), it typically has nothing to do until teammates complete their work. The lead enters a **wait loop** — similar to the teammate idle loop but watching for coordination events:
+
+```mermaid
+flowchart TD
+    A[Lead finishes team setup] --> B[Wait with backoff 5s..30s]
+    B --> C{Wake condition?}
+    C -- "All tasks completed" --> D[Trigger LLM call for consolidation]
+    C -- "Message from teammate" --> E[Trigger LLM call with message context]
+    C -- "Teammate failed/budget exhausted" --> F[Trigger LLM call for recovery decision]
+    C -- "User sends follow-on message" --> G[Trigger LLM call with user input]
+    C -- "None" --> B
+    D --> H[Lead verifies results, reports to user]
+    E --> I[Lead responds or adjusts plan]
+    F --> J[Lead proposes recovery to user]
+    G --> K[Lead handles user request]
+```
+
+**Wake conditions** (any one triggers an LLM call):
+1. **All tasks completed** — `SharedTaskList` has no `pending`, `in_progress`, or `blocked` tasks
+2. **Incoming message** — teammate sends a message to the lead via `MailboxRouter`
+3. **Teammate failure** — a teammate's task moves to `failed` (budget exhaustion, error, crash)
+4. **User input** — user sends a new message in the lead's conversation panel
+
+Between wake conditions, the lead's loop is dormant — no LLM calls, no token consumption. The `ContextInjectionStrategy` only runs when a wake condition triggers an LLM call, at which point the lead sees the full updated state (task list, messages) in its context.
+
+Note: the lead can also do its own work while teammates run. If the lead has tasks assigned to itself (e.g., a verification task blocked on teammate tasks), it processes those through its normal `ReactLoop` — the wait behavior only applies when the lead has nothing to do.
+
+### 6.4 Teammate System Prompt
 
 ```
 You are a teammate in a multi-agent team working on a shared project.
@@ -743,7 +774,7 @@ assigned tasks. Check the task list to see what others are working on to avoid c
 - If the task list is empty and you have no messages, let the lead know you are idle
 ```
 
-### 6.4 Shutdown
+### 6.5 Shutdown
 
 ```
 Lead calls ShutdownTeammate(name="researcher")
@@ -929,23 +960,28 @@ This is additive to policy — it only skips the user approval UI for actions th
 
 ## 10. Checkpointing & Crash Recovery
 
-### How Checkpointing Works Today (Single Agent)
+### How It Works Today (Single Agent)
 
-The existing checkpoint system (see [local-agent-host.md](local-agent-host.md) §9.2) writes a JSON file after each completed step:
+The existing system has two durability layers (see [local-agent-host.md](local-agent-host.md) §9):
 
-```
-~/Library/Application Support/{AppName}/agent-runtime/checkpoints/{sessionId}.json
-```
+1. **Local checkpoint** — JSON file written after each step. Contains full session state (thread, working memory, token counts, active task). Enables fast, exact resume on crash. Deleted on clean session end.
+2. **Workspace Service sync** — every N steps (default 5) and on task completion, `session_messages` are uploaded as a `session_history` artifact. This is the permanent record.
 
-Contains: session metadata, full message thread, working memory, token usage, active task state. Written atomically (temp file → rename). Deleted on clean session end. On crash, the Agent Host restores from this file and calls `POST /sessions/{sessionId}/resume` to refresh the policy bundle.
+On crash recovery, the Agent Host reads the local checkpoint for exact state. If the checkpoint is corrupt, it falls back to fetching session history from Workspace Service and reconstructing the thread.
 
-Additionally, after each task completes, the full conversation thread is uploaded to the Workspace Service as a `session_history` artifact for permanent storage.
+### Key Insight: Session History Is Sufficient for Resume
+
+The local checkpoint provides a **fast, exact** resume. But session history alone is **functionally sufficient** — the thread can be rebuilt from conversation messages, working memory re-derived from context, and token counts re-estimated. The checkpoint is an optimization, not a necessity.
+
+This insight simplifies the team checkpoint model significantly.
 
 ### What Changes for Teams
 
-Teams introduce multiple concurrent agent loops, each with its own message thread and working memory. The `TeamCheckpointProvider` (implementing `CheckpointStrategy`) extends the existing checkpoint with team state.
+Each teammate is a separate Session entity with its own `sessionId`. Each teammate **independently syncs its own session history** to Workspace Service using the same mechanism the single agent uses today (every N steps + on task completion). No changes to Workspace Service needed — these are just additional `session_history` artifacts keyed by different `sessionId`s in the same workspace.
 
-#### Checkpoint Structure
+The lead's local checkpoint only stores **coordination state** — not full teammate threads:
+
+#### Lead Checkpoint Structure (team_state extension)
 
 ```json
 {
@@ -970,8 +1006,6 @@ Teams introduce multiple concurrent agent loops, each with its own message threa
         "role": "Gather market data and competitor info",
         "status": "running",
         "token_budget_remaining": 82000,
-        "thread": [...],
-        "working_memory": {...},
         "active_task_id": "ttask_002"
       },
       "analyst": {
@@ -979,8 +1013,6 @@ Teams introduce multiple concurrent agent loops, each with its own message threa
         "role": "Process data and generate charts",
         "status": "idle",
         "token_budget_remaining": 130000,
-        "thread": [...],
-        "working_memory": {...},
         "active_task_id": null
       }
     },
@@ -1010,16 +1042,19 @@ Teams introduce multiple concurrent agent loops, each with its own message threa
 }
 ```
 
+Note what's **not** in `team_state.members`: no `thread`, no `working_memory`, no `session_messages`. Those live in each teammate's own session history in Workspace Service.
+
+#### Durability Model
+
+| Agent | Local checkpoint | Workspace Service sync | What's durable |
+|-------|-----------------|----------------------|----------------|
+| **Lead** | Full state after each lead step (existing behavior) | Every N steps + task completion | Lead conversation + coordination |
+| **Teammates** | Not in lead checkpoint (only metadata) | Each teammate syncs independently every N steps + task completion | Teammate conversations |
+| **Coordination** | Task list, mailbox queues, member list in lead checkpoint | Task list snapshot in lead's final summary artifact | Team coordination state |
+
 #### Checkpoint Write Timing
 
-Checkpointing is **batched by the lead** to avoid excessive I/O:
-
-1. **Teammate step completes** → teammate updates its in-memory state snapshot (thread, working memory, budget, active task)
-2. **Lead step completes** → lead writes a full team checkpoint atomically, capturing all teammates' latest in-memory snapshots
-
-Checkpoint is still **one file per lead session** — teammate state is nested inside. This batching means at most one checkpoint write per lead step, regardless of how many teammate steps complete in between. On crash, teammates may lose work since their last snapshot was captured by a lead checkpoint.
-
-On recovery, each teammate resumes from whatever state is in the checkpoint — the checkpoint file **is** the recovery point, no separate cursor needed.
+Unchanged from single-agent — the lead checkpoints after each of its own completed steps. The `TeamCheckpointProvider` adds coordination state (`team_state`) to the lead's checkpoint. Teammates do not trigger lead checkpoints — they sync their own history to Workspace Service independently.
 
 #### Crash Recovery Flow
 
@@ -1029,6 +1064,7 @@ sequenceDiagram
     participant CP as CheckpointManager
     participant TCP as TeamCheckpointProvider
     participant SS as Session Service
+    participant WS as Workspace Service
     participant TS as TeammateSessionManagers
 
     AH->>CP: restore(checkpoint_file)
@@ -1038,40 +1074,42 @@ sequenceDiagram
     TCP->>SS: POST /sessions/{lead_sessionId}/resume
     SS-->>TCP: Refreshed PolicyBundle
 
-    loop For each teammate in team_state.members
-        TCP->>SS: POST /sessions/{teammate_sessionId}/resume
-        SS-->>TCP: Refreshed PolicyBundle
-        TCP->>TS: Create TeammateSessionManager from snapshot
-        Note over TS: Restore thread, working_memory, budget
-    end
-
     TCP->>TCP: Restore SharedTaskList from task_list snapshot
     TCP->>TCP: Restore MailboxRouter queues from mailbox_queues
 
-    Note over AH: Resume all teammate loops from last checkpointed step
+    loop For each teammate in team_state.members
+        TCP->>SS: POST /sessions/{teammate_sessionId}/resume
+        SS-->>TCP: Refreshed PolicyBundle
+        TCP->>WS: GET session_history for teammate_sessionId
+        WS-->>TCP: Teammate's conversation messages
+        TCP->>TS: Create TeammateSessionManager
+        Note over TS: Rebuild thread from session_history,<br/>re-derive working memory from context
+    end
+
+    Note over AH: Resume all teammate loops
 ```
 
 **Recovery guarantees:**
-- **At-most-once step execution**: a step that was in progress at crash time is lost — the teammate resumes from the state in the checkpoint. This may mean re-doing some work, but prevents duplicate side effects.
-- **Independent resume per teammate**: the checkpoint contains each teammate's full thread and working memory snapshot. On recovery, each teammate resumes from its own snapshot — no shared cursor or step counter needed.
-- **Task list consistency**: restored from checkpoint, not re-derived. If a task was marked completed before the crash, it stays completed.
-- **Pending messages preserved**: mailbox queues are checkpointed, so messages sent before the last checkpoint write are delivered after recovery. Messages sent between the last checkpoint and crash are lost.
-- **Workspace state**: since all work is in the shared workspace (files on disk), workspace changes from completed steps survive the crash. Only in-flight changes from the interrupted step are lost.
-- **Policy refresh**: each teammate calls `POST /sessions/{sessionId}/resume` independently on recovery, receiving a refreshed `PolicyBundle` that the lead propagates to all.
+- **Lead state**: exact resume from local checkpoint (same as single agent)
+- **Teammate state**: reconstructed from Workspace Service session history. Thread is rebuilt, working memory re-derived. Resume is not byte-identical but functionally equivalent — the teammate picks up where it left off with full conversation context
+- **Coordination state**: task list, mailbox queues, and member metadata restored from lead checkpoint. If a task was completed before crash, it stays completed. Pending messages from before the last lead checkpoint are preserved
+- **Workspace files**: survive the crash (files on disk). Only in-flight changes from interrupted steps are lost
+- **Data loss window**: teammate conversation since their last Workspace Service sync (every N steps, default 5). At most ~5 steps of teammate work may need to be re-executed. This is significantly better than the previous design where teammates could lose all work since the last lead step
 
-#### Session History Upload
+#### Session History & Follow-On Tasks
 
-Team session history follows the existing pattern with one addition:
+Each agent's session history is stored independently in Workspace Service:
 
 | Event | What's uploaded | Where |
 |-------|----------------|-------|
+| Every N teammate steps | Teammate's `session_history` artifact (incremental) | Workspace Service (keyed by teammate's `sessionId`) |
+| Teammate task completes | Teammate's `session_history` artifact (final) | Workspace Service (keyed by teammate's `sessionId`) |
 | Lead task completes | Lead's `session_history` artifact | Workspace Service (keyed by lead's `sessionId`) |
-| Teammate task completes | Teammate's `session_history` artifact | Workspace Service (keyed by teammate's `sessionId`) |
 | Team shuts down | Lead uploads final summary + links to teammate sessions | Workspace Service |
 
-Each teammate's history is a separate artifact because each has its own `sessionId`. The lead's history references teammate sessions via `teamId`, enabling the Desktop App to reconstruct the full team conversation when browsing history.
+**Follow-on tasks** in the same session use **lead history only**. The lead's thread contains the full narrative — user prompts, team creation, task definitions, task results from `TeamTaskList`, consolidation summary. Teammate detailed histories are not injected into the lead's context. If the user needs teammate details, they can browse the teammate's panel in History View, or the lead can read workspace files the teammates produced.
 
-**Team task persistence:** `TeamTask` records are **ephemeral** — they live in the `SharedTaskList` (in-memory) and are checkpointed locally. They are **not** persisted to Session Service as `Task` records. Each teammate's real work is tracked via its Session Service `Task` (one per teammate agent loop invocation), while `TeamTask` is a coordination-only concept. The task list state is captured in the checkpoint and in the lead's final `session_history` artifact summary.
+**Team task persistence:** `TeamTask` records are **ephemeral** — they live in the `SharedTaskList` (in-memory) and are included in the lead's local checkpoint. They are **not** persisted to Session Service as `Task` records. Each teammate's real work is tracked via its Session Service `Task` (one per teammate agent loop invocation), while `TeamTask` is a coordination-only concept. The task list state is captured in the lead checkpoint and in the lead's final `session_history` artifact summary.
 
 **History browsing query pattern:**
 1. Desktop App loads lead session from History View
@@ -1079,7 +1117,7 @@ Each teammate's history is a separate artifact because each has its own `session
 3. For each teammate, queries Workspace Service `sessionId-type-index` → `session_history` artifact
 4. Merges all conversations for display with lead as primary, teammates as expandable panels
 
-Note: Workspace Service has no `teamId` index — team history always requires the Session Service hop first. This is acceptable for user-initiated browsing. If performance becomes an issue, a batch artifact fetch endpoint can be added later.
+Note: Workspace Service has no `teamId` index — team history always requires the Session Service hop first. This is acceptable for user-initiated browsing.
 
 ---
 
@@ -1209,6 +1247,7 @@ This last point is key: teammates are ephemeral (they exist only for the duratio
 
 | Constraint | Value | Rationale |
 |-----------|-------|-----------|
+| Workspace type | `local` only | Teams require a shared project directory for parallel file work. `general` workspaces have no project dir. `cloud` workspaces deferred to Phase 3+ |
 | Max teammates per team | 8 | Coordination overhead grows superlinearly |
 | Max teams per session | 1 | Prevent nested team complexity |
 | Teammate depth | 0 (no teams) | Teammates cannot spawn their own teams |
@@ -1231,6 +1270,7 @@ These extend the existing error code set from `cowork-platform`:
 | Error Code | When | Handling |
 |-----------|------|----------|
 | `TEAM_MODE_DISABLED` | Lead calls `CreateTeam` but Team Mode is off | Agent receives tool error, cannot create team |
+| `TEAM_WORKSPACE_INVALID` | Team Mode enabled on a `general` or unsupported workspace type | Toggle rejected, user informed teams require a project workspace |
 | `TEAM_ALREADY_ACTIVE` | Lead calls `CreateTeam` when a team already exists | Agent receives tool error (max 1 team per session) |
 | `TEAMMATE_SPAWN_FAILED` | Session Service rejects teammate session creation | Lead notified, can retry or reduce team size |
 | `TEAMMATE_BUDGET_EXCEEDED` | Teammate's `TokenBudget` exhausted | Teammate becomes idle, lead notified via mailbox |
@@ -1449,7 +1489,7 @@ class CheckpointStrategy(Protocol):
 
 **Solo implementation**: returns empty dict, restore is a no-op.
 
-**Team implementation** (`TeamCheckpointProvider`): captures team config, member list, task list snapshot, and teammate message thread snapshots. On restore, recreates `TeamManager` and resumes teammate loops.
+**Team implementation** (`TeamCheckpointProvider`): captures coordination state only — team config, member metadata (sessionId, role, status, budget), task list snapshot, and mailbox queues. Does **not** capture teammate threads or working memory (those are durable via each teammate's own Workspace Service sync). On restore, recreates `TeamManager`, fetches teammate session histories from Workspace Service, rebuilds threads, and resumes teammate loops.
 
 ### How Strategies Are Wired
 
@@ -1769,19 +1809,41 @@ This is additive — policies without `teamPolicy` use defaults.
 
 The plan is structured as **increments** — each increment produces a working, testable system. No increment breaks existing functionality. Later increments build on earlier ones.
 
+### Branching Strategy
+
+All work is done on a **feature branch per repo**. Nothing merges to `main` until all increments are complete and tested end-to-end.
+
+| Repo | Feature Branch | Created At |
+|------|---------------|------------|
+| `cowork-agent-runtime` | `feature/agent-teams` | Increment 1 |
+| `cowork-platform` | `feature/agent-teams` | Increment 4 |
+| `cowork-session-service` | `feature/agent-teams` | Increment 4 |
+| `cowork-desktop-app` | `feature/agent-teams` | Increment 6 |
+| `cowork-policy-service` | `feature/agent-teams` | Increment 7 |
+| `cowork-infra` | `feature/agent-teams` | Increment 8 |
+
+**Rules:**
+- Same branch name (`feature/agent-teams`) across all repos for traceability
+- Each increment commits to the feature branch with conventional commit messages
+- CI runs on the feature branch (all repos trigger on all branches per project convention)
+- Cross-repo dependencies during development use the feature branch (e.g., `cowork-platform @ git+https://...#feature/agent-teams`)
+- No PR to `main` until Increment 8 (final validation). All repos merge together as a coordinated release
+
 ### Increment 1: Strategy Foundation (no behavioral change)
 
 **Goal:** Introduce strategy interfaces and wire them into existing components with Solo (no-op) implementations. The system behaves exactly as before — this is a pure refactor with zero functional change.
 
 | Step | Repo | What | Test |
 |------|------|------|------|
-| 1.1 | `cowork-agent-runtime` | Create `coordination/protocols.py` — all 4 strategy protocols (`CoordinationStrategy`, `ToolProviderStrategy`, `ContextInjectionStrategy`, `CheckpointStrategy`) | Type-check only (protocols are abstract) |
-| 1.2 | `cowork-agent-runtime` | Create `coordination/solo.py` — Solo implementations for all 4 protocols (no-ops) | Unit tests: each Solo implementation satisfies its protocol |
-| 1.3 | `cowork-agent-runtime` | Modify `SessionManager` — accept strategy objects in constructor, default to Solo implementations, call `_coordination.on_session_start()` / `on_session_shutdown()` | Existing unit + service tests pass unchanged |
-| 1.4 | `cowork-agent-runtime` | Modify `AgentToolHandler` — accept `ToolProviderStrategy`, call `get_tool_definitions()` and `handle_tool_call()` | Existing unit tests pass unchanged |
-| 1.5 | `cowork-agent-runtime` | Modify `LoopRuntime` — accept `ContextInjectionStrategy`, call `get_injections()` in `ReactLoop._build_messages()` | Existing unit tests pass unchanged |
-| 1.6 | `cowork-agent-runtime` | Modify `CheckpointManager` — accept `list[CheckpointStrategy]` | Existing unit tests pass unchanged |
-| 1.7 | `cowork-agent-runtime` | Run full test suite (`make check`) + `make test-chat` | **Gate:** all tests green, zero behavioral change |
+| 1.1 | `cowork-agent-runtime` | Create feature branch `feature/agent-teams` | — |
+| 1.2 | `cowork-agent-runtime` | Create `coordination/protocols.py` — all 4 strategy protocols (`CoordinationStrategy`, `ToolProviderStrategy`, `ContextInjectionStrategy`, `CheckpointStrategy`) | Type-check only (protocols are abstract) |
+| 1.3 | `cowork-agent-runtime` | Create `coordination/solo.py` — Solo implementations for all 4 protocols (no-ops) | Unit tests: each Solo implementation satisfies its protocol |
+| 1.4 | `cowork-agent-runtime` | Modify `SessionManager` — accept strategy objects in constructor, default to Solo implementations, call `_coordination.on_session_start()` / `on_session_shutdown()` | Existing unit + service tests pass unchanged |
+| 1.5 | `cowork-agent-runtime` | Modify `AgentToolHandler` — accept `ToolProviderStrategy`, call `get_tool_definitions()` and `handle_tool_call()` | Existing unit tests pass unchanged |
+| 1.6 | `cowork-agent-runtime` | Modify `LoopRuntime` — accept `ContextInjectionStrategy`, call `get_injections()` in `ReactLoop._build_messages()` | Existing unit tests pass unchanged |
+| 1.7 | `cowork-agent-runtime` | Modify `CheckpointManager` — accept `list[CheckpointStrategy]` | Existing unit tests pass unchanged |
+| 1.8 | `cowork-agent-runtime` | Update `CLAUDE.md` — document strategy pattern, new modules, and coordination directory | — |
+| 1.9 | `cowork-agent-runtime` | Run full test suite (`make check`) + `make test-chat` | **Gate:** all tests green, zero behavioral change |
 
 **Deliverable:** Strategy pattern is in place. All existing tests pass. Solo implementations are the default. Team code doesn't exist yet.
 
@@ -1795,7 +1857,8 @@ The plan is structured as **increments** — each increment produces a working, 
 | 2.2 | `cowork-agent-runtime` | Create `teams/task_list.py` — `SharedTaskList` with dependency resolution, `asyncio.Lock`, cycle detection | Unit tests: CRUD, assignment, dependency unblocking, cycle rejection, concurrent access |
 | 2.3 | `cowork-agent-runtime` | Create `teams/mailbox.py` — `MailboxRouter` with per-agent queues, `asyncio.Queue`, broadcast | Unit tests: send, poll, broadcast, register/unregister, empty poll |
 | 2.4 | `cowork-agent-runtime` | Create `teams/team_manager.py` — `TeamManager` lifecycle (create/shutdown teammates), wires TaskList + Mailbox | Unit tests: create team, add teammates, shutdown individual, shutdown all, enforce limits |
-| 2.5 | `cowork-agent-runtime` | Run `make check` | **Gate:** all tests green, new modules tested in isolation |
+| 2.5 | `cowork-agent-runtime` | Update `CLAUDE.md` — document `teams/` module structure | — |
+| 2.6 | `cowork-agent-runtime` | Run `make check` | **Gate:** all tests green, new modules tested in isolation |
 
 **Deliverable:** Core coordination primitives exist and are tested. No integration with `SessionManager` yet.
 
@@ -1820,30 +1883,35 @@ The plan is structured as **increments** — each increment produces a working, 
 
 | Step | Repo | What | Test |
 |------|------|------|------|
-| 4.1 | `cowork-agent-runtime` | Create `teams/teammate_session.py` — `TeammateSessionManager` (lightweight variant of `SessionManager`). Shares: `LLMClient`, `PolicyEnforcer`, workspace. Fresh: `MessageThread`, `TokenBudget`, `WorkingMemory` | Unit tests: construction, agent role is `teammate`, restricted memory tools |
-| 4.2 | `cowork-agent-runtime` | Wire `TeamCoordinator.spawn_agent()` → creates `TeammateSessionManager` → launches `asyncio.create_task(teammate.run())` | Integration test: spawn teammate, verify it runs and exits on empty task list |
-| 4.3 | `cowork-agent-runtime` | Wire teammate system prompt injection (§6.3) — team name, role, available teammates, instructions | Unit test: system prompt contains expected fields |
-| 4.4 | `cowork-agent-runtime` | Wire teammate execution loop extensions — mailbox poll before LLM call, task list poll after task completion, idle backoff, shutdown signal handling | Integration test: teammate picks up task, completes it, goes idle |
-| 4.5 | `cowork-agent-runtime` | Wire shutdown flow — `ShutdownTeam` → `TeamCoordinator.shutdown_all()` → graceful + timeout + force-cancel | Integration test: shutdown with and without timeout |
-| 4.6 | `cowork-platform` | Add team error codes to shared error schema: `TEAM_MODE_DISABLED`, `TEAMMATE_BUDGET_EXCEEDED`, `TASK_DEPENDENCY_CYCLE`, etc. | Schema validation tests |
-| 4.7 | `cowork-session-service` | Add `teamId`, `parentSessionId`, `sessionType` fields to Session model. Add `teamId-index` GSI. | Service tests: create teammate session, query by teamId |
-| 4.8 | `cowork-agent-runtime` | End-to-end test: lead creates team → creates 2 teammates → teammates pick up and complete tasks → lead verifies → shutdown | `make test-chat` extended with team scenario |
+| 4.1 | `cowork-platform` | Create feature branch `feature/agent-teams` | — |
+| 4.2 | `cowork-platform` | Add team error codes to shared error schema: `TEAM_MODE_DISABLED`, `TEAM_WORKSPACE_INVALID`, `TEAMMATE_BUDGET_EXCEEDED`, `TASK_DEPENDENCY_CYCLE`, etc. | Schema validation tests |
+| 4.3 | `cowork-platform` | Update `CLAUDE.md` and `README.md` — document new error codes | — |
+| 4.4 | `cowork-session-service` | Create feature branch `feature/agent-teams` | — |
+| 4.5 | `cowork-session-service` | Add `teamId`, `parentSessionId`, `sessionType` fields to Session model. Add `teamId-index` GSI | Service tests: create teammate session, query by teamId |
+| 4.6 | `cowork-session-service` | Update `CLAUDE.md` — document new session fields and GSI | — |
+| 4.7 | `cowork-agent-runtime` | Create `teams/teammate_session.py` — `TeammateSessionManager` (lightweight variant of `SessionManager`). Shares: `LLMClient`, `PolicyEnforcer`, workspace. Fresh: `MessageThread`, `TokenBudget`, `WorkingMemory` | Unit tests: construction, agent role is `teammate`, restricted memory tools |
+| 4.8 | `cowork-agent-runtime` | Wire `TeamCoordinator.spawn_agent()` → creates `TeammateSessionManager` → launches `asyncio.create_task(teammate.run())` | Integration test: spawn teammate, verify it runs and exits on empty task list |
+| 4.9 | `cowork-agent-runtime` | Wire teammate system prompt injection (§6.4) — team name, role, available teammates, instructions | Unit test: system prompt contains expected fields |
+| 4.10 | `cowork-agent-runtime` | Wire teammate execution loop extensions — mailbox poll before LLM call, task list poll after task completion, idle backoff, shutdown signal handling | Integration test: teammate picks up task, completes it, goes idle |
+| 4.11 | `cowork-agent-runtime` | Wire lead wait behavior (§6.3) — dormant wait loop after team setup, wake on: all tasks completed, incoming message, teammate failure, user input | Integration test: lead wakes when all tasks complete |
+| 4.12 | `cowork-agent-runtime` | Wire shutdown flow — `ShutdownTeam` → `TeamCoordinator.shutdown_all()` → graceful + timeout + force-cancel | Integration test: shutdown with and without timeout |
+| 4.13 | `cowork-agent-runtime` | End-to-end test: lead creates team → creates 2 teammates → teammates pick up and complete tasks → lead verifies → shutdown | `make test-chat` extended with team scenario |
 
 **Deliverable:** Teams work end-to-end in the agent runtime. Lead spawns teammates, they execute tasks, communicate via mailbox, and shut down cleanly.
 
-### Increment 5: Checkpointing & Session History
+### Increment 5: Durability & Recovery
 
 **Goal:** Team state survives crashes. Teammate histories are persisted for browsing.
 
 | Step | Repo | What | Test |
 |------|------|------|------|
-| 5.1 | `cowork-agent-runtime` | Add `TeamCheckpointProvider` to `teams/strategies.py` — implements `CheckpointStrategy`, captures/restores team state (members, task list, mailbox queues) | Unit tests: capture, restore, round-trip |
-| 5.2 | `cowork-agent-runtime` | Wire checkpoint timing — batched writes (lead checkpoints after its own steps, capturing all teammate snapshots) | Integration test: verify checkpoint file contains team state after teammate step |
-| 5.3 | `cowork-agent-runtime` | Wire crash recovery — `TeamCheckpointProvider.restore()` → recreate `TeamManager`, resume teammate loops, call `POST /sessions/{id}/resume` for each | Integration test: kill process, restart, verify team resumes from checkpoint |
-| 5.4 | `cowork-agent-runtime` | Wire session history upload — each teammate uploads `session_history` artifact on task completion; lead uploads summary on team shutdown | Integration test: verify artifacts exist in Workspace Service after team shutdown |
+| 5.1 | `cowork-agent-runtime` | Wire teammate session history sync — each teammate uploads `session_history` artifact to Workspace Service every N steps + on task completion (reuse existing sync mechanism) | Integration test: verify teammate artifacts exist in Workspace Service |
+| 5.2 | `cowork-agent-runtime` | Add `TeamCheckpointProvider` to `teams/strategies.py` — implements `CheckpointStrategy`, captures coordination state only (member metadata, task list, mailbox queues — no teammate threads) | Unit tests: capture, restore, round-trip |
+| 5.3 | `cowork-agent-runtime` | Wire crash recovery — `TeamCheckpointProvider.restore()` → restore coordination state from checkpoint, fetch teammate histories from Workspace Service, rebuild threads, recreate `TeamManager`, resume loops | Integration test: kill process, restart, verify team resumes |
+| 5.4 | `cowork-agent-runtime` | Wire lead summary upload — lead uploads final summary + teammate session links on team shutdown | Integration test: verify summary artifact references teammate sessions |
 | 5.5 | `cowork-agent-runtime` | Run `make check` + `make test-chat` | **Gate:** all tests green, crash recovery verified |
 
-**Deliverable:** Teams are resilient. Crash recovery works. History is persisted for browsing.
+**Deliverable:** Teams are resilient. Each teammate owns its own durability via Workspace Service sync. Crash recovery rebuilds teammate state from session history. Lead checkpoint only stores coordination metadata.
 
 ### Increment 6: Desktop App — Team View
 
@@ -1852,15 +1920,17 @@ The plan is structured as **increments** — each increment produces a working, 
 | Step | Repo | What | Test |
 |------|------|------|------|
 | 6.1 | `cowork-agent-runtime` | Wire JSON-RPC notifications — `TeamCoordinator` emits `team/*` events via `EventEmitter` → JSON-RPC server → Desktop App | Unit test: events forwarded as JSON-RPC notifications |
-| 6.2 | `cowork-desktop-app` | Add `TeamState` slice to state management — team config, members, task list, per-teammate conversation buffers | Unit test: state updates on team events |
-| 6.3 | `cowork-desktop-app` | Add IPC handlers for `team/*` notification methods | Unit test: handlers registered, state updated |
-| 6.4 | `cowork-desktop-app` | Create `TeamView` — multi-panel container that splits screen into lead + teammate panels + task board | Visual test: layout renders correctly with 1, 2, 4 teammates |
-| 6.5 | `cowork-desktop-app` | Create `TeammatePanel` — per-teammate conversation stream (mirrors `ConversationView` but scoped) | Visual test: messages stream to correct panel |
-| 6.6 | `cowork-desktop-app` | Create `TaskBoardView` — shared task list with status indicators, assignees, dependency lines | Visual test: tasks update in real-time |
-| 6.7 | `cowork-desktop-app` | Add Team Mode toggle to conversation toolbar | Manual test: toggle enables/disables team tools |
-| 6.8 | `cowork-desktop-app` | Modify `ApprovalView` — show teammate name in approval dialog, batch approve button | Manual test: approve teammate action, batch approve |
-| 6.9 | `cowork-desktop-app` | Modify `HistoryView` — show team sessions with expandable teammate panels | Manual test: browse past team session |
-| 6.10 | `cowork-desktop-app` | Run `make check` | **Gate:** all tests green |
+| 6.2 | `cowork-desktop-app` | Create feature branch `feature/agent-teams` | — |
+| 6.3 | `cowork-desktop-app` | Add `TeamState` slice to state management — team config, members, task list, per-teammate conversation buffers | Unit test: state updates on team events |
+| 6.4 | `cowork-desktop-app` | Add IPC handlers for `team/*` notification methods | Unit test: handlers registered, state updated |
+| 6.5 | `cowork-desktop-app` | Create `TeamView` — multi-panel container that splits screen into lead + teammate panels + task board | Visual test: layout renders correctly with 1, 2, 4 teammates |
+| 6.6 | `cowork-desktop-app` | Create `TeammatePanel` — per-teammate conversation stream (mirrors `ConversationView` but scoped) | Visual test: messages stream to correct panel |
+| 6.7 | `cowork-desktop-app` | Create `TaskBoardView` — shared task list with status indicators, assignees, dependency lines | Visual test: tasks update in real-time |
+| 6.8 | `cowork-desktop-app` | Add Team Mode toggle to conversation toolbar (hidden for `general` workspaces) | Manual test: toggle enables/disables team tools, hidden for general sessions |
+| 6.9 | `cowork-desktop-app` | Modify `ApprovalView` — show teammate name in approval dialog, batch approve button | Manual test: approve teammate action, batch approve |
+| 6.10 | `cowork-desktop-app` | Modify `HistoryView` — show team sessions with expandable teammate panels | Manual test: browse past team session |
+| 6.11 | `cowork-desktop-app` | Update `CLAUDE.md` — document team views, state management, IPC handlers | — |
+| 6.12 | `cowork-desktop-app` | Run `make check` | **Gate:** all tests green |
 
 **Deliverable:** Full Desktop App integration. Users can create teams, watch teammates work, approve actions, and browse team history.
 
@@ -1872,13 +1942,35 @@ The plan is structured as **increments** — each increment produces a working, 
 |------|------|------|------|
 | 7.1 | `cowork-agent-runtime` | Budget reallocation — lead can redistribute unused teammate budgets from completed teammates | Unit + integration test |
 | 7.2 | `cowork-agent-runtime` | Idle timeout — auto-shutdown teammates idle > 5 minutes | Integration test: idle teammate auto-shuts down |
-| 7.3 | `cowork-agent-runtime` | `TeamMessageFeed` view in Desktop App — timeline of inter-agent messages | Visual test |
-| 7.4 | `cowork-policy-service` | Add optional `teamPolicy` section to PolicyBundle | Service test: policy with/without teamPolicy |
-| 7.5 | `cowork-agent-runtime` | Structured logging for team events — `structlog` with `team_id`, `teammate_name` context fields | Log inspection |
-| 7.6 | All repos | End-to-end integration test — full team workflow across all services | `make test-chat` with team scenario against running backend |
-| 7.7 | `cowork-desktop-app` | Performance testing — verify UI handles 8 teammates with streaming output | Manual test |
+| 7.3 | `cowork-desktop-app` | `TeamMessageFeed` view — timeline of inter-agent messages | Visual test |
+| 7.4 | `cowork-policy-service` | Create feature branch `feature/agent-teams` | — |
+| 7.5 | `cowork-policy-service` | Add optional `teamPolicy` section to PolicyBundle | Service test: policy with/without teamPolicy |
+| 7.6 | `cowork-policy-service` | Update `CLAUDE.md` — document teamPolicy extension | — |
+| 7.7 | `cowork-agent-runtime` | Structured logging for team events — `structlog` with `team_id`, `teammate_name` context fields | Log inspection |
+| 7.8 | All repos | End-to-end integration test — full team workflow across all services (all on feature branches) | `make test-chat` with team scenario against running backend |
+| 7.9 | `cowork-desktop-app` | Performance testing — verify UI handles 8 teammates with streaming output | Manual test |
 
 **Deliverable:** Production-quality team functionality.
+
+### Increment 8: Documentation & Merge
+
+**Goal:** Final documentation updates, cross-repo validation, coordinated merge to `main`.
+
+| Step | Repo | What | Test |
+|------|------|------|------|
+| 8.1 | `cowork-infra` | Create feature branch `feature/agent-teams` | — |
+| 8.2 | `cowork-infra` | Update `docs/components/local-agent-host.md` — document strategy interfaces (§4), coordination module, checkpoint extensions, lead wait behavior | Doc review |
+| 8.3 | `cowork-infra` | Update `docs/components/local-tool-runtime.md` — document team tool definitions and ToolProviderStrategy integration | Doc review |
+| 8.4 | `cowork-infra` | Update `docs/components/desktop-app.md` — document TeamView, TeammatePanel, TaskBoardView, Team Mode toggle | Doc review |
+| 8.5 | `cowork-infra` | Update `docs/services/session-service.md` — document `teamId`, `parentSessionId`, `sessionType` fields, `teamId-index` GSI | Doc review |
+| 8.6 | `cowork-infra` | Update `docs/services/policy-service.md` — document `teamPolicy` section in PolicyBundle | Doc review |
+| 8.7 | `cowork-infra` | Update `docs/domain-model.md` — add team entities (TeamTask, TeammateInfo), teammate session type, team workspace constraint | Doc review |
+| 8.8 | `cowork-infra` | Update `docs/architecture.md` — add Agent Teams to architecture overview, capability table, phase plan | Doc review |
+| 8.9 | `cowork-infra` | Update IaC if needed — DynamoDB `teamId-index` GSI for sessions table | `make validate` |
+| 8.10 | All repos | Final cross-repo validation — run `make check` on all feature branches, run full `make test-chat` with team scenario | **Gate:** all tests green across all repos |
+| 8.11 | All repos | Open PRs from `feature/agent-teams` → `main` in all repos. Squash merge in dependency order: `cowork-platform` → `cowork-session-service` → `cowork-policy-service` → `cowork-agent-runtime` → `cowork-desktop-app` → `cowork-infra` | **Gate:** all CI checks pass on PRs |
+
+**Deliverable:** All repos merged to `main`. Design docs, CLAUDE.md files, and IaC updated. Agent Teams is shipped.
 
 ### Increment Summary
 
@@ -1888,9 +1980,10 @@ The plan is structured as **increments** — each increment produces a working, 
 | 2 | Core primitives | agent-runtime | **Zero** — isolated new modules |
 | 3 | Team strategies | agent-runtime | **Low** — new code behind strategy interfaces |
 | 4 | Agent loops + backend | agent-runtime, platform, session-service | **Medium** — first real integration |
-| 5 | Checkpointing | agent-runtime | **Low** — extends existing checkpoint |
+| 5 | Durability & recovery | agent-runtime | **Low** — reuses existing sync mechanism, extends checkpoint with coordination metadata only |
 | 6 | Desktop App | desktop-app, agent-runtime | **Medium** — new UI views + IPC |
 | 7 | Hardening | all | **Low** — polish and optimization |
+| 8 | Documentation & merge | all (especially infra) | **Zero** — docs and merge only |
 
 ### Estimated Scope
 
@@ -1912,6 +2005,9 @@ The plan is structured as **increments** — each increment produces a working, 
 | Desktop App team view | Large | 6 |
 | Budget reallocation + idle timeout | Small | 7 |
 | Policy Service teamPolicy | Small | 7 |
+| Design doc updates (6 docs) | Medium | 8 |
+| IaC updates (DynamoDB GSI) | Small | 8 |
+| Cross-repo merge coordination | Small | 8 |
 
 ---
 
