@@ -8,7 +8,7 @@
 
 ## 1. Purpose
 
-Agent Teams extends cowork's single-agent-with-sub-agents model into a coordinated multi-agent system where a **lead agent** can spawn **teammate agents** that work in parallel on shared projects with peer-to-peer communication, shared task tracking, and workspace isolation.
+Agent Teams extends cowork's single-agent-with-sub-agents model into a coordinated multi-agent system where a **lead agent** can spawn **teammate agents** that work in parallel on a shared workspace with peer-to-peer communication and shared task tracking.
 
 ### What We Have Today
 
@@ -24,7 +24,7 @@ Agent Teams extends cowork's single-agent-with-sub-agents model into a coordinat
 |-----------|---------------------|-------------------|
 | Communication | Hub-and-spoke (parent only) | Peer-to-peer messaging + broadcasts |
 | Context | Shared token budget, limited context | Independent token budget per teammate |
-| File isolation | Same working directory | Isolated workspace sandbox per teammate |
+| File isolation | Same working directory | Shared workspace (task-based coordination) |
 | Coordination | Parent orchestrates all | Shared task list with dependencies |
 | Depth | 1 (no recursive spawning) | 1 (teammates can't spawn teams) |
 | Lifetime | Ephemeral (within one step) | Persistent (across multiple steps, outlive individual tasks) |
@@ -48,26 +48,24 @@ flowchart TB
         subgraph TM["TeamManager"]
             TL["SharedTaskList"]
             MB["MailboxRouter"]
-            WI["WorkspaceIsolation"]
         end
 
         subgraph Lead["Lead Agent"]
             SM1["SessionManager"]
             LR1["LoopRuntime → ReactLoop"]
-            W1["workspace: /project/"]
         end
 
         subgraph TA["Teammate A"]
             SM2["TeammateSessionManager"]
             LR2["LoopRuntime → ReactLoop"]
-            W2["sandbox: .cowork-sandboxes/teammate-a/"]
         end
 
         subgraph TBAgent["Teammate B"]
             SM3["TeammateSessionManager"]
             LR3["LoopRuntime → ReactLoop"]
-            W3["sandbox: .cowork-sandboxes/teammate-b/"]
         end
+
+        WS_DIR["Shared Workspace: /project/"]
 
         subgraph Shared["Shared Resources"]
             LLM["LLMClient"]
@@ -96,6 +94,10 @@ flowchart TB
     Lead --> Shared
     TA --> Shared
     TBAgent --> Shared
+
+    Lead -.-> WS_DIR
+    TA -.-> WS_DIR
+    TBAgent -.-> WS_DIR
 
     LLM -->|HTTP streaming| LG
     SM1 -->|HTTPS| SS
@@ -133,7 +135,6 @@ class TeamManager:
     members: dict[str, TeammateInfo]      # name → info
     task_list: SharedTaskList
     mailbox: MailboxRouter
-    workspace_isolation: WorkspaceIsolation
     config: TeamConfig
 
     async def create_teammate(
@@ -149,7 +150,7 @@ class TeamManager:
 
 **Lifecycle:**
 1. Lead agent calls `CreateTeam` tool → `TeamManager` created
-2. Lead calls `CreateTeammate` tool → `TeamManager.create_teammate()` → new `SessionManager` instance created with its own isolated workspace
+2. Lead calls `CreateTeammate` tool → `TeamManager.create_teammate()` → new `SessionManager` instance created with access to the shared workspace
 3. Teammates run their agent loops independently
 4. Lead calls `ShutdownTeam` → graceful shutdown of all teammates
 
@@ -236,207 +237,45 @@ class MailboxRouter:
   ```
 - This approach avoids interrupting the agent mid-step
 
-### 3.4 WorkspaceIsolation
+### 3.4 Shared Workspace
 
-New module: `agent_host/teams/workspace_isolation.py`
+All teammates share the same workspace directory. There is no file copying, no sandboxing, and no isolation layer.
 
-Provides file-level isolation between teammates. The key design constraint: **workspaces can be very large** (multi-GB repos, data directories, media files). Copying the entire workspace per teammate is not practical. The isolation strategy must be lightweight.
+#### Why Shared?
 
-```python
-class IsolationStrategy(Protocol):
-    """Strategy for creating isolated workspaces per teammate."""
+- **Zero overhead** — no copies, no disk usage, instant teammate startup regardless of workspace size
+- **Simplicity** — no merge step, no delta tracking, no ToolExecutor interception
+- **Real-time visibility** — teammates see each other's changes immediately
+- **Works universally** — git repos, data directories, media projects, any workspace
 
-    async def create(self, teammate_name: str) -> Path: ...
-    async def merge_back(self, teammate_name: str) -> MergeResult: ...
-    async def cleanup(self, teammate_name: str) -> None: ...
-    async def cleanup_all(self) -> None: ...
+Copying workspaces is impractical (multi-GB repos, 4 teammates = 4x disk usage). File reservation adds complexity that doesn't pay off — the lead must predict file access upfront, and agents often discover they need unexpected files mid-task.
 
-class SharedWithFileReservation:
-    """Default strategy: shared workspace + file reservation via task list."""
-    ...
+#### How Conflicts Are Prevented
 
-class CopyOnWriteOverlay:
-    """Delta-based isolation: reads from original, writes to overlay directory."""
-    ...
-
-class GitWorktreeSandbox:
-    """For git repos: lightweight worktrees (shared .git objects, no data copy)."""
-    ...
-
-class WorkspaceIsolation:
-    """Facade that selects the appropriate isolation strategy."""
-
-    _strategy: IsolationStrategy
-    _sandboxes: dict[str, SandboxInfo]  # teammate_name → info
-
-    @classmethod
-    def create(cls, workspace_dir: Path, config: TeamConfig) -> WorkspaceIsolation:
-        """Select strategy based on config and workspace type."""
-        ...
-
-    async def create_sandbox(self, teammate_name: str) -> Path: ...
-    async def merge_back(self, teammate_name: str) -> MergeResult: ...
-    async def cleanup(self, teammate_name: str) -> None: ...
-    async def cleanup_all(self) -> None: ...
-```
-
-#### Why Not Copy the Workspace?
-
-A naive directory copy is problematic:
-- A typical project workspace can be 1-10 GB (node_modules, .venv, data files, media)
-- Spawning 4 teammates = 4-40 GB of copies before any work starts
-- Copy time delays teammate startup significantly
-- Disk space on user machines is finite
-
-Instead, we use three strategies — none of which require a full workspace copy.
-
-#### Strategy 1: SharedWithFileReservation (Default)
-
-**The simplest and most practical approach.** All teammates share the original workspace directory. Conflicts are prevented by **file reservation** — each teammate declares which files/directories it will modify, and the `ToolExecutor` enforces non-overlapping access for writes.
+Conflicts are prevented by **task decomposition**, not enforcement. The lead agent decomposes work into tasks that target non-overlapping areas of the workspace:
 
 ```mermaid
 flowchart LR
-    subgraph Workspace["/project/ (shared)"]
+    subgraph Workspace["/project/ (shared by all)"]
         F1["src/billing/"]
         F2["src/invoicing/"]
-        F3["src/shared/"]
-        F4["tests/"]
+        F3["tests/"]
     end
 
-    T1["billing-dev<br/>Reserved: src/billing/"] -->|read+write| F1
-    T1 -->|read-only| F2
-    T1 -->|read-only| F3
-
-    T2["invoicing-dev<br/>Reserved: src/invoicing/"] -->|read+write| F2
-    T2 -->|read-only| F1
-    T2 -->|read-only| F3
-
-    T3["test-dev<br/>Reserved: tests/"] -->|read+write| F4
-    T3 -->|read-only| F1
-    T3 -->|read-only| F2
+    T1["billing-dev<br/>Task: billing service"] -->|works on| F1
+    T2["invoicing-dev<br/>Task: invoicing service"] -->|works on| F2
+    T3["test-dev<br/>Task: write tests"] -->|works on| F3
+    T1 -.->|can read| F2
+    T2 -.->|can read| F1
 ```
 
-**How it works:**
-- When the lead creates tasks, each task specifies `file_scope` — the files/directories that task will modify
-- When a teammate claims a task, those paths are **reserved** for that teammate
-- `ToolExecutor` allows writes only to reserved paths; all other paths are read-only
-- Multiple teammates can read any file — only writes are restricted
-- The `SharedTaskList` tracks reservations and prevents overlapping claims
+This is the same coordination model humans use — you don't lock files, you divide work so people don't step on each other. The `SharedTaskList` makes the division explicit so teammates know what's theirs.
 
-```python
-@dataclass
-class TeamTask:
-    task_id: str
-    title: str
-    description: str
-    file_scope: list[str] = field(default_factory=list)  # paths this task may modify
-    # ... other fields
-```
+If two teammates do write the same file (rare with good task decomposition), the later write wins. The lead can detect this during verification and fix it.
 
-**Advantages:**
-- Zero copy, zero disk overhead
-- Instant teammate startup
-- Works with any workspace size
-- Teammates see each other's changes in real-time (useful for shared config files)
+#### Future Enhancement: Git Worktrees (Phase 3c)
 
-**Trade-offs:**
-- Teammates can accidentally read stale data if another teammate is mid-write to a shared file
-- Requires the lead to correctly decompose work into non-overlapping file scopes
-- No rollback if a teammate makes a mistake — changes are live
-
-**Conflict prevention enforcement:**
-
-```python
-# In ToolExecutor, when teammate tries to write:
-async def _check_file_reservation(self, path: str, teammate_name: str) -> bool:
-    """Returns True if this teammate has write access to the path."""
-    reservations = self._task_list.get_reservations()
-    for reserved_path, owner in reservations.items():
-        if path.startswith(reserved_path) and owner != teammate_name:
-            return False  # Another teammate owns this path
-    return True  # Path is unreserved or owned by this teammate
-```
-
-#### Strategy 2: CopyOnWriteOverlay (Opt-in for Full Isolation)
-
-For cases where teammates need true isolation (e.g. two teammates experimenting with conflicting approaches to the same files), a **copy-on-write overlay** provides isolation without copying the full workspace.
-
-**How it works:**
-- Each teammate gets a small **delta directory**: `{workspace}/.cowork-deltas/{teammate_name}/`
-- **Reads**: Teammate reads from the original workspace (no copy)
-- **Writes**: `ToolExecutor` intercepts writes and redirects them to the delta directory, preserving the relative path structure
-- The teammate's view is: delta files override original files (overlay semantics)
-- Delta directories are typically tiny — only the files the teammate actually modified
-
-```
-/project/                          ← original workspace (read-only base)
-/project/.cowork-deltas/
-  billing-dev/
-    src/billing/service.py         ← teammate's modified version
-    src/billing/models.py          ← teammate's new file
-  invoicing-dev/
-    src/invoicing/handler.py       ← teammate's modified version
-```
-
-**File resolution for reads:**
-```python
-def resolve_path(self, path: str, teammate_name: str) -> Path:
-    delta_path = self._delta_dir / teammate_name / path
-    if delta_path.exists():
-        return delta_path          # Teammate's modified version
-    return self._workspace_dir / path  # Original version
-```
-
-**Merge back:**
-- Walk the delta directory, produce a list of changed/new/deleted files
-- Lead reviews the diff and applies changes to the original workspace
-- Conflicts (two teammates modified the same file) are flagged for lead resolution
-
-**Advantages:**
-- True isolation — teammates can modify the same files independently
-- Disk usage proportional to changes, not workspace size (typically KB-MB, not GB)
-- Supports rollback — delete the delta directory to discard all changes
-
-**Trade-offs:**
-- Slightly more complex file resolution
-- Requires `ToolExecutor` integration to intercept reads and writes
-- Teammates don't see each other's changes until merge
-
-#### Strategy 3: GitWorktreeSandbox (Auto-detected for Git Repos)
-
-When the workspace is a git repository, git worktrees provide the best isolation with zero data copy (shared `.git` objects).
-
-**How it works:**
-- `git worktree add .cowork-sandboxes/{teammate_name} -b team/{team_id}/{teammate_name}`
-- Each teammate gets a full working tree on its own branch
-- Shares `.git` objects — no file duplication
-- Instant creation (milliseconds, not minutes)
-
-**Merge back:**
-- Teammate commits changes to its branch
-- Lead merges branches via git (fast-forward, merge commit, or rebase)
-- Git's merge machinery handles conflicts
-
-**Cleanup:**
-- `git worktree remove .cowork-sandboxes/{teammate_name}`
-- Branches with unmerged commits are preserved; clean branches are deleted
-
-#### Strategy Selection
-
-```python
-class TeamConfig:
-    isolation_mode: Literal["auto", "shared", "overlay", "worktree"] = "auto"
-    # auto     → GitWorktreeSandbox if git repo, else SharedWithFileReservation
-    # shared   → SharedWithFileReservation (no isolation, file reservation only)
-    # overlay  → CopyOnWriteOverlay (delta-based isolation)
-    # worktree → GitWorktreeSandbox (fails if not a git repo)
-```
-
-**Auto-detection logic:**
-1. If workspace has `.git/` → `GitWorktreeSandbox`
-2. Otherwise → `SharedWithFileReservation`
-
-The `overlay` mode is opt-in for cases where teammates need to work on the same files independently. In practice, most teams will use either `auto` (git worktree) or `shared` (file reservation).
+For git repositories where true isolation becomes necessary (e.g. teammates experimenting with conflicting approaches), git worktrees can be added as an opt-in mode later. Worktrees are lightweight (shared `.git` objects, no data copy) and provide branch-based isolation with git's merge machinery for consolidation. This is deferred to keep the initial implementation simple.
 
 ---
 
@@ -649,7 +488,6 @@ sequenceDiagram
     participant User
     participant Lead as Lead Agent
     participant TM as TeamManager
-    participant WI as WorkspaceIsolation
     participant MB as MailboxRouter
     participant TL as SharedTaskList
     participant T1 as Teammate: billing
@@ -662,15 +500,11 @@ sequenceDiagram
     TM-->>Lead: team_id
 
     Lead->>TM: CreateTeammate(name="billing", role="...", prompt="...")
-    TM->>WI: create_sandbox("billing")
-    WI-->>TM: /path/.cowork-sandboxes/billing
     TM->>MB: register("billing")
     TM->>T1: start agent loop (initial_prompt)
     TM-->>Lead: {status: "created", name: "billing"}
 
     Lead->>TM: CreateTeammate(name="invoicing", role="...", prompt="...")
-    TM->>WI: create_sandbox("invoicing")
-    WI-->>TM: /path/.cowork-sandboxes/invoicing
     TM->>MB: register("invoicing")
     TM->>T2: start agent loop (initial_prompt)
     TM-->>Lead: {status: "created", name: "invoicing"}
@@ -681,10 +515,10 @@ sequenceDiagram
 
     par Parallel Execution
         T1->>TL: claim("Extract billing service")
-        T1->>T1: Work on billing service...
+        T1->>T1: Work on billing service in shared workspace...
     and
         T2->>TL: claim("Extract invoicing service")
-        T2->>T2: Work on invoicing service...
+        T2->>T2: Work on invoicing service in shared workspace...
     end
 
     T1->>TL: update(task-1, status="completed")
@@ -700,11 +534,9 @@ sequenceDiagram
     TM->>T2: shutdown_request
     T1-->>TM: shutdown_response(accepted)
     T2-->>TM: shutdown_response(accepted)
-    TM->>WI: merge_back("billing") → changes applied
-    TM->>WI: merge_back("invoicing") → changes applied
-    TM->>WI: cleanup_all()
     TM-->>Lead: team shut down
 
+    Lead->>Lead: Verify results in shared workspace
     Lead-->>User: "Refactoring complete. Created billing and invoicing services."
 ```
 
@@ -741,21 +573,15 @@ This is **not part of the initial implementation** — the prompt-driven approac
 Lead calls CreateTeammate(name="backend-dev", role="...", initial_prompt="...")
   │
   ├─ TeamManager.create_teammate()
-  │   ├─ WorkspaceIsolation.create_sandbox("backend-dev")
-  │   │     → (git repo) git worktree add .cowork-sandboxes/backend-dev ...
-  │   │     → (non-git)  copy workspace to .cowork-sandboxes/backend-dev/
-  │   │     → returns /path/to/.cowork-sandboxes/backend-dev
-  │   │
   │   ├─ MailboxRouter.register("backend-dev")
   │   │
   │   ├─ Create TeammateSessionManager (lightweight variant of SessionManager)
-  │   │     → Shares: LLMClient, PolicyEnforcer, PolicyBundle
+  │   │     → Shares: LLMClient, PolicyEnforcer, PolicyBundle, workspace directory
   │   │     → Fresh: MessageThread, TokenBudget(teammate_limit), WorkingMemory
-  │   │     → Workspace dir: sandbox path
   │   │
   │   └─ Start agent loop: asyncio.create_task(teammate.run(initial_prompt))
   │
-  └─ Return to lead: {"status": "created", "name": "backend-dev", "workspace": "..."}
+  └─ Return to lead: {"status": "created", "name": "backend-dev"}
 ```
 
 ### 6.2 Execution Loop (per Teammate)
@@ -779,7 +605,7 @@ flowchart TD
     G --> H
     H --> I[Call LLM]
     I --> J{LLM response}
-    J -- Tool calls --> K[Execute tools in sandbox]
+    J -- Tool calls --> K[Execute tools in shared workspace]
     K --> L{Task complete?}
     J -- Text only --> L
     L -- No --> E
@@ -830,9 +656,9 @@ Your name: {teammate_name}
 Your role: {role_description}
 
 ## Working Directory
-You are working in an isolated workspace at: {sandbox_path}
-Other teammates are working in separate workspaces — your file changes do not affect them.
-When your work is complete, the lead will review and merge your changes back.
+You are working in: {workspace_path}
+You share this workspace with other teammates. Stick to the files relevant to your
+assigned tasks. Check the task list to see what others are working on to avoid conflicts.
 
 ## Coordination
 - Use TeamTaskList to see what needs to be done
@@ -862,13 +688,6 @@ Lead calls ShutdownTeammate(name="backend-dev")
   ├─ TeamManager waits for loop completion (timeout: 60s)
   │   └─ If timeout: force-cancel the teammate task
   │
-  ├─ WorkspaceIsolation.merge_back("backend-dev")
-  │   └─ Returns MergeResult with list of changed files
-  │   └─ Lead reviews and applies changes (or auto-applies if configured)
-  │
-  ├─ WorkspaceIsolation.cleanup("backend-dev")
-  │   └─ Removes sandbox directory (or git worktree)
-  │
   └─ MailboxRouter.unregister("backend-dev")
 ```
 
@@ -876,7 +695,7 @@ Lead calls ShutdownTeammate(name="backend-dev")
 
 ## 7. Result Consolidation
 
-When teammates complete their work, the lead agent is responsible for consolidating results back into a coherent whole. The consolidation approach depends on the isolation strategy.
+When teammates complete their work, the lead agent verifies and reports the results. Since all teammates share the same workspace, there is no merge step — changes are already in place.
 
 ### 7.1 Consolidation Flow
 
@@ -886,7 +705,6 @@ sequenceDiagram
     participant T2 as Teammate: invoicing
     participant TL as SharedTaskList
     participant Lead as Lead Agent
-    participant WI as WorkspaceIsolation
     participant User
 
     T1->>TL: update(task-1, status="completed", result="Created billing service...")
@@ -895,62 +713,23 @@ sequenceDiagram
     Note over Lead: All tasks completed, begin consolidation
 
     Lead->>TL: TeamTaskList() → reviews all completed tasks and results
-    Lead->>WI: merge_back("billing") → MergeResult{changed: [src/billing/...], created: [...]}
-    Lead->>WI: merge_back("invoicing") → MergeResult{changed: [...], conflicts: []}
-
-    alt Conflicts detected
-        Lead->>Lead: Resolve conflicts (read both versions, decide)
-    end
-
-    Lead->>Lead: Verify consolidated result (run tests, check integration)
-    Lead->>WI: cleanup_all() → remove sandboxes/worktrees/deltas
-
+    Lead->>Lead: Verify results in workspace (read key files, run tests)
     Lead->>User: "Refactoring complete. Summary:
     - billing-dev: Created billing service (5 files)
     - invoicing-dev: Created invoicing service (4 files)
     - All tests passing"
 ```
 
-### 7.2 Per-Strategy Consolidation
+### 7.2 What the Lead Does
 
-#### SharedWithFileReservation (Default)
-
-No merge needed — changes are already in the workspace. Consolidation is just **verification**:
+No merge needed — changes are already in the workspace. Consolidation is **verification**:
 
 1. Lead reads the `SharedTaskList` to see what each teammate accomplished
 2. Lead verifies the results (runs tests, checks file integrity, reviews key changes)
 3. Lead reports a summary to the user
 4. No cleanup needed (no sandboxes to remove)
 
-This is the simplest path. Since file reservations prevent overlapping writes, there are no conflicts to resolve.
-
-#### CopyOnWriteOverlay
-
-Changes live in delta directories and must be explicitly applied:
-
-1. Lead calls `merge_back(teammate_name)` for each teammate
-2. `WorkspaceIsolation` returns a `MergeResult`:
-   ```python
-   @dataclass
-   class MergeResult:
-       applied: list[str]      # files successfully applied to workspace
-       created: list[str]      # new files added
-       deleted: list[str]      # files removed
-       conflicts: list[str]    # files modified by multiple teammates
-   ```
-3. For conflicts: lead reads both versions, decides which to keep (or combines them)
-4. Lead verifies the consolidated result
-5. Delta directories are cleaned up
-
-#### GitWorktreeSandbox
-
-Git handles the heavy lifting:
-
-1. Lead calls `merge_back(teammate_name)` → executes `git merge team/{team_id}/{teammate_name}`
-2. If fast-forward: automatic, no conflicts
-3. If merge conflicts: lead agent resolves using `ReadFile` on conflicting files + `WriteFile` to resolve
-4. Lead can also spawn a sub-agent to handle conflict resolution
-5. Worktrees and merged branches are cleaned up
+Since the lead decomposes tasks into non-overlapping areas of the workspace, conflicts are prevented by design rather than detected after the fact.
 
 ### 7.3 What the User Sees
 
@@ -986,7 +765,7 @@ If a teammate fails or is shut down before completing:
 
 - **Completed tasks**: Results are preserved and consolidated normally
 - **In-progress task**: Marked as `failed` in the task list. Lead can reassign to another teammate or handle it solo
-- **Teammate's workspace changes**: For `shared` mode, partial changes are already in the workspace (may need manual cleanup). For `overlay`/`worktree`, changes are isolated and can be discarded or selectively applied
+- **Partial workspace changes**: Since all teammates share the workspace, partial changes are already present. The lead reviews and may need to clean up incomplete work before reassigning
 
 The lead reports partial failures to the user:
 
@@ -1132,7 +911,7 @@ New notifications from Agent Host → Desktop App:
 
 ### Safety
 
-- **No cross-sandbox access**: Teammates cannot read/write files outside their sandbox. The `PolicyEnforcer` path restriction is scoped to the teammate's sandbox root (unless `shared` isolation mode is used).
+- **Workspace boundaries**: All teammates share the workspace but the `PolicyEnforcer` path restrictions from the session's `PolicyBundle` still apply. Teammates cannot access paths outside the allowed workspace.
 - **Teammate isolation**: Teammates cannot access each other's `MessageThread` or `WorkingMemory`. Communication is only via `SharedTaskList` and `MailboxRouter`.
 - **Lead authority**: Only the lead can create/shutdown teammates. Teammates cannot promote themselves or modify team configuration.
 - **Graceful degradation**: If a teammate crashes, the team continues. The lead is notified and can reassign the crashed teammate's tasks.
@@ -1148,7 +927,7 @@ Sub-agents and teammates serve different purposes and **coexist**:
 | **Scope** | Quick focused task (e.g. "search for X") | Extended workstream (e.g. "build the API") |
 | **Lifetime** | Single tool call (seconds) | Minutes to hours |
 | **Budget** | Shared with parent | Independent allocation |
-| **File isolation** | None (same directory) | Sandbox directory or git worktree |
+| **File isolation** | None (same directory) | Shared workspace (task-based coordination) |
 | **Persistence** | Ephemeral | Persisted (survives parent step boundaries) |
 | **Communication** | Return value only | Bidirectional messaging |
 | **Who can spawn** | Any agent (lead or teammate) | Lead only |
@@ -1166,7 +945,6 @@ agent_host/
     team_manager.py        # TeamManager: lifecycle, coordination
     task_list.py           # SharedTaskList: in-memory task tracking
     mailbox.py             # MailboxRouter: peer-to-peer messaging
-    workspace_isolation.py # WorkspaceIsolation: sandbox/worktree strategies
     models.py              # TeamConfig, TeammateInfo, TeamTask, TeamMessage
     teammate_session.py    # TeammateSessionManager: lightweight session for teammates
     tools.py               # Team-specific agent tool definitions and handlers
@@ -1183,7 +961,6 @@ flowchart TB
         TM[TeamManager]
         TL[SharedTaskList]
         MB[MailboxRouter]
-        WI[WorkspaceIsolation]
         TS[TeammateSessionManager]
         TT[Team Tools]
     end
@@ -1193,7 +970,6 @@ flowchart TB
         SM[SessionManager<br/>+ holds TeamManager ref<br/>+ forwards team events]
         ATH[AgentToolHandler<br/>+ registers team tools<br/>+ lead vs teammate check]
         RL[ReactLoop<br/>+ mailbox poll before LLM call<br/>+ message injection]
-        TE[ToolExecutor<br/>+ sandbox path scoping]
         EE[EventEmitter<br/>+ team event types]
         JRPC[JSON-RPC Server<br/>+ team notification methods]
         CP[CheckpointManager<br/>+ persist team state]
@@ -1211,7 +987,6 @@ flowchart TB
     SM --> TM
     TM --> TL
     TM --> MB
-    TM --> WI
     TM --> TS
     ATH --> TT
     RL --> MB
@@ -1242,8 +1017,7 @@ flowchart TB
 - No changes to tool execution flow — team tools route through `AgentToolHandler` like existing agent tools
 
 **`ToolExecutor` (`loop/tool_executor.py`)**
-- Modify `_check_path_allowed()`: if teammate, resolve paths against sandbox root instead of original workspace
-- Pass `sandbox_root` via `ExecutionContext.workspace_dir` (already supported — just needs correct path)
+- No changes needed — teammates share the workspace and use the same `ExecutionContext.workspace_dir` as the lead
 
 **`EventEmitter` (`events/event_emitter.py`)**
 - New event types: `team_created`, `teammate_created`, `teammate_removed`, `team_task_updated`, `team_message`, `team_shutdown`
@@ -1338,7 +1112,7 @@ Approval decisions already carry `sessionId` + `userId`. Teammate approvals are 
 
 | Change | Purpose |
 |--------|---------|
-| Optional `teamPolicy` section in PolicyBundle | Team-specific settings: max teammates, auto-approve capabilities, isolation mode |
+| Optional `teamPolicy` section in PolicyBundle | Team-specific settings: max teammates, auto-approve capabilities, budget allocation |
 
 This is additive — policies without `teamPolicy` use defaults.
 
@@ -1350,8 +1124,7 @@ This is additive — policies without `teamPolicy` use defaults.
 
 1. **SharedTaskList** — in-memory task list with dependencies and locking
 2. **MailboxRouter** — in-memory message queues with poll/send/broadcast
-3. **WorkspaceIsolation** — directory sandbox (default) + git worktree strategy (auto-detected)
-4. **TeamManager** — teammate lifecycle, wiring shared resources
+3. **TeamManager** — teammate lifecycle, wiring shared resources
 5. **TeammateSessionManager** — lightweight session manager variant for teammates
 6. **Team tools** — `CreateTeam`, `CreateTeammate`, `ShutdownTeammate`, `ShutdownTeam`, `TeamTaskCreate`, `TeamTaskUpdate`, `TeamTaskList`, `SendTeamMessage`
 7. **ReactLoop integration** — mailbox polling, message injection
@@ -1376,8 +1149,7 @@ This is additive — policies without `teamPolicy` use defaults.
 |-----------|--------|-------------|
 | SharedTaskList | Small | None |
 | MailboxRouter | Small | None |
-| WorkspaceIsolation | Medium | Platform adapters (copy, symlink) + git CLI (optional) |
-| TeamManager | Medium | TaskList, Mailbox, WorkspaceIsolation |
+| TeamManager | Medium | TaskList, Mailbox |
 | TeammateSessionManager | Medium | SessionManager refactor |
 | Team tools | Medium | TeamManager |
 | ReactLoop integration | Small | MailboxRouter |
