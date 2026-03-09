@@ -275,6 +275,8 @@ sequenceDiagram
 | `createdAt` | datetime | Session creation time |
 | `expiresAt` | datetime | Policy bundle expiry — session must not continue past this |
 
+> **Team context:** Sessions may include team-related fields: `sessionType` (`solo`/`lead`/`teammate`), `teamId` (links teammates to the same team), and `parentSessionId` (teammate to lead reference). The `teamId-index` GSI enables querying all sessions in a team.
+
 ---
 
 ## Data Store

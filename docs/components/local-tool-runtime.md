@@ -124,6 +124,8 @@ interface ToolRouter {
 }
 ```
 
+> The ToolRouter handles file/shell/network/code tools. Agent-internal tools (`TaskTracker`, `CreatePlan`, etc.) and team tools are handled by separate handlers (`AgentToolHandler` and `TeamToolProvider` respectively).
+
 > ToolRequest / ToolResult schemas: [architecture.md, Section 6.2](../architecture.md#62-tool-schemas--local-agent-host--local-tool-runtime)
 
 ### Tool Registry
@@ -150,6 +152,8 @@ registry = {
   "ExecuteCode":       ExecuteCodeTool,
 }
 ```
+
+> **Note:** Team tools (`CreateTeam`, `CreateTeammate`, etc.) are NOT routed through ToolRouter — they are handled by `TeamToolProvider` in `agent_host/teams/`. See [components/agent-teams.md](agent-teams.md).
 
 Phase 2+: MCP tools are added to the registry dynamically when remote MCP servers are discovered and connected, and their manifests translated.
 

@@ -79,6 +79,14 @@ agent-host/
   thread/          — Message thread management, context compaction, token counting
   memory/          — Working memory (task tracker, plan, notes) + persistent memory (project instructions, auto-memory)
   skills/          — Skill definitions, loader (built-in/markdown/policy)
+  teams/           — Team primitives and strategy implementations
+    strategies.py      — TeamCoordinator, TeamToolProvider, TeamContextInjector, TeamCheckpointProvider
+    team_manager.py    — TeamManager: lifecycle, task list, mailbox coordination
+    task_list.py       — SharedTaskList: in-memory task tracking with async locking
+    mailbox.py         — MailboxRouter: peer-to-peer + broadcast messaging
+    models.py          — TeamConfig, TeammateInfo, TeamTask, TeamMessage
+    teammate_session.py — TeammateSessionManager: lightweight agent loop for teammates
+    tools.py           — Team tool definitions (9 tools: lead-only + shared)
   policy/          — Local Policy Enforcer (capability checks, path/command enforcement, risk assessment)
   budget/          — Token budget tracking (pre-check + record_usage)
   approval/        — Approval gate (asyncio Futures for user approval flow)
@@ -698,7 +706,23 @@ Each sub-agent receives:
 
 **Error handling:** Sub-agent failures do not crash the parent. If a sub-agent fails (LLM error, budget exhaustion, max_steps), the failure message is returned as a tool result and the parent decides how to proceed.
 
-### 4.9 Skills System
+### 4.9 Agent Teams
+
+Agent Teams extend the sub-agent model (Section 4.8) into a multi-agent coordination system managed by the `teams/` module. The lead agent can spawn teammate agents that collaborate via a shared task list and mailbox.
+
+**Strategy pattern:** Teams use four pluggable strategies — `CoordinationStrategy` (task assignment, completion checks), `ToolProviderStrategy` (tool filtering by agent role), `ContextInjectionStrategy` (system prompt augmentation with team state), and `CheckpointStrategy` (team state persistence for crash recovery). The default implementations are `TeamCoordinator`, `TeamToolProvider`, `TeamContextInjector`, and `TeamCheckpointProvider` in `teams/strategies.py`.
+
+**TeammateSessionManager:** Each teammate gets a lightweight agent loop via `TeammateSessionManager`. Teammates share the lead's `LLMClient`, `PolicyEnforcer`, and `ToolRouter` but receive a fresh `MessageThread`, `TokenBudget` (allocated from lead's remaining budget), and `WorkingMemory`. This keeps teammates isolated conversationally while reusing expensive shared resources.
+
+**Budget reallocation:** When a teammate completes, any unused tokens from its budget are reclaimed back to the lead agent's budget. This prevents budget waste when teammates finish early.
+
+**Idle timeout:** Teammates that remain idle for more than 5 minutes are automatically shut down and their remaining budget reclaimed.
+
+**Team tools:** Nine team-specific tools are provided via `TeamToolProvider` (not `ToolRouter`), filtered by agent role — lead-only tools (e.g., spawn teammate, assign task, broadcast) vs. shared tools (e.g., check mailbox, update task status). See Section 7.1 for how this interacts with tool routing.
+
+> Full design: see [`components/agent-teams.md`](agent-teams.md)
+
+### 4.10 Skills System
 
 The skills system (`skills/`) provides formalized multi-step workflows that the agent can invoke as tools. Skills use **directory-based Markdown format** with progressive disclosure.
 
@@ -945,7 +969,11 @@ Each retry attempt emits an `llm_retry` event with `attempt`, `maxRetries`, `err
 
 ### 7.1 ToolRouter Interface
 
-The `ToolRouter` is the sole boundary between `agent-host/` and `tool-runtime/`:
+The `ToolRouter` is the sole boundary between `agent-host/` and `tool-runtime/`.
+
+> **Agent Teams note:** Team tools (Section 4.9) are routed via `TeamToolProvider`, not through `ToolRouter`. The `TeamToolProvider` strategy filters available tools based on agent role (lead vs. teammate) and handles team-specific tool execution (task list, mailbox, teammate management) entirely within `agent-host/`. Only non-team tools pass through the standard `ToolRouter` dispatch flow below.
+
+Interface:
 
 ```
 interface ToolRouter {

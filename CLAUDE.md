@@ -39,9 +39,10 @@ docs/   ← Architecture design docs, ADRs, runbooks, threat models
 |-----|-------|
 | `architecture.md` | Master architecture — start here |
 | `domain-model.md` | Entity hierarchy, session types, message storage |
-| `components/local-agent-host.md` | Agent loop, policy enforcer, state store |
+| `components/local-agent-host.md` | Agent loop, policy enforcer, state store, agent teams |
 | `components/local-tool-runtime.md` | Tools, platform adapters, MCP client |
-| `components/desktop-app.md` | UI views, IPC client, updater |
+| `components/desktop-app.md` | UI views, IPC client, updater, team view |
+| `components/agent-teams.md` | Multi-agent coordination, strategy interfaces, team tools, incremental plan |
 | `services/session-service.md` | Session CRUD, compatibility check |
 | `services/policy-service.md` | Policy bundle, capability model |
 | `services/workspace-service.md` | Artifact storage, S3 integration |

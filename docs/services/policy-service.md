@@ -74,9 +74,16 @@ A policy bundle is a JSON document returned to the Session Service, which passes
       "title": "Local command execution",
       "description": "User approval required for shell commands"
     }
-  ]
+  ],
+  "teamPolicy": {
+    "maxTeammates": 5,
+    "teammateBudget": 50000,
+    "allowedRoles": []
+  }
 }
 ```
+
+> **Team policy:** The optional `teamPolicy` section controls team behavior: `maxTeammates` (1-20), `teammateBudget` (default token budget per teammate), `allowedRoles` (optional allowlist). When absent, team creation is disabled.
 
 ### Client-side Validation
 
