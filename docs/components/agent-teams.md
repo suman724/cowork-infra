@@ -2029,7 +2029,25 @@ All work is done on a **feature branch per repo**. Nothing merges to `main` unti
 
 ---
 
-## 19. References
+## 19. Future Enhancements
+
+Parking lot for improvements identified during implementation. Not planned for initial launch.
+
+### 19.1 Idle Timeout Wake Reason
+
+Currently, when the idle monitor shuts down a teammate, the lead receives a generic `"event"` wake reason from `WaitForTeam`. The lead cannot distinguish between an idle timeout shutdown and a normal task completion. **Enhancement:** Add a specific wake reason (e.g. `"idle_timeout"`) or include a `shutdown_reason` field in the teammate status so the lead can decide whether to recreate the teammate, reassign its work, or ignore.
+
+### 19.2 Auto-Recreate Policy
+
+Teammates shut down by idle timeout are not automatically recreated — the lead must decide. This is intentional (avoids infinite loops if the teammate keeps getting stuck). **Enhancement:** Add an optional `auto_recreate` flag in `TeamConfig` or per-teammate config that allows the coordinator to automatically respawn idle-shutdown teammates with a retry prompt. Should include a max-recreate count to prevent runaway loops.
+
+### 19.3 Budget Request from Teammates
+
+Currently budget flows one way: lead allocates at spawn, unused budget reclaimed on completion. A productive teammate that runs out of budget is simply shut down. **Enhancement:** Allow teammates to send a `BudgetRequest` message to the lead, who can approve/deny additional budget allocation. Requires a new message type and approval flow. (Also noted in §18 Open Question #2.)
+
+---
+
+## 20. References
 
 - **Claude Code Agent Teams**: [Official docs](https://code.claude.com/docs/en/agent-teams), announced Feb 2026 with Opus 4.6
 - **"Building a C compiler with a team of parallel Claudes"**: Anthropic engineering blog — 16 agents, 100K lines of Rust, ~$20K
