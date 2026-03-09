@@ -17,7 +17,7 @@ This keeps the user experience local-first while preserving enterprise-grade gov
 | Component | Purpose |
 |-----------|---------|
 | **Desktop App** | User interface — conversations, approval dialogs, patch preview |
-| **Local Agent Host** | Agent loop orchestration — planning, steps, LLM calls, tool routing, checkpointing |
+| **Local Agent Host** | Agent loop orchestration — planning, steps, LLM calls, tool routing, checkpointing, agent teams |
 | **Local Tool Runtime** | Executes file, shell, and network tools; MCP client for remote tool servers (Phase 2+) |
 | **Local Policy Enforcer** | Enforces capability and path restrictions from the policy bundle |
 | **Local Approval UI** | Presents approval requests to the user; captures decisions |
@@ -286,6 +286,15 @@ Capabilities are issued in the policy bundle and enforced by **Local Policy Enfo
 | `LLM.Call` | Call LLM Gateway | model allowlist, token budgets | No |
 | `Search.Web` | Web search via Tavily API | — | No |
 | `Code.Execute` | Execute Python code | `allowedLanguages`, `maxExecutionTimeSeconds`, `allowCodeNetwork` | Usually yes |
+| `Team.CreateTeam` | Create an agent team | team name, strategy | No |
+| `Team.CreateTeammate` | Spawn a teammate agent | team id, role, prompt | No |
+| `Team.ShutdownTeammate` | Shut down a single teammate | team id, teammate id | No |
+| `Team.ShutdownTeam` | Shut down an entire team | team id | No |
+| `Team.TaskCreate` | Create a task for a teammate | team id, teammate id, task description | No |
+| `Team.TaskUpdate` | Update a teammate's task status | team id, task id, status | No |
+| `Team.TaskList` | List tasks for a team or teammate | team id | No |
+| `Team.SendMessage` | Send a message to a teammate or team | team id, recipient | No |
+| `Team.WaitForTeam` | Wait for team tasks to complete | team id, timeout | No |
 
 > Full policy bundle structure and LLM policy fields: [services/policy-service.md](services/policy-service.md)
 >
@@ -464,6 +473,7 @@ Internal design, algorithms, state machines, and module structure:
 | Local Agent Host, Local Policy Enforcer, Local State Store | 1 (MVP) | [components/local-agent-host.md](components/local-agent-host.md) |
 | Desktop App, Local Approval UI | 1 (MVP) | [components/desktop-app.md](components/desktop-app.md) |
 | Local Tool Runtime | 1 (MVP) | [components/local-tool-runtime.md](components/local-tool-runtime.md) |
+| Agent Teams | 1 (MVP) | [components/agent-teams.md](components/agent-teams.md) — Multi-agent coordination, strategy interfaces, team tools |
 
 ### Backend Services
 
@@ -611,7 +621,7 @@ All tables follow these conventions:
 
 ### Phase 1 — Core desktop agent
 
-Desktop App, Local Agent Host, Local Tool Runtime (built-in file/shell/network tools), Session Service, LLM Gateway integration, Policy Service, Workspace Service
+Desktop App, Local Agent Host, Local Tool Runtime (built-in file/shell/network tools), Agent Teams (multi-agent coordination, strategy interfaces), Session Service, LLM Gateway integration, Policy Service, Workspace Service
 
 ### Phase 2 — Approvals, MCP, and resilience
 
@@ -711,7 +721,7 @@ cowork-desktop-app/
   updater/        ← agent-runtime version check, download, verification, launch
 
 cowork-agent-runtime/
-  agent_host/     ← Local Agent Host (agent loop, session client, LLM client, JSON-RPC server)
+  agent_host/     ← Local Agent Host (agent loop, session client, LLM client, JSON-RPC server, teams/)
   tool_runtime/   ← Local Tool Runtime (built-in tools, MCP client, platform adapters)
   build/          ← Platform-specific packaging (macOS arm64/x86_64, Windows x64)
   pyproject.toml  ← Python project config

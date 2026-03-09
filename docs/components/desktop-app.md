@@ -345,7 +345,13 @@ Shows pending file changes made by the agent during the current task. Accessed v
 - **Select a file** → show its diff in the right panel
 - **View modes** → unified diff or side-by-side
 
-### 4.5 Settings View
+### 4.5 Team View
+
+A multi-panel container shown below the lead conversation when a team is active. Displays teammate output panels on the left and a shared task board with message feed in the right sidebar.
+
+**Components:** `TeamView`, `TeammatePanel`, `TaskBoardView`, `TeamMessageFeed`.
+
+### 4.6 Settings View
 
 User preferences and connection configuration.
 
@@ -429,6 +435,8 @@ ipcClient.on("error",                 handler)  — agent-level error
 
 The conversation view registers handlers to update the message list in real time. The approval view registers for `approval_requested` to show the modal.
 
+Additionally, `push:team-event` forwards `team/*` JSON-RPC notifications from the agent runtime. These are dispatched by the `useTeamEvents` hook to `team-store`.
+
 ### 5.4 Error Code to UI Message Mapping
 
 | Error Code | User-Facing Message |
@@ -490,6 +498,11 @@ AppState {
     goal: string
     steps: { index: number, description: string, status: string }[]
   } | null
+
+  // Team state (Zustand store: team-store)
+  // TeamInfo, members (TeamMember[]), tasks (TeamTask[]), messages (TeamMessage[]),
+  // teammateOutput (streaming text per teammate)
+  team: TeamState | null
 
   // UI
   view: "history" | "conversation" | "settings"

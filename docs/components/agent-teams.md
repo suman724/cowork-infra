@@ -660,36 +660,34 @@ Lead calls CreateTeammate(name="researcher", role="...", initial_prompt="...")
 
 Each teammate runs a standard `ReactLoop` with these additions:
 
-1. **Before each LLM call** — check mailbox, inject pending messages as context
-2. **After task completion** — automatically poll `SharedTaskList` for next available task
-3. **Idle behavior** — if no tasks available and no messages, wait with backoff (poll every 5s, max 30s)
-4. **Shutdown signal** — when `shutdown_request` message received, finish current step, exit
+1. **Before each LLM call** — `TeamContextInjector` polls the mailbox and task list, injecting pending messages and current task status as system messages into the LLM context
+2. **Exit check** — before allowing natural termination (`stop_reason=stop`, no tool calls), the loop calls an `exit_check` callback. If the teammate still has incomplete tasks (pending, in_progress, or blocked), a nudge is injected and the loop continues. Solo sessions have no exit check (unaffected).
+3. **Blocked wait** — if all remaining tasks are blocked (waiting on dependencies), the teammate **blocks on a per-teammate `asyncio.Event`** instead of spinning LLM calls. Zero token consumption while waiting.
+4. **Wake triggers** — the blocked wait ends when:
+   - A message is sent to the teammate via `SendTeamMessage` (mailbox delivery)
+   - A task created by the teammate is unblocked (`_unblock_dependents` fires after a dependency completes)
+   - 5-minute timeout (safety fallback)
+5. **Shutdown signal** — `cancel()` sets the cancellation event, the loop exits on next iteration
 
 ```mermaid
 flowchart TD
-    A[Start: initial_prompt] --> B[Poll SharedTaskList for available tasks]
-    B --> C{Task available?}
-    C -- Yes --> D[Claim task via TeamTaskUpdate]
-    D --> E[Poll MailboxRouter for messages]
-    E --> F{Messages pending?}
-    F -- Yes --> G[Inject messages into context window]
-    F -- No --> H[Build LLM context]
-    G --> H
-    H --> I[Call LLM]
-    I --> J{LLM response}
-    J -- Tool calls --> K[Execute tools in shared workspace]
-    K --> L{Task complete?}
-    J -- Text only --> L
-    L -- No --> E
-    L -- Yes --> M[TeamTaskUpdate: status=completed]
-    M --> N{Shutdown requested?}
-    N -- No --> B
-    N -- Yes --> O[Exit agent loop]
-    C -- No --> P[Wait with backoff 5s..30s]
-    P --> Q{Shutdown requested?}
-    Q -- No --> B
-    Q -- Yes --> O
+    A[Start: initial_prompt] --> B[Context injection: messages + task status]
+    B --> C[Call LLM]
+    C --> D{LLM response}
+    D -- Tool calls --> E[Execute tools in shared workspace]
+    E --> B
+    D -- "Text only (stop)" --> F{Exit check: incomplete tasks?}
+    F -- "No incomplete tasks" --> G[Exit loop: completed]
+    F -- "Pending/in_progress tasks" --> H[Inject nudge: keep working]
+    H --> B
+    F -- "All tasks blocked" --> I[Block on wake_event]
+    I -- "Message received" --> J[Inject nudge with updated context]
+    I -- "Task unblocked" --> J
+    I -- "Timeout 5min" --> J
+    J --> B
 ```
+
+**Design decision — no restart, no polling:** We chose event-driven blocking over restarting stopped teammates or polling with backoff. Rationale: (1) restarting loses conversation context, (2) polling burns tokens/steps, (3) the mailbox already delivers messages — the teammate just needs to stay alive to receive them.
 
 #### Peer-to-Peer Communication Flow
 
@@ -720,32 +718,31 @@ sequenceDiagram
 
 ### 6.3 Lead Wait Behavior
 
-After the lead sets up the team (creates teammates, populates the task list), it typically has nothing to do until teammates complete their work. The lead enters a **wait loop** — similar to the teammate idle loop but watching for coordination events:
+After the lead sets up the team (creates teammates, populates the task list), it calls the `WaitForTeam` agent tool to block until teammates produce results. This uses a shared `asyncio.Event` (`_wake_event`) — no polling, no token consumption while waiting.
 
 ```mermaid
 flowchart TD
-    A[Lead finishes team setup] --> B[Wait with backoff 5s..30s]
-    B --> C{Wake condition?}
-    C -- "All tasks completed" --> D[Trigger LLM call for consolidation]
-    C -- "Message from teammate" --> E[Trigger LLM call with message context]
-    C -- "Teammate failed/budget exhausted" --> F[Trigger LLM call for recovery decision]
-    C -- "User sends follow-on message" --> G[Trigger LLM call with user input]
-    C -- "None" --> B
-    D --> H[Lead verifies results, reports to user]
-    E --> I[Lead responds or adjusts plan]
-    F --> J[Lead proposes recovery to user]
-    G --> K[Lead handles user request]
+    A[Lead finishes team setup] --> B["Call WaitForTeam(timeout=120)"]
+    B --> C["Block on _wake_event.wait()"]
+    C --> D{Wake condition?}
+    D -- "Task completed/failed" --> E[Return task summary snapshot to LLM]
+    D -- "Message from teammate" --> E
+    D -- "Teammate loop finished" --> E
+    D -- "Timeout" --> E
+    E --> F{All tasks done?}
+    F -- Yes --> G[Lead consolidates results]
+    F -- No --> B
 ```
 
-**Wake conditions** (any one triggers an LLM call):
-1. **All tasks completed** — `SharedTaskList` has no `pending`, `in_progress`, or `blocked` tasks
-2. **Incoming message** — teammate sends a message to the lead via `MailboxRouter`
-3. **Teammate failure** — a teammate's task moves to `failed` (budget exhaustion, error, crash)
-4. **User input** — user sends a new message in the lead's conversation panel
+**Wake conditions** (any one sets `_wake_event`):
+1. **Task completed or failed** — `TeamTaskUpdate` handler calls `coordinator.wake()` on completion/failure
+2. **Incoming message** — teammate sends a message to the lead via `SendTeamMessage`
+3. **Teammate done** — `_on_teammate_done` callback fires when a teammate's asyncio task finishes
+4. **Teammate creates a task** — `TeamTaskCreate` from a teammate wakes the lead
 
-Between wake conditions, the lead's loop is dormant — no LLM calls, no token consumption. The `ContextInjectionStrategy` only runs when a wake condition triggers an LLM call, at which point the lead sees the full updated state (task list, messages) in its context.
+Between wake conditions, the lead's loop is dormant — no LLM calls, no token consumption. `WaitForTeam` returns a snapshot including task summary counts, `all_tasks_done` flag, and teammate statuses.
 
-Note: the lead can also do its own work while teammates run. If the lead has tasks assigned to itself (e.g., a verification task blocked on teammate tasks), it processes those through its normal `ReactLoop` — the wait behavior only applies when the lead has nothing to do.
+Note: the lead can also do its own work while teammates run. If the lead has tasks assigned to itself, it processes those through its normal `ReactLoop` — `WaitForTeam` is an explicit agent tool call, not automatic.
 
 ### 6.4 Teammate System Prompt
 
@@ -754,18 +751,24 @@ You are a teammate in a multi-agent team working on a shared project.
 
 Team: {team_name}
 Your name: {teammate_name}
-Your role: {role_description}
+Your role: {role}
 
 ## Working Directory
-You are working in: {workspace_path}
+You are working in: {workspace_dir}
 You share this workspace with other teammates. Stick to the files relevant to your
 assigned tasks. Check the task list to see what others are working on to avoid conflicts.
 
-## Coordination
-- Use TeamTaskList to see what needs to be done
-- Use TeamTaskUpdate to pick up tasks and report completion
-- Use SendTeamMessage to communicate with teammates or the lead
-- Save your work frequently
+## Coordination — IMPORTANT
+You MUST use the team coordination tools to keep the team in sync:
+
+1. **Start of work**: Call TeamTaskCreate to register what you are working on.
+2. **Progress**: Call TeamTaskUpdate with status='in_progress' when you begin a task.
+3. **Completion**: Call TeamTaskUpdate with status='completed' and a result summary when done.
+4. **Communication**: Use SendTeamMessage to share findings, ask questions, or report to the lead.
+5. **Check tasks**: Use TeamTaskList to see what needs to be done and what others are doing.
+
+These tools are how the team stays coordinated and how the user sees your progress.
+Working without updating tasks or sending messages makes you invisible to the team.
 
 ## Guidelines
 - Focus on your assigned tasks
@@ -1125,28 +1128,27 @@ Note: Workspace Service has no `teamId` index — team history always requires t
 
 ### UI Layout
 
-When a team is active, the Desktop App switches to a **team view**:
+When a team is active, the Desktop App switches to a **side-by-side layout**: the lead's conversation on the left (400px fixed), and the team view filling the remaining space on the right.
 
 ```
-┌──────────────────────────────────────────────────────────────────┐
-│  Team: "Q4 Market Analysis"                        [Shutdown Team]│
-├──────────────────┬──────────────────┬────────────────────────────┤
-│  Lead            │  researcher      │  analyst                   │
-│  ─────────────── │  ─────────────── │  ──────────────────────── │
-│  Conversation    │  Conversation    │  Conversation              │
-│  messages...     │  messages...     │  messages...               │
-│                  │                  │                            │
-│                  │                  │                            │
-│                  │  [Approval: Y/N] │                            │
-│                  │                  │                            │
-├──────────────────┴──────────────────┴────────────────────────────┤
-│  Shared Tasks                                                    │
-│  ☑ Gather competitor data (researcher) — completed               │
-│  ▶ Analyze market trends (analyst) — in_progress                │
-│  ⏸ Write executive summary — blocked by: task-1, task-2         │
-│  ○ Final review and formatting — pending                         │
-└──────────────────────────────────────────────────────────────────┘
+┌──────────────────────┬───────────────────────────────────────────┐
+│  Lead Conversation   │  Team: "Q4 Market Analysis"  2 active     │
+│  ─────────────────── │  ┌──────────────────┬──────────────────┐  │
+│  User: Create a team │  │  researcher      │  Tasks           │  │
+│  to analyze...       │  │  ● Research AI..  │  ▶ Gather data   │  │
+│                      │  │  🔍 WebSearch AI  │    @researcher   │  │
+│  [WaitForTeam]       │  │  📄 ReadFile ...  │  ✓ Research done │  │
+│  [SendTeamMessage]   │  │  Research text... │    @researcher   │  │
+│                      │  ├──────────────────┤──────────────────│  │
+│                      │  │  analyst         │  Messages         │  │
+│                      │  │  ● Draft Report  │  @researcher →    │  │
+│                      │  │  Waiting for...  │    @analyst: ...  │  │
+│  [PromptInput]       │  │                  │  @lead → @analyst │  │
+│                      │  └──────────────────┴──────────────────┘  │
+└──────────────────────┴───────────────────────────────────────────┘
 ```
+
+Each teammate panel shows: status indicator (running/stopped), tool call history with icons and args, and streaming text output rendered as markdown. The right sidebar shows a shared task board (color-coded by status) and inter-agent message feed.
 
 ### JSON-RPC Extensions
 
@@ -1170,7 +1172,12 @@ New notifications from Agent Host → Desktop App:
 
 // Teammate conversation update (stream to UI panel)
 {"jsonrpc": "2.0", "method": "team/teammate_output", "params": {"teamId": "...", "name": "researcher", "content": "..."}}
+
+// Teammate tool activity (tool call started/completed indicator for UI)
+{"jsonrpc": "2.0", "method": "team/teammate_tool", "params": {"teamId": "...", "name": "researcher", "toolName": "WebSearch", "toolCallId": "tc-1", "status": "requested", "args": "AI payments industry"}}
 ```
+
+**Event proxy:** Teammate events do NOT flow through the `SessionEvent` envelope. The `_TeammateEventProxy` intercepts `emit_tool_requested/completed` and `emit_text_chunk` from the teammate's agent loop and converts them to `team/teammate_tool` and `team/teammate_output` notifications respectively. All other session events (step_started, step_completed, etc.) are suppressed — they would pollute the lead's conversation.
 
 ---
 
@@ -2029,7 +2036,25 @@ All work is done on a **feature branch per repo**. Nothing merges to `main` unti
 
 ---
 
-## 19. References
+## 19. Future Enhancements
+
+Parking lot for improvements identified during implementation. Not planned for initial launch.
+
+### 19.1 Idle Timeout Wake Reason
+
+Currently, when the idle monitor shuts down a teammate, the lead receives a generic `"event"` wake reason from `WaitForTeam`. The lead cannot distinguish between an idle timeout shutdown and a normal task completion. **Enhancement:** Add a specific wake reason (e.g. `"idle_timeout"`) or include a `shutdown_reason` field in the teammate status so the lead can decide whether to recreate the teammate, reassign its work, or ignore.
+
+### 19.2 Auto-Recreate Policy
+
+Teammates shut down by idle timeout are not automatically recreated — the lead must decide. This is intentional (avoids infinite loops if the teammate keeps getting stuck). **Enhancement:** Add an optional `auto_recreate` flag in `TeamConfig` or per-teammate config that allows the coordinator to automatically respawn idle-shutdown teammates with a retry prompt. Should include a max-recreate count to prevent runaway loops.
+
+### 19.3 Budget Request from Teammates
+
+Currently budget flows one way: lead allocates at spawn, unused budget reclaimed on completion. A productive teammate that runs out of budget is simply shut down. **Enhancement:** Allow teammates to send a `BudgetRequest` message to the lead, who can approve/deny additional budget allocation. Requires a new message type and approval flow. (Also noted in §18 Open Question #2.)
+
+---
+
+## 20. References
 
 - **Claude Code Agent Teams**: [Official docs](https://code.claude.com/docs/en/agent-teams), announced Feb 2026 with Opus 4.6
 - **"Building a C compiler with a team of parallel Claudes"**: Anthropic engineering blog — 16 agents, 100K lines of Rust, ~$20K

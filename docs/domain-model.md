@@ -8,16 +8,20 @@ This document is the authoritative reference for all core domain concepts in the
 
 ```
 Workspace
-  └── Session  (one or more per workspace, over time)
-        └── Task  (one or more per session)
-              └── Step  (one or more per task)
-                    ├── LLM Call
-                    ├── Tool Call  (zero or more per step)
-                    ├── Approval   (zero or more per step)
-                    └── Artifact   (zero or more per step)
+  ├── Session  (one or more per workspace, over time)
+  │     └── Task  (one or more per session)
+  │           └── Step  (one or more per task)
+  │                 ├── LLM Call
+  │                 ├── Tool Call  (zero or more per step)
+  │                 ├── Approval   (zero or more per step)
+  │                 └── Artifact   (zero or more per step)
+  │
+  └── Team  (zero or more per workspace)
+        ├── Lead Session  (exactly one)
+        └── Teammate Session  (zero or more)
 ```
 
-Every session always has a workspace. There are no workspace-less sessions.
+Every session always has a workspace. There are no workspace-less sessions. A Team sits alongside sessions — it is a coordination container that groups one lead session with N teammate sessions under the same workspace.
 
 ---
 
@@ -119,6 +123,63 @@ SESSION_CREATED
 **Terminology note:** The design doc uses "session" throughout. The Desktop App UI shows the user a "conversation". These are the same entity — different vocabulary for different audiences.
 
 **Owned by:** Session Service (lifecycle); Local Agent Host (state machine and message thread during execution)
+
+---
+
+### Team
+
+A coordination container that spans one lead session and N teammate sessions, enabling multi-agent collaboration within a single workspace. The lead agent orchestrates work by assigning tasks and routing messages to teammates.
+
+| Attribute | Type | Description |
+|-----------|------|-------------|
+| `teamId` | string | Unique identifier |
+| `workspaceId` | string | The workspace all team sessions belong to |
+| `leadSessionId` | string | The lead session that created and orchestrates this team |
+| `teammates` | TeammateInfo[] | Metadata for each teammate (see below) |
+| `status` | enum | `active`, `completed`, `failed` |
+| `createdAt` | datetime | When the team was created |
+| `completedAt` | datetime | When the team finished (null while active) |
+
+**TeammateInfo** — metadata per teammate in the team:
+
+| Attribute | Type | Description |
+|-----------|------|-------------|
+| `name` | string | Human-readable teammate name (e.g., "researcher", "coder") |
+| `sessionId` | string | The teammate's session ID |
+| `role` | string | Free-form role description guiding the teammate's behaviour |
+| `budget` | object | Token/step budget allocated to this teammate |
+| `status` | enum | `idle`, `working`, `done`, `failed` |
+
+**TeamTask** — shared task list items visible to all agents in the team:
+
+| Attribute | Type | Description |
+|-----------|------|-------------|
+| `taskId` | string | Unique identifier within the team |
+| `teamId` | string | Parent team |
+| `title` | string | Short description of the work item |
+| `status` | enum | `pending`, `in_progress`, `completed`, `failed` |
+| `assignee` | string | Teammate name or `lead` |
+| `createdBy` | string | Agent that created this task item |
+| `result` | string | Summary of outcome (null until completed) |
+
+**TeamMessage** — inter-agent messages routed via MailboxRouter:
+
+| Attribute | Type | Description |
+|-----------|------|-------------|
+| `messageId` | string | Unique identifier |
+| `teamId` | string | Parent team |
+| `fromAgent` | string | Sender name (`lead` or teammate name) |
+| `toAgent` | string | Recipient name (`lead` or teammate name) |
+| `content` | string | Message content |
+| `timestamp` | datetime | When the message was sent |
+
+**Key behaviours:**
+- Team state (tasks, messages, teammate statuses) is checkpointed locally by the lead agent
+- On team completion, a `team_summary` artifact is uploaded to the Workspace Service capturing the final state
+- Teammates share the lead's LLM client and workspace — they do not create independent backend sessions
+- The lead agent is responsible for spawning, coordinating, and shutting down teammates
+
+**Owned by:** Local Agent Host (lead session manages the team lifecycle)
 
 ---
 
@@ -278,6 +339,17 @@ The `session_history` artifact makes this possible. The Local State Store is not
 | **General chat** | `general` | Auto-created fresh for each session | Single-use — not shared across general chat sessions | Uploaded to Workspace Service after each task |
 | **Web session** (Phase 3+) | `cloud` | Auto-created or resolved | TBD | Uploaded to Workspace Service after each task |
 
+### Session Roles (Agent Teams)
+
+When a Team is active, sessions within the team have distinct roles:
+
+| Role | Description |
+|------|-------------|
+| **`lead`** | The primary session that orchestrates teammates. Creates the Team, assigns tasks, routes messages, and manages the team lifecycle. Always a full session with its own policy bundle. |
+| **`teammate`** | A lightweight child session spawned by the lead. Shares the lead's LLM client and workspace. Executes work assigned via TeamTask items. Communicates with other agents via TeamMessage through the MailboxRouter. |
+
+A session without a team role is a normal standalone session — the default for all non-team scenarios.
+
 ---
 
 ## Service Ownership
@@ -300,6 +372,8 @@ The `session_history` artifact makes this possible. The Local State Store is not
 | LLM routing and guardrails | LLM Gateway (external — not implemented) |
 | Audit records | Audit Service |
 | Telemetry and traces | Telemetry Service |
+| Team lifecycle and coordination | Local Agent Host (lead session) |
+| `team_summary` artifact | Workspace Service |
 
 ---
 
@@ -312,3 +386,5 @@ The `session_history` artifact makes this possible. The Local State Store is not
 | Crash recovery vs Continue conversation | Crash recovery uses Local State Store checkpoint; continuation uses `session_history` from Workspace Service |
 | Local State Store vs Workspace Service | Local State Store = transient crash buffer; Workspace Service = canonical history and artifact store |
 | Task cancel vs Session end | Cancelling a task does not end the session; the user can start a new task immediately |
+| Task vs TeamTask | Task is a user-prompt-triggered agent work cycle within a session; TeamTask is a shared work item on the team's task list, assigned to and executed by a specific agent |
+| Lead session vs Teammate session | Lead is a full session that orchestrates the team; teammates are lightweight child sessions sharing the lead's LLM client and workspace |
