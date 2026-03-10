@@ -124,7 +124,7 @@ sequenceDiagram
 
 2. **Sandbox self-registration**: The container reads its own IP from the ECS task metadata endpoint (`$ECS_CONTAINER_METADATA_URI_V4`) and registers with the Session Service. This avoids the Session Service needing to poll ECS for task IPs.
 
-3. **Provisioning timeout**: If the sandbox does not register within 120 seconds of `RunTask`, the Session Service transitions the session to `SESSION_FAILED` with reason `sandbox_provision_timeout`. The idle check (Section 10.4) handles this cleanup.
+3. **Provisioning timeout**: If the sandbox does not register within 180 seconds (3 minutes) of `RunTask`, the Session Service transitions the session to `SESSION_FAILED` with reason `sandbox_provision_timeout`. The lifecycle check (Section 10.4) handles this cleanup.
 
 4. **RunTask failure**: If the ECS `RunTask` API call fails, the session is immediately transitioned to `SESSION_FAILED` with the ECS error. The browser sees this on the next poll.
 
@@ -535,6 +535,12 @@ New fields on the session DynamoDB record for web sessions:
 
 A periodic check terminates sandbox sessions that have been idle too long.
 
+**Idle definition:** A sandbox is idle when **both** conditions are true:
+1. No user activity for longer than the idle timeout (`now - lastActivityAt > idleTimeout`)
+2. No task is currently running (no task with `status = running` for this session)
+
+This prevents terminating a sandbox where the agent is actively working on a long-running task. A user can start a multi-hour task, close the browser, and the sandbox continues until the task completes. The idle timeout only kicks in after the task finishes and the user hasn't returned.
+
 **Multi-instance safety:** The Session Service runs multiple instances behind an ALB. All instances execute the idle check independently, so the termination flow must be safe under concurrent execution.
 
 **Phase 3a — Idempotent check in each instance:**
@@ -543,8 +549,9 @@ Each instance runs the idle check on a configurable interval (default: every 5 m
 
 1. Query sessions where `executionEnvironment = cloud_sandbox` and `status` is active
 2. For each session, check if `now - lastActivityAt > idleTimeout`
-3. Attempt a DynamoDB conditional update: `SET status = SANDBOX_TERMINATED WHERE status IN (SESSION_RUNNING, SESSION_PAUSED)`. Only one instance wins the condition check — others get `ConditionalCheckFailedException` and skip.
-4. The winning instance sends `shutdown` to the sandbox and calls ECS `StopTask` (which is itself idempotent)
+3. For candidates that exceed the idle timeout, query the `{env}-tasks` table (`sessionId-index`) to check for running tasks. If a task is running, skip — the sandbox is busy.
+4. Attempt a DynamoDB conditional update: `SET status = SANDBOX_TERMINATED WHERE status IN (SESSION_RUNNING, SESSION_PAUSED)`. Only one instance wins the condition check — others get `ConditionalCheckFailedException` and skip.
+5. The winning instance sends `shutdown` to the sandbox and calls ECS `StopTask` (which is itself idempotent)
 
 This is simple and correct. Multiple instances may scan the same sessions, but only one performs the termination. The overhead is acceptable at low-to-moderate scale.
 

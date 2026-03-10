@@ -215,17 +215,18 @@ Add background task for idle timeout enforcement and provisioning timeout cleanu
 
 1. Create `services/sandbox_lifecycle.py`:
    - `SandboxLifecycleManager` — started as a background task on app startup
-   - `check_idle_sessions()` — query active sandbox sessions, check `lastActivityAt` against timeout, terminate idle ones with conditional DynamoDB update
-   - `check_provisioning_timeouts()` — query `SANDBOX_PROVISIONING` sessions older than 120s, transition to `SESSION_FAILED`
+   - `check_idle_sessions()` — query active sandbox sessions, check `lastActivityAt` against timeout, verify no running tasks for that session (busy sandbox is never idle), terminate idle ones with conditional DynamoDB update
+   - `check_provisioning_timeouts()` — query `SANDBOX_PROVISIONING` sessions older than 180s (3 min), transition to `SESSION_FAILED`
    - Both use conditional updates for multi-instance safety
 2. Register lifecycle manager in FastAPI lifespan (start on startup, cancel on shutdown)
-3. Add config: `sandbox_idle_timeout_seconds` (default 1800), `sandbox_max_duration_seconds` (default 14400), `sandbox_provision_timeout_seconds` (default 120), `sandbox_lifecycle_check_interval_seconds` (default 300)
+3. Add config: `sandbox_idle_timeout_seconds` (default 1800), `sandbox_max_duration_seconds` (default 14400), `sandbox_provision_timeout_seconds` (default 180), `sandbox_lifecycle_check_interval_seconds` (default 300)
 4. Max duration enforcement: check `created_at + maxDuration < now` for active sandbox sessions
 
 ### Tests
 
-- Unit: Idle timeout detection (mock clock, mock repo)
-- Unit: Provisioning timeout detection
+- Unit: Idle timeout detection — session idle with no running task → terminated
+- Unit: Idle timeout skip — session idle but task still running → not terminated
+- Unit: Provisioning timeout detection (>180s → SESSION_FAILED)
 - Unit: Max duration enforcement
 - Unit: Conditional update conflict handling (simulated concurrent instance)
 - Unit: Lifecycle manager start/stop lifecycle
@@ -233,8 +234,9 @@ Add background task for idle timeout enforcement and provisioning timeout cleanu
 ### Definition of Done
 
 - `make check` passes
-- Idle sessions are terminated after configured timeout
-- Stuck provisioning sessions are cleaned up after 120s
+- Idle sessions (no running task + no user activity) are terminated after configured timeout
+- Sessions with active tasks are never terminated by idle check, even if user is away
+- Stuck provisioning sessions are cleaned up after 180s
 - Max duration sessions are terminated
 - Multiple lifecycle managers running concurrently don't cause errors (conditional updates)
 
