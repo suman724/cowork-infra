@@ -514,13 +514,29 @@ New fields on the session DynamoDB record for web sessions:
 
 ### 10.4 Idle Timeout Enforcement
 
-A background task in the Session Service checks for idle sandbox sessions:
+A periodic check terminates sandbox sessions that have been idle too long.
+
+**Multi-instance safety:** The Session Service runs multiple instances behind an ALB. All instances execute the idle check independently, so the termination flow must be safe under concurrent execution.
+
+**Phase 3a — Idempotent check in each instance:**
+
+Each instance runs the idle check on a configurable interval (default: every 5 minutes):
 
 1. Query sessions where `executionEnvironment = cloud_sandbox` and `status` is active
 2. For each session, check if `now - lastActivityAt > idleTimeout`
-3. If idle, send `shutdown` command to sandbox and stop the ECS task
+3. Attempt a DynamoDB conditional update: `SET status = SANDBOX_TERMINATED WHERE status IN (SESSION_RUNNING, SESSION_PAUSED)`. Only one instance wins the condition check — others get `ConditionalCheckFailedException` and skip.
+4. The winning instance sends `shutdown` to the sandbox and calls ECS `StopTask` (which is itself idempotent)
 
-This runs on a configurable interval (default: every 5 minutes).
+This is simple and correct. Multiple instances may scan the same sessions, but only one performs the termination. The overhead is acceptable at low-to-moderate scale.
+
+**Phase 3c — EventBridge scheduled rule:**
+
+At higher scale (hundreds of concurrent sandboxes), move the idle check out of the service entirely:
+
+- EventBridge rule on a 5-minute schedule triggers a Lambda function
+- Lambda queries for idle sessions and terminates them
+- Single execution per interval — no duplication, no conditional update needed
+- Session Service instances no longer run the background task
 
 ---
 
