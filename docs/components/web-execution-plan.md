@@ -14,6 +14,44 @@
 - **Step numbers = execution order**: Steps are numbered in the order they should be implemented.
 - **Wiring verification**: Every step must verify end-to-end wiring with adjacent components. After implementing, trace the data flow from caller to callee and back — check request/response types match, error codes are handled, timeouts are set, and no integration seams are left untested.
 - **Self-review before done**: Every step includes a mandatory self-review pass before marking complete. Review all changed files for: unhandled exceptions, missing error handling at boundaries, type mismatches between components, hardcoded values that should be configurable, missing structured logging, missing tests for error paths, and any deviation from existing patterns. Fix all issues found before proceeding.
+- **Logical bug review**: Every step must include a dedicated pass to check for logical bugs — race conditions, off-by-one errors, null/None dereferences, incorrect state transitions, missing edge cases, wrong comparison operators, inverted boolean logic, and incorrect error propagation. Fix all issues before marking complete.
+- **Local-first development**: Every infrastructure change (DynamoDB tables, GSIs, S3 buckets) must be reflected in `scripts/localstack-init.sh` so the full stack runs locally on a developer's MacBook via `docker-compose up`. Every step's Definition of Done includes verifying the feature works against LocalStack, not just in unit tests.
+- **Local run instructions**: Each repo must have a `make run` target and `.env.example` that allows running the service locally against LocalStack. Integration tests and manual testing should be possible without AWS credentials, using only `docker-compose up` + `make run` in each service.
+
+---
+
+## Local Development Setup
+
+All web execution features must be testable locally. The local stack runs on a MacBook with:
+
+```bash
+# 1. Start infrastructure (DynamoDB + S3 via LocalStack)
+cd /path/to/cowork
+docker-compose up -d
+
+# 2. Start backend services (each in a separate terminal)
+cd cowork-session-service && make run     # http://localhost:8001
+cd cowork-workspace-service && make run   # http://localhost:8002
+cd cowork-policy-service && make run      # http://localhost:8004
+
+# 3. Start agent runtime in HTTP/sandbox mode (simulates a sandbox container)
+cd cowork-agent-runtime && make run-sandbox   # http://localhost:8080
+# This starts with --transport http and reads SESSION_ID from env
+# For local dev, it skips ECS metadata lookup and uses localhost for registration
+
+# 4. Start web app
+cd cowork-web-app && make dev             # http://localhost:5173
+```
+
+**Key env vars for local development:**
+- `AWS_ENDPOINT_URL=http://localhost:4566` — all services use LocalStack
+- `ENVIRONMENT=dev` — table/bucket names prefixed with `dev-`
+- `SESSION_SERVICE_URL=http://localhost:8001` — agent runtime → session service
+- `WORKSPACE_SERVICE_URL=http://localhost:8002` — agent runtime → workspace service
+- `SANDBOX_LOCAL_MODE=true` — skips ECS metadata lookup, uses localhost for self-registration
+- `SANDBOX_ENDPOINT=http://localhost:8080` — session service proxy target (local override, skips DynamoDB lookup)
+
+**docker-compose.yml** already provides LocalStack with DynamoDB + S3. The `scripts/localstack-init.sh` script creates all tables and buckets on startup. When new tables, GSIs, or buckets are added in any step, `localstack-init.sh` must be updated in the same step.
 
 ---
 
@@ -49,6 +87,7 @@ Add schemas and SDK helpers for web execution. This unblocks all other repos.
 - All downstream repos can import the new types
 - **Wiring check**: Import new types in session-service, workspace-service, agent-runtime — verify they compile/typecheck with no errors
 - **Self-review**: Review all schemas for field name consistency (camelCase in JSON, snake_case in Python), verify enum values match design doc, check codegen output for correctness
+- **Logical bug review**: Verify enum values are exhaustive (no missing states), verify optional vs required fields are correct (e.g. `sandboxEndpoint` must be optional — only present after registration), verify schema defaults don't conflict with domain logic
 
 ---
 
@@ -91,6 +130,8 @@ Extract a `Transport` protocol from the existing `StdioTransport`, then implemen
 - File upload to `/upload` and download from `/files/{path}` work with a local workspace directory
 - **Wiring check**: Verify `MethodDispatcher` receives identical request/response types from both transports. Verify `EventEmitter` → event buffer → SSE stream chain delivers events without data loss. Verify JSON-RPC error codes propagate correctly through HttpTransport
 - **Self-review**: Review all changed files for unhandled exceptions (especially in SSE streaming and file upload), missing timeouts, missing structured logging on error paths, and ensure Transport protocol is satisfied by both implementations
+- **Logical bug review**: Verify event buffer doesn't lose events under high throughput (ring buffer overwrite vs backpressure). Verify SSE `since` parameter handles edge cases: `since=0` (replay all), `since` greater than max ID (return empty), `since` for an ID that was evicted from buffer (return error, not silent data loss). Verify concurrent SSE clients each get their own stream and don't interfere. Verify file upload path traversal prevention (resolve path, verify within workspace root)
+- **Local run**: `make run-sandbox` starts agent-runtime in HTTP mode on `localhost:8080`. Verify `/health`, `/rpc`, `/events`, `/upload`, `/files` all work locally
 
 ---
 
@@ -127,6 +168,8 @@ Add the `/sessions/{sessionId}/register` endpoint and the new session status sta
 - Desktop session creation is not affected (existing tests pass unchanged)
 - **Wiring check**: Verify registration request/response types match what agent-runtime will send (from Step 2's HttpTransport). Verify new session fields are persisted and queryable. Verify state machine transitions are consistent — no orphaned states
 - **Self-review**: Review all changed files for missing validation (e.g. malformed taskArn), missing error handling on DynamoDB conditional updates, ensure new fields have proper defaults for desktop sessions (null/None, not breaking)
+- **Logical bug review**: Verify state machine has no impossible transitions (e.g. can't go from `SANDBOX_TERMINATED` back to `SANDBOX_READY`). Verify `expected_task_arn` comparison is exact string match (not prefix/contains). Verify registration is idempotent — calling register twice with same data doesn't fail. Verify conditional update expression handles `ConditionalCheckFailedException` gracefully (race between registration and timeout)
+- **Local run**: Run session-service locally with `make run`, test registration endpoint via `curl` against LocalStack DynamoDB. Verify new fields are persisted and queryable
 
 ---
 
@@ -148,6 +191,7 @@ Implement `cloud` workspace scope — S3-backed workspace that sandboxes sync fi
    - `DELETE /workspaces/{id}/files/{path}` — delete file from S3
 3. Add `s3_workspace_prefix` field to `WorkspaceDomain`
 4. Workspace deletion (`DELETE /workspaces/{id}`) already cascades artifacts; extend to also delete workspace files under the prefix
+5. **No localstack-init.sh changes needed** — existing `dev-workspaces` table and `dev-workspace-artifacts` S3 bucket already support this. The new `s3_workspace_prefix` field is just a new attribute on existing workspace records, and workspace files use the same S3 bucket under a different key prefix
 
 ### Tests
 
@@ -163,6 +207,8 @@ Implement `cloud` workspace scope — S3-backed workspace that sandboxes sync fi
 - `local` and `general` workspace behavior unchanged
 - **Wiring check**: Verify file upload/download API matches what session-service proxy (Step 6) and agent-runtime workspace sync (Step 7) will call. Verify S3 key prefixes are consistent with artifact storage keys. Verify workspace creation response includes `s3_workspace_prefix`
 - **Self-review**: Review for missing S3 error handling (ClientError → service exceptions), missing size limits on file uploads, missing cleanup on partial failures, ensure delete cascades cover both artifacts and workspace files
+- **Logical bug review**: Verify file path sanitization prevents directory traversal (e.g. `../../etc/passwd` must be rejected). Verify file listing pagination handles empty directories. Verify workspace deletion with thousands of files uses batch delete (not one-by-one). Verify `cloud` workspace creation returns `s3_workspace_prefix` in response (not just stored internally). Verify file upload content-type is preserved in S3 metadata
+- **Local run**: Run workspace-service locally with `make run` against LocalStack. Upload files via `curl`, verify they appear in LocalStack S3 (`awslocal s3 ls s3://dev-workspace-artifacts/{workspaceId}/workspace-files/`)
 
 ---
 
@@ -201,6 +247,8 @@ Add ECS client to launch Fargate tasks when creating `cloud_sandbox` sessions.
 - Concurrent session limit rejects excess sessions with 409
 - **Wiring check**: Verify ECS RunTask overrides (env vars, security groups) match what agent-runtime expects in sandbox startup (Step 7). Verify `expected_task_arn` stored on session matches what container will read from ECS metadata. Verify error responses use platform contract types from Step 1
 - **Self-review**: Review for missing error handling on ECS API calls (ClientError subtypes), ensure session status rollback on RunTask failure is atomic, verify concurrent limit query uses correct GSI and status filters, check for race conditions between session creation and limit check
+- **Logical bug review**: Verify concurrent session limit count query filters by correct statuses (`SANDBOX_PROVISIONING` + `SANDBOX_READY` + running sessions, not terminated). Verify RunTask failure doesn't leave session in `SANDBOX_PROVISIONING` forever (must transition to `SESSION_FAILED`). Verify `expected_task_arn` is stored BEFORE RunTask returns (not after — race with fast-starting container). Verify ECS client handles throttling (too many RunTask calls)
+- **Local run**: For local dev, ECS calls are mocked — `SANDBOX_LOCAL_MODE=true` skips RunTask and returns a fake task ARN. Session creation still writes to DynamoDB. Test the full session creation flow against LocalStack, verify session record has correct status and fields
 
 ---
 
@@ -249,6 +297,8 @@ Add proxy endpoints that forward browser requests to the sandbox container.
 - Activity tracking updates DynamoDB at most once per 60s per session
 - **Wiring check**: Verify proxy forwards all headers correctly (Last-Event-ID, Content-Type, Authorization). Verify SSE proxy streams events byte-for-byte without corruption. Verify error responses from sandbox are translated to proxy error responses matching platform contract types. Test with real HttpTransport from Step 2 running in a subprocess
 - **Self-review**: Review for connection leak risks (SSE proxy must close upstream on client disconnect), missing timeouts on proxy connections, missing structured logging for proxy errors, ensure cache invalidation on session status changes, verify 403/404/409/503 error paths all return structured responses
+- **Logical bug review**: Verify SSE proxy doesn't buffer entire response before forwarding (must stream chunk-by-chunk). Verify `lastActivityAt` batching timer resets correctly (not using wall clock that drifts). Verify cache TTL is per-session (not global — stale entry for session A shouldn't affect session B). Verify proxy doesn't forward internal sandbox errors (500s from sandbox should be wrapped in proxy error response, not passed through raw). Verify endpoint cache is invalidated when session status changes to terminated (don't proxy to dead sandbox)
+- **Local run**: Run session-service with `SANDBOX_ENDPOINT=http://localhost:8080` to bypass DynamoDB sandbox endpoint lookup. Run agent-runtime in HTTP mode on port 8080. Test full proxy flow: `curl http://localhost:8001/sessions/{id}/rpc` → verify it reaches agent-runtime. Test SSE: `curl http://localhost:8001/sessions/{id}/events` → verify events stream through
 
 ---
 
@@ -293,6 +343,8 @@ Wire the sandbox startup flow: read session ID from env, self-register with Sess
 - Stdio mode is completely unaffected
 - **Wiring check**: Verify registration request matches Step 3's endpoint contract exactly (field names, types, auth). Verify workspace sync calls match Step 4's file upload/download API. Verify session token from registration response is used for all subsequent backend calls. Test full startup → register → serve → shutdown sequence against a real Session Service instance
 - **Self-review**: Review for missing error handling on registration failure (retry? fail fast?), missing cleanup if workspace sync fails on startup, ensure SIGTERM handler doesn't race with in-flight requests, verify ECS metadata endpoint parsing handles all edge cases
+- **Logical bug review**: Verify workspace sync downloads files BEFORE marking sandbox as ready (don't serve requests with empty workspace). Verify SIGTERM handler waits for workspace sync to complete before exiting (data loss risk). Verify registration retry has a max attempt limit (don't retry forever if session-service is down). Verify `SANDBOX_LOCAL_MODE` code path is tested — local mode must skip ECS metadata but still register with session-service. Verify file sync handles empty workspace (no files to sync — should not error)
+- **Local run**: Add `make run-sandbox` target to agent-runtime Makefile: `SANDBOX_LOCAL_MODE=true SESSION_ID=test-session-123 SESSION_SERVICE_URL=http://localhost:8001 WORKSPACE_SERVICE_URL=http://localhost:8002 python -m agent_host.main --transport http`. Verify: starts up, registers with local session-service, serves `/health`, accepts JSON-RPC on `/rpc`, streams events on `/events`
 
 ---
 
@@ -332,6 +384,8 @@ Add background task for idle timeout enforcement and provisioning timeout cleanu
 - Multiple lifecycle managers running concurrently don't cause errors (conditional updates)
 - **Wiring check**: Verify lifecycle manager queries use correct GSI and status filters matching Step 3's session model. Verify terminate flow calls sandbox shutdown endpoint (matching Step 7's HttpTransport) before calling ECS StopTask (matching Step 5's ECS client). Verify task status check queries the tasks table with correct index from session-service
 - **Self-review**: Review for missing error handling when sandbox is unreachable during shutdown (best-effort, don't block), ensure lifecycle manager doesn't crash on individual session failures (catch per-session, continue loop), verify conditional update expressions are correct, check that background task shuts down cleanly on app exit
+- **Logical bug review**: Verify idle check compares `lastActivityAt` using UTC consistently (not mixing local time). Verify provisioning timeout uses `createdAt` of the session, not `lastActivityAt` (which may not be set yet). Verify max duration check uses session `createdAt`, not task `createdAt`. Verify the "running task" check queries the tasks table with status filter (only `running` tasks count, not `completed` or `failed`). Verify conditional update prevents double-termination (two lifecycle checks running concurrently on different instances)
+- **Local run**: Run session-service locally, create a sandbox session (with `SANDBOX_LOCAL_MODE=true`), wait for idle timeout (set to 30s for testing via env var). Verify session transitions to `SANDBOX_TERMINATED`. Verify lifecycle manager logs appear in structured format
 
 ---
 
@@ -368,6 +422,8 @@ Verify the full sandbox lifecycle works across services.
 - Idle timeout and provisioning timeout tested
 - **Wiring check**: This step IS the wiring check — verify every integration seam from Steps 1–8 works together. Document any mismatches found and fix them in the originating step before proceeding
 - **Self-review**: Review test coverage for all error paths (sandbox crash mid-task, network timeout during proxy, workspace sync failure). Ensure test script has clear error reporting so failures are easy to diagnose
+- **Logical bug review**: Verify test assertions check for correct status transitions (not just final state). Verify SSE reconnect test actually disconnects mid-stream (not just opens a new connection). Verify file upload test checks content integrity (not just 200 status). Verify idle timeout test doesn't race with the lifecycle check interval (use short interval for tests)
+- **Local run**: Create `scripts/test-web-sandbox.py` (similar to existing `test-chat.py`). Must run entirely locally: `docker-compose up -d && make run` (all services) + script. The script runs the full lifecycle: create session → register sandbox → proxy RPC → stream SSE → upload file → idle timeout. Add a `make test-sandbox` target to agent-runtime Makefile that runs this script
 
 ---
 
@@ -414,6 +470,8 @@ Set up the repo and build the core web UI.
 - Reconnect after page refresh shows full history
 - **Wiring check**: Verify SSE event types match what HttpTransport emits (Step 2). Verify JSON-RPC method names and params match agent-runtime handlers. Verify API client URLs and request/response shapes match session-service proxy endpoints (Step 6). Verify auth header format matches session-service expectations
 - **Self-review**: Review for missing error states in UI (sandbox provisioning failure, proxy 503, SSE disconnect without reconnect), ensure all API errors are shown to user with actionable messages, check for memory leaks in SSE client (event listener cleanup), verify Zustand stores handle all state transitions correctly
+- **Logical bug review**: Verify SSE client doesn't accumulate event listeners on reconnect (must remove old listener before adding new). Verify provisioning poll stops when component unmounts (memory leak / state update on unmounted component). Verify conversation store handles out-of-order events (SSE replay may deliver events the store already has). Verify session list doesn't show terminated sessions as active after page refresh. Verify file upload progress tracking handles network errors (don't show stuck progress bar)
+- **Local run**: `make dev` starts Vite dev server on `localhost:5173`. Configure `.env.development` with `VITE_SESSION_SERVICE_URL=http://localhost:8001`. Full local flow: create session in web UI → see provisioning → conversation loads → send task → see streaming response. Add instructions to `cowork-web-app/README.md` for local development setup
 
 ---
 
@@ -452,6 +510,8 @@ Add Terraform modules for sandbox ECS resources.
 - Sandbox task role has scoped S3 and CloudWatch access
 - **Wiring check**: Verify ECS task definition env vars match what agent-runtime expects (Step 7). Verify security group rules match proxy flow (Session Service → sandbox on port 8080). Verify IAM policies scope to correct S3 bucket and DynamoDB tables. Verify log group name matches what agent-runtime's structlog writes to
 - **Self-review**: Review for overly permissive IAM policies, missing tags on resources, hardcoded values that should be variables, ensure all resources are prefixed with `cowork-{env}-`
+- **Logical bug review**: Verify security group rules are not overly permissive (sandbox ingress only from Session Service SG, not 0.0.0.0/0). Verify S3 bucket policy scopes sandbox task role to `{workspaceId}/*` prefix (not entire bucket). Verify log group retention is set (not infinite). Verify ECS task definition CPU/memory values are valid Fargate combinations. Verify IAM execution role has ECR pull permissions for the correct registry
+- **No localstack-init.sh changes needed** — Terraform resources are for AWS environments. Local development uses the existing LocalStack setup
 
 ---
 
@@ -488,6 +548,8 @@ Add Dockerfile for agent-runtime and CI pipeline for sandbox builds.
 - CI builds and pushes image to ECR
 - **Wiring check**: Verify Dockerfile installs all dependencies needed for HTTP mode (uvicorn, fastapi). Verify entrypoint and health check match ECS task definition from Step 11. Verify container can reach Session Service URL for registration (network connectivity). Run the E2E test from Step 9 against the Docker container instead of a local process
 - **Self-review**: Review Dockerfile for unnecessary layers, missing non-root user, missing health check interval, ensure .dockerignore excludes tests/docs/dev files, verify CI pipeline triggers on correct branches
+- **Logical bug review**: Verify Dockerfile doesn't copy `.env` or secrets into the image. Verify health check endpoint matches the one HttpTransport exposes (`/health`, not `/healthz`). Verify entrypoint uses exec form (not shell form — PID 1 issue for SIGTERM handling). Verify non-root user has write access to `/workspace` directory inside container
+- **Local run**: `make docker-build && docker run -p 8080:8080 -e SANDBOX_LOCAL_MODE=true -e SESSION_ID=test -e SESSION_SERVICE_URL=http://host.docker.internal:8001 cowork-sandbox:latest` — verify container starts, `/health` returns 200, `/rpc` accepts JSON-RPC. Add this to agent-runtime README
 
 ---
 
@@ -510,7 +572,7 @@ Pre-provision idle sandbox containers so sessions start in <3s instead of 15–4
    - `acquire_container() → (task_arn, sandbox_endpoint)` — claim an idle container from the pool, assign it to a session
    - `replenish()` — if pool size < target, launch new ECS tasks (pre-registered as `POOL_IDLE`)
    - `drain_excess()` — if pool size > target, stop excess idle containers
-2. New DynamoDB table `{env}-warm-pool` or reuse sessions table with a `POOL_IDLE` status:
+2. New DynamoDB table `{env}-warm-pool` (update `scripts/localstack-init.sh` to create this table):
    - Track idle containers: `taskArn`, `sandboxEndpoint`, `createdAt`, `status` (POOL_IDLE, POOL_CLAIMED)
    - Conditional update on claim to prevent double-assignment
 3. Update `POST /sessions` for `cloud_sandbox`:
@@ -537,6 +599,8 @@ Pre-provision idle sandbox containers so sessions start in <3s instead of 15–4
 - Pool size is configurable per environment
 - **Wiring check**: Verify warm container assignment RPC matches HttpTransport's endpoint. Verify session creation flow still works end-to-end (both warm hit and cold miss paths). Verify pool containers use same task definition and security groups as cold-start containers from Step 5
 - **Self-review**: Review for race conditions in concurrent acquire (conditional update correctness), ensure pool replenishment doesn't exceed max, verify cleanup of stale pool entries (container crashed before claim)
+- **Logical bug review**: Verify conditional update on `POOL_IDLE → POOL_CLAIMED` transition uses correct condition expression (status must equal `POOL_IDLE`, not just exist). Verify pool replenishment doesn't launch tasks when pool is at max (check count before launching). Verify stale detection uses `createdAt` not `lastActivityAt` (pool containers have no user activity). Verify pool drain stops the right containers (LIFO — drain newest first to keep warmed containers)
+- **Local run**: Update `scripts/localstack-init.sh` with `dev-warm-pool` DynamoDB table creation. Test warm pool flow locally with `SANDBOX_LOCAL_MODE=true` — pool "containers" are just DynamoDB entries. Verify acquire/release/replenish operations against LocalStack
 
 ---
 
@@ -576,6 +640,8 @@ Gracefully handle sandbox shutdown while SSE connections and in-flight requests 
 - In-flight requests complete before container stops
 - **Wiring check**: Verify shutdown SSE event type is handled by web app. Verify proxy correctly distinguishes 503-from-shutdown vs 503-from-transient-error. Verify workspace sync completes before container exits. Test with real proxy and real web app connected
 - **Self-review**: Review for edge cases (shutdown during file upload, shutdown during LLM streaming), ensure no goroutine/task leaks on shutdown, verify grace period is configurable
+- **Logical bug review**: Verify drain sequence order is correct: stop accepting → flush in-flight → send shutdown event → close connections (not close connections → then try to send event). Verify 503 from sandbox during shutdown includes a distinguishable error code (not generic 503). Verify web app doesn't try to auto-reconnect SSE after receiving `sandbox_shutting_down` event (infinite reconnect loop). Verify workspace sync on shutdown doesn't race with final artifact upload
+- **Local run**: Start agent-runtime in HTTP mode, connect SSE client, send SIGTERM — verify shutdown event arrives before connection closes. Verify in-flight `/rpc` request completes before shutdown
 
 ---
 
@@ -616,6 +682,8 @@ Allow users to resume work from a terminated sandbox by restoring the workspace 
 - Snapshot cleanup (auto-delete after 30 days)
 - **Wiring check**: Verify snapshot S3 keys don't collide with workspace file keys or artifact keys. Verify restore creates workspace sync that matches Step 7's startup flow. Verify web app's resume flow correctly polls for new session provisioning. Verify conversation history loads from Workspace Service API matching Step 4's endpoints
 - **Self-review**: Review for missing error handling on large workspace snapshots (timeout, partial copy), ensure snapshot cleanup doesn't delete active snapshots, verify restore works when original workspace has been deleted
+- **Logical bug review**: Verify snapshot S3 copy handles large files (multipart copy for >5GB). Verify snapshot listing is sorted by creation time (newest first). Verify restore creates a new session linked to same workspace (not a new workspace). Verify conversation history is fetched from workspace-service using the OLD session ID (not new one). Verify snapshot auto-delete TTL doesn't delete snapshots for active sessions
+- **Local run**: Test snapshot/restore flow against LocalStack: create workspace → upload files → create snapshot → list snapshots → restore → verify files present in new workspace. All via `curl` against local services
 
 ---
 
@@ -670,6 +738,8 @@ Replace simple auth with OIDC for production multi-tenant use.
 - Simple auth still works as fallback (configurable, for dev environments)
 - **Wiring check**: Verify JWT claims extraction produces correct `userId`/`tenantId` that match session-service's existing field names. Verify proxy endpoints enforce ownership using JWT-derived userId. Verify web app attaches token to SSE connections (EventSource doesn't support headers — verify workaround via query param or cookie). Verify sandbox registration endpoint is excluded from OIDC validation (internal-only)
 - **Self-review**: Review for missing token refresh edge cases (refresh fails during active session), ensure JWKS cache invalidation works when keys rotate, verify no sensitive data in JWT is logged, check that 401 responses don't leak internal details
+- **Logical bug review**: Verify JWT validation checks `exp` claim BEFORE signature verification (fail fast on expired tokens). Verify JWKS cache doesn't serve stale keys indefinitely (TTL must be enforced). Verify `userId`/`tenantId` extraction handles missing claims gracefully (reject, don't default to empty string). Verify OIDC middleware doesn't apply to health/ready endpoints. Verify SSE connection token validation happens at connection time (not per-event)
+- **Local run**: For local dev, OIDC is disabled by default (`AUTH_MODE=none`). Add `AUTH_MODE=simple` for API key auth (existing), `AUTH_MODE=oidc` for production OIDC. Document in `.env.example` and README
 
 ---
 
@@ -704,6 +774,8 @@ Move idle timeout and provisioning timeout checks from in-process background tas
 - CloudWatch metrics on Lambda invocations and errors
 - **Wiring check**: Verify Lambda uses same DynamoDB table names, GSIs, and conditional update expressions as Step 8's in-process lifecycle manager. Verify Lambda calls same ECS StopTask API as Step 5's sandbox service. Verify feature flag correctly switches between Lambda and in-process mode without gaps in coverage
 - **Self-review**: Review for Lambda timeout configuration (must be long enough to process all idle sessions), ensure Lambda has correct IAM permissions for DynamoDB + ECS, verify error handling doesn't cause Lambda to retry on partial failures (use dead letter queue)
+- **Logical bug review**: Verify Lambda processes all sessions in a single invocation (paginate DynamoDB scan, don't stop at first page). Verify Lambda doesn't terminate sessions that were just created (race between creation and lifecycle check — check `createdAt` grace period). Verify feature flag transition doesn't create a gap (both Lambda and in-process running for a brief overlap is better than neither running)
+- **Local run**: Lambda logic is extracted to a shared module — test it locally as a regular Python function against LocalStack DynamoDB. No actual Lambda invocation needed for local testing
 
 ---
 
@@ -742,6 +814,8 @@ Scale warm pool size based on usage patterns instead of fixed target.
 - CloudWatch dashboard shows pool metrics
 - **Wiring check**: Verify custom metrics published by session-service match CloudWatch alarm metric names exactly. Verify scaling actions call the same WarmPoolManager API from Step 13. Verify schedule-based scaling doesn't conflict with metrics-based scaling (priority rules)
 - **Self-review**: Review for missing bounds checks (pool size never goes negative, never exceeds max), ensure scaling decisions are logged for debugging, verify dashboard queries match published metric dimensions
+- **Logical bug review**: Verify scaling down doesn't drain containers that are in the process of being claimed (race condition). Verify hit rate calculation handles zero-request periods correctly (0/0 is not 0% — it's no data, don't scale down). Verify time-based schedule uses the correct timezone. Verify min pool size of 0 actually stops all containers (not leaves 1 running)
+- **Local run**: Scaling logic is testable locally — mock CloudWatch metrics, verify scaling decisions. No actual CloudWatch or EventBridge needed for local testing
 
 ---
 
@@ -782,6 +856,8 @@ Improve the file browser from basic list to a full workspace explorer.
 - Modified files are visually indicated
 - **Wiring check**: Verify file list API response structure matches tree view component's expected format. Verify inline editor save calls the correct sandbox file write endpoint. Verify file change indicators correctly parse `file_diff` artifact data from workspace-service
 - **Self-review**: Review for missing loading/error states in all file operations, ensure large file handling (don't load 10MB file into Monaco), verify drag-and-drop respects upload size limits from policy
+- **Logical bug review**: Verify tree view handles symlinks and circular references (if present in workspace). Verify inline editor doesn't lose unsaved changes on SSE event (agent modifies same file). Verify multi-file download zip generation handles special characters in filenames. Verify file change indicators correctly match artifact `file_diff` paths to tree view paths (relative vs absolute)
+- **Local run**: `make dev` with all backend services running locally. Upload files, browse tree, edit inline, download — all against LocalStack
 
 ---
 
@@ -819,6 +895,8 @@ Scan uploaded files for malware before they enter the sandbox workspace.
 - Scan infrastructure deployed via Terraform
 - **Wiring check**: Verify S3 event notification triggers on correct prefix (`workspace-files/`). Verify Lambda scan result tags are read by workspace-service before serving files. Verify scan status polling endpoint is called by web app upload flow. Verify infected file deletion uses same S3 client patterns as workspace-service
 - **Self-review**: Review for missing edge cases (scan timeout, Lambda cold start delay, file uploaded faster than scan completes), ensure scan doesn't block small file uploads excessively, verify Lambda has access to latest ClamAV definitions
+- **Logical bug review**: Verify scan status check doesn't have TOCTOU race (file tagged clean, then replaced before sandbox reads it). Verify `202 Accepted` polling endpoint returns final status (not stuck in `pending` forever — add scan timeout). Verify infected file is deleted from S3 (not just tagged — sandbox must not be able to read it). Verify scan applies to all upload paths (direct workspace upload, workspace sync from agent)
+- **Local run**: For local dev, virus scanning is disabled by default (`VIRUS_SCAN_ENABLED=false`). When enabled locally, use ClamAV Docker container instead of Lambda. Document in README
 
 ---
 
@@ -865,6 +943,8 @@ Support GPU instances for ML workloads (model training, data processing).
 - Cost tracking per resource profile
 - **Wiring check**: Verify GPU task definition is selected based on `resourceProfile` in session creation request. Verify GPU capacity provider has instances available. Verify policy bundle includes `Compute.GPU` capability for GPU sessions. Verify concurrent limit check distinguishes standard vs GPU sessions
 - **Self-review**: Review for missing fallback when GPU instances are unavailable (queue? reject?), ensure GPU container image includes CUDA drivers, verify cost tracking metrics are published correctly
+- **Logical bug review**: Verify `resourceProfile` is validated against allowed values (not arbitrary string). Verify GPU concurrent limit check is separate from standard limit (user can have 3 standard + 1 GPU, not 3 total). Verify GPU task definition uses correct capacity provider (not default Fargate — needs GPU instances). Verify session response includes `resourceProfile` so web app can show GPU indicator
+- **Local run**: GPU is not available locally. For local dev, `resourceProfile=gpu` creates a standard session with a flag — test the selection logic, not the GPU hardware. Document in README
 
 ---
 
@@ -907,6 +987,8 @@ Allow multiple sessions to share a workspace — enabling iterative work across 
 - Workspace access control enforced
 - **Wiring check**: Verify workspace access control is checked on session creation (session-service), file operations (workspace-service), and proxy requests (session-service). Verify workspace sync in agent-runtime handles concurrent writes from other sessions. Verify web app workspace view correctly fetches sessions from session-service and files from workspace-service
 - **Self-review**: Review for missing edge cases (session reads file while another session is writing), ensure advisory locks have TTL to prevent deadlocks, verify access control can't be bypassed via direct workspace-service calls, check that conflict resolution UI handles all conflict types
+- **Logical bug review**: Verify workspace access control is checked on every file operation (not just workspace creation). Verify advisory lock TTL is shorter than session idle timeout (lock shouldn't outlive session). Verify conflict detection compares S3 ETag (not timestamp — clock skew). Verify workspace deletion is blocked when active sessions exist (don't delete workspace under a running session). Verify shared workspace file sync handles concurrent modifications (last-write-wins must be consistent, not data-corrupting)
+- **Local run**: Test shared workspace flow locally with two agent-runtime instances on different ports, both pointing at same workspace. Upload file from one, verify visible from other. Document multi-instance local testing in README
 
 ---
 
