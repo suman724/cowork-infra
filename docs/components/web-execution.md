@@ -124,7 +124,11 @@ sequenceDiagram
 
 2. **Sandbox self-registration**: The container reads its own IP from the ECS task metadata endpoint (`$ECS_CONTAINER_METADATA_URI_V4`) and registers with the Session Service. This avoids the Session Service needing to poll ECS for task IPs.
 
-3. **Warm pool (Phase 2 optimization)**: Pre-provisioned idle containers that can be assigned to sessions instantly. Reduces provisioning time from 15–45s to <3s. Not required for initial launch.
+3. **Provisioning timeout**: If the sandbox does not register within 120 seconds of `RunTask`, the Session Service transitions the session to `SESSION_FAILED` with reason `sandbox_provision_timeout`. The idle check (Section 10.4) handles this cleanup.
+
+4. **RunTask failure**: If the ECS `RunTask` API call fails, the session is immediately transitioned to `SESSION_FAILED` with the ECS error. The browser sees this on the next poll.
+
+5. **Warm pool (Phase 3b optimization)**: Pre-provisioned idle containers that can be assigned to sessions instantly. Reduces provisioning time from 15–45s to <3s. Not required for initial launch.
 
 ### 3.2 Session Status Extensions
 
@@ -197,6 +201,17 @@ class HttpTransport:
     """
 ```
 
+Both transports implement a shared `Transport` protocol:
+
+```python
+# agent_host/server/transport.py
+
+class Transport(Protocol):
+    async def start(self) -> None: ...
+    async def send_event(self, event: SessionEvent) -> None: ...
+    async def shutdown(self) -> None: ...
+```
+
 The `MethodDispatcher` is shared between both transports — the same handlers process `start_task`, `approve`, `cancel_task`, `shutdown`, etc. The only difference is how messages are framed and delivered.
 
 **Event streaming:** The `EventEmitter` already produces `SessionEvent` objects. `HttpTransport` subscribes to the emitter and pushes events as SSE:
@@ -225,11 +240,14 @@ Browser → GET  /sessions/{sessionId}/events   → Session Service → GET  htt
 Browser → POST /sessions/{sessionId}/upload   → Session Service → multipart forward to sandbox
 ```
 
-**Proxy implementation:** The Session Service maintains an in-memory map of `sessionId → sandboxEndpoint`. On proxy requests, it:
-1. Looks up the sandbox endpoint for the session
-2. Validates the session is in a running state
-3. Forwards the request (streaming for SSE, buffered for RPC/upload)
-4. Returns the sandbox response to the browser
+**Proxy implementation:** The Session Service resolves `sandboxEndpoint` from the DynamoDB session record (not in-memory — Session Service runs multiple instances behind ALB, so any instance may handle any request). A short TTL cache (e.g. 30s) avoids repeated DynamoDB reads for the same session. On proxy requests, it:
+1. Looks up the sandbox endpoint from the session record (cached)
+2. Validates the session is in an active state and the caller owns the session
+3. Updates `lastActivityAt` on the session record (batched, not per-request — see Section 10.5)
+4. Forwards the request (streaming for SSE, buffered for RPC/upload)
+5. Returns the sandbox response to the browser
+
+**SSE proxy:** SSE is a long-lived connection. The proxy uses `httpx.AsyncClient.stream()` with `StreamingResponse` to pipe chunks from the sandbox to the browser. Connection drops on either side are detected and cleaned up. Proxy timeout is set to match `maxSessionDuration` (default 4h).
 
 If the sandbox is unreachable (container crashed, network issue), the proxy returns a `503 Service Unavailable` with a structured error indicating the sandbox state.
 
@@ -488,9 +506,10 @@ Called by the sandbox container during startup:
 
 **Behavior:**
 1. Validate the session exists and is in `SANDBOX_PROVISIONING` state
-2. Store `sandboxEndpoint` and `taskArn` on the session record
-3. Update session status to `SANDBOX_READY`
-4. Return a session-scoped auth token for the sandbox to use with backend services
+2. Validate the `taskArn` matches the ARN stored at `RunTask` time (prevents sandbox impersonation)
+3. Store `sandboxEndpoint` on the session record
+4. Update session status to `SANDBOX_READY`
+5. Return a session-scoped auth token for the sandbox to use with backend services
 
 **Response:**
 ```json
@@ -538,6 +557,18 @@ At higher scale (hundreds of concurrent sandboxes), move the idle check out of t
 - Single execution per interval — no duplication, no conditional update needed
 - Session Service instances no longer run the background task
 
+### 10.5 Activity Tracking
+
+`lastActivityAt` is updated on user-initiated actions only (not on SSE keepalives or health checks):
+- `POST /sessions/{sessionId}/rpc` — any JSON-RPC command
+- `POST /sessions/{sessionId}/upload` — file uploads
+
+To avoid a DynamoDB write on every request, updates are batched: the proxy caches the last update time per session and only writes if >60 seconds have elapsed since the last write. This is safe because idle timeout granularity is 30 minutes — a 60-second batching window is negligible.
+
+### 10.6 Concurrent Session Limit
+
+At session creation time (`POST /sessions` with `executionEnvironment: cloud_sandbox`), the Session Service queries the `tenantId-userId-index` GSI to count active sandbox sessions for the user (status in `SANDBOX_PROVISIONING`, `SANDBOX_READY`, `SESSION_RUNNING`, `SESSION_PAUSED`). If the count exceeds the limit (default: 3), the request is rejected with `409 Conflict` and a structured error.
+
 ---
 
 ## 11. cowork-web-app
@@ -580,6 +611,8 @@ eventSource.addEventListener("task_completed", (e) => { /* update status */ });
 ```
 
 On disconnect, the client automatically reconnects with `Last-Event-ID` to resume from where it left off.
+
+**Event IDs:** The sandbox assigns a monotonically increasing integer ID to each SSE event (starting at 1). The `HttpTransport` includes this as the SSE `id:` field. On reconnect, the browser sends `Last-Event-ID` and the sandbox replays all events after that ID from its in-memory buffer.
 
 ### 11.4 Command Submission
 
