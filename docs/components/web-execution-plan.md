@@ -461,30 +461,464 @@ Add Dockerfile for agent-runtime and CI pipeline for sandbox builds.
 
 ---
 
-## Dependency Graph
+---
+
+# Phase 3b — Optimization
+
+Prerequisite: Phase 3a complete and deployed.
+
+---
+
+## Step 13 — Warm Pool (session-service, infra)
+
+**Repos:** `cowork-session-service`, `cowork-infra`
+
+Pre-provision idle sandbox containers so sessions start in <3s instead of 15–45s.
+
+### Work
+
+1. Create `services/warm_pool.py` in session-service:
+   - `WarmPoolManager` — background task that maintains a target number of idle containers
+   - `acquire_container() → (task_arn, sandbox_endpoint)` — claim an idle container from the pool, assign it to a session
+   - `replenish()` — if pool size < target, launch new ECS tasks (pre-registered as `POOL_IDLE`)
+   - `drain_excess()` — if pool size > target, stop excess idle containers
+2. New DynamoDB table `{env}-warm-pool` or reuse sessions table with a `POOL_IDLE` status:
+   - Track idle containers: `taskArn`, `sandboxEndpoint`, `createdAt`, `status` (POOL_IDLE, POOL_CLAIMED)
+   - Conditional update on claim to prevent double-assignment
+3. Update `POST /sessions` for `cloud_sandbox`:
+   - Try `warm_pool.acquire_container()` first
+   - If pool empty, fall back to cold-start `RunTask` (same as Phase 3a)
+   - If warm container acquired, skip `SANDBOX_PROVISIONING` → go directly to `SANDBOX_READY`
+4. Warm container startup: containers start in HTTP mode, register with Session Service as `POOL_IDLE`, wait for assignment
+5. Assignment flow: Session Service updates the container's `SESSION_ID` env via RPC, container initializes session context
+6. Terraform: add warm pool config variables (target size, min, max), CloudWatch alarm for pool depletion
+
+### Tests
+
+- Unit: WarmPoolManager — replenish, acquire, drain, concurrent acquire (conditional update)
+- Unit: Session creation — warm hit (instant), warm miss (fallback to cold start)
+- Unit: Pool container lifecycle (POOL_IDLE → POOL_CLAIMED → SESSION_RUNNING)
+- Integration: Full warm pool flow with mocked ECS
+
+### Definition of Done
+
+- `make check` passes on session-service
+- Session creation with available warm container skips provisioning wait
+- Pool auto-replenishes after containers are claimed
+- Cold-start fallback works when pool is empty
+- Pool size is configurable per environment
+
+---
+
+## Step 14 — Connection Draining (session-service, agent-runtime)
+
+**Repos:** `cowork-session-service`, `cowork-agent-runtime`
+
+Gracefully handle sandbox shutdown while SSE connections and in-flight requests are active.
+
+### Work
+
+1. Agent-runtime (`http_transport.py`):
+   - On shutdown signal, stop accepting new requests (return 503)
+   - Wait for in-flight RPC requests to complete (up to 30s grace)
+   - Send final SSE event `{"type": "sandbox_shutting_down"}` to all connected clients
+   - Close all SSE connections
+2. Session Service proxy:
+   - On `503` from sandbox, check if session is terminating
+   - If terminating, return structured error `sandbox_shutting_down` with session history URL
+   - If not terminating (transient error), retry once
+3. Web app:
+   - On `sandbox_shutting_down` SSE event, show "Session ending" UI
+   - Fetch final history from Workspace Service
+   - Disable input, show session summary
+
+### Tests
+
+- Unit: HttpTransport drain sequence (stop accepting → flush → close)
+- Unit: Proxy retry vs shutdown detection
+- Unit: Web app handles shutdown event gracefully
+- Integration: Trigger shutdown during active SSE stream, verify clean handoff
+
+### Definition of Done
+
+- No dropped events during graceful shutdown
+- Browser shows clean transition from live to terminated
+- In-flight requests complete before container stops
+
+---
+
+## Step 15 — Workspace Snapshot/Restore (workspace-service, session-service, web-app)
+
+**Repos:** `cowork-workspace-service`, `cowork-session-service`, `cowork-web-app`
+
+Allow users to resume work from a terminated sandbox by restoring the workspace state into a new container.
+
+### Work
+
+1. Workspace Service:
+   - `POST /workspaces/{id}/snapshot` — create a point-in-time snapshot of all workspace files in S3 (copy to `{workspaceId}/snapshots/{snapshotId}/`)
+   - `GET /workspaces/{id}/snapshots` — list available snapshots
+   - Auto-snapshot on sandbox termination (triggered by Session Service)
+2. Session Service:
+   - `POST /sessions/{sessionId}/restore` — create a new session from a terminated one:
+     - Create new `cloud_sandbox` session linked to same workspace
+     - Provision sandbox, restore workspace files from latest snapshot
+     - Return new session ID
+3. Web app:
+   - On terminated session view, show "Resume" button
+   - Resume triggers restore flow, shows provisioning state, transitions to new session
+   - Conversation history loaded from Workspace Service (previous session's history)
+
+### Tests
+
+- Unit: Snapshot creation and listing
+- Unit: Restore flow — new session creation, workspace file restore
+- Unit: Web app resume UX (terminated → provisioning → running)
+- Integration: Full terminate → snapshot → restore → verify files present
+
+### Definition of Done
+
+- Terminated sessions show "Resume" option in web app
+- Resume creates new sandbox with all previous workspace files restored
+- Conversation history from previous session is visible
+- Snapshot cleanup (auto-delete after 30 days)
+
+---
+
+## Step 16 — Enhanced File Management (web-app)
+
+**Repo:** `cowork-web-app`
+
+Improve the file browser from basic list to a full workspace explorer.
+
+### Work
+
+1. Tree view: hierarchical directory display with expand/collapse
+2. Inline file viewer: syntax-highlighted code viewer for common languages
+3. Inline editor: Monaco-based editor for quick edits (saves back to sandbox)
+4. Drag-and-drop upload: drop files/folders onto file browser
+5. Multi-file download: select multiple files → download as zip
+6. File change indicators: show which files were modified by the agent (from `file_diff` artifacts)
+
+### Tests
+
+- Component: Tree view rendering with nested directories
+- Component: File viewer with syntax highlighting
+- Component: Editor save round-trip (edit → save → verify)
+- Unit: Change indicator logic from artifact data
+
+### Definition of Done
+
+- `make check` passes
+- File browser shows full directory tree
+- Can view and edit files inline
+- Drag-and-drop upload works
+- Modified files are visually indicated
+
+---
+
+## Step 17 — Virus Scanning for Uploads (workspace-service, infra)
+
+**Repos:** `cowork-workspace-service`, `cowork-infra`
+
+Scan uploaded files for malware before they enter the sandbox workspace.
+
+### Work
+
+1. Integrate ClamAV (or AWS-native solution like S3 Object Lambda + ClamAV layer):
+   - S3 event notification on upload to `workspace-files/` prefix
+   - Lambda function scans the file with ClamAV
+   - Tag clean files as `scan-status: clean`, infected files as `scan-status: infected`
+2. Workspace Service:
+   - After upload, check scan status before making file available to sandbox
+   - If infected, delete file and return `400` with `file_infected` error
+   - If scan pending (async), return `202 Accepted` with scan status polling endpoint
+3. Terraform:
+   - Lambda function with ClamAV layer
+   - S3 event notification configuration
+   - IAM roles for Lambda → S3 access
+
+### Tests
+
+- Unit: Scan result handling (clean, infected, pending)
+- Integration: Upload file → verify scan triggered → verify clean file accessible
+
+### Definition of Done
+
+- Uploaded files are scanned before sandbox can access them
+- Infected files are rejected with clear error message
+- Clean files are available within seconds of upload
+- Scan infrastructure deployed via Terraform
+
+---
+
+# Phase 3c — Scale
+
+Prerequisite: Phase 3b complete and deployed.
+
+---
+
+## Step 18 — OIDC Authentication (session-service, web-app)
+
+**Repos:** `cowork-session-service`, `cowork-web-app`
+
+Replace simple auth with OIDC for production multi-tenant use.
+
+### Work
+
+1. Session Service:
+   - Add OIDC token validation middleware (verify JWT signature, issuer, audience, expiry)
+   - Extract `userId`, `tenantId` from JWT claims
+   - Support multiple OIDC providers via configuration (list of issuer URLs + JWKS endpoints)
+   - Cache JWKS keys with TTL (default 1 hour)
+   - Reject requests with invalid/expired tokens → `401 Unauthorized`
+2. Web app:
+   - Add OIDC login flow using `oidc-client-ts`:
+     - Redirect to OIDC provider
+     - Handle callback, store tokens
+     - Silent token renewal before expiry
+     - Logout (clear tokens, redirect to provider logout)
+   - Attach `Authorization: Bearer {token}` to all API calls
+   - Handle 401 → redirect to login
+3. Configuration:
+   - `OIDC_ISSUER_URLS` — comma-separated list of trusted issuers
+   - `OIDC_AUDIENCE` — expected audience claim
+   - `OIDC_CLIENT_ID` — client ID for web app (public client, PKCE flow)
+
+### Tests
+
+- Unit: JWT validation (valid, expired, wrong issuer, wrong audience, malformed)
+- Unit: JWKS cache hit and miss
+- Unit: Claims extraction (userId, tenantId mapping)
+- Unit: Web app login flow, token renewal, logout
+- Integration: Full login → create session → verify ownership enforcement
+
+### Definition of Done
+
+- `make check` passes on both repos
+- Web app redirects to OIDC provider on first visit
+- Valid JWT required for all API calls
+- Session ownership enforced via JWT claims
+- Token renewal happens transparently
+- Simple auth still works as fallback (configurable, for dev environments)
+
+---
+
+## Step 19 — EventBridge Lifecycle Manager (session-service, infra)
+
+**Repos:** `cowork-session-service`, `cowork-infra`
+
+Move idle timeout and provisioning timeout checks from in-process background tasks to EventBridge + Lambda for single-execution reliability at scale.
+
+### Work
+
+1. Create Lambda function (`sandbox-lifecycle-checker`):
+   - Same logic as `SandboxLifecycleManager` from Step 6
+   - Query idle sessions, check for running tasks, terminate idle ones
+   - Check provisioning timeouts, max duration
+   - No conditional updates needed (single execution per interval)
+2. EventBridge rule: trigger Lambda every 5 minutes
+3. Remove background task from Session Service (feature flag to switch between in-process and Lambda)
+4. Lambda shares the same DynamoDB/ECS client code as Session Service (extract to shared module or Lambda reads service config)
+5. Terraform: Lambda function, EventBridge rule, IAM roles, CloudWatch alarm on Lambda errors
+
+### Tests
+
+- Unit: Lambda handler with mocked DynamoDB/ECS (same tests as Step 6, adapted)
+- Integration: EventBridge triggers Lambda, Lambda terminates idle session
+
+### Definition of Done
+
+- EventBridge rule triggers Lambda on schedule
+- Lambda correctly identifies and terminates idle/timed-out sessions
+- Session Service background task can be disabled via config
+- CloudWatch metrics on Lambda invocations and errors
+
+---
+
+## Step 20 — Auto-Scaling Warm Pool (session-service, infra)
+
+**Repos:** `cowork-session-service`, `cowork-infra`
+
+Scale warm pool size based on usage patterns instead of fixed target.
+
+### Work
+
+1. Metrics-based scaling:
+   - Track `sandbox.provision_requests` (counter) and `warm_pool.hit_rate` (percentage)
+   - CloudWatch custom metrics published by Session Service
+2. Scaling policy:
+   - If hit rate < 80% for 15 minutes → shrink pool (reduce target by 20%)
+   - If hit rate < 50% → shrink aggressively (reduce to min)
+   - If cold starts > 5 in 10 minutes → expand pool (increase target by 50%)
+   - Min pool size: 0 (off-hours), Max pool size: configurable per environment
+3. Time-based scaling:
+   - Schedule-based overrides via EventBridge (e.g. scale up at 8am, scale down at 8pm)
+   - Weekend/holiday schedules
+4. Terraform: CloudWatch alarms, EventBridge schedules, scaling config variables
+
+### Tests
+
+- Unit: Scaling policy decisions (hit rate → target size)
+- Unit: Schedule-based overrides
+- Integration: Publish metrics → verify scaling action taken
+
+### Definition of Done
+
+- Warm pool scales up on demand spikes (cold starts detected)
+- Warm pool scales down during low usage (cost savings)
+- Time-based schedules work for predictable patterns
+- CloudWatch dashboard shows pool metrics
+
+---
+
+## Step 21 — Regional Sandbox Deployment (infra, session-service)
+
+**Repos:** `cowork-infra`, `cowork-session-service`
+
+Deploy sandbox infrastructure in multiple AWS regions and route users to the closest one.
+
+### Work
+
+1. Terraform:
+   - Parameterize sandbox module for multi-region deployment
+   - Deploy ECS cluster, task definition, security groups, warm pool in each region
+   - Cross-region S3 replication for workspace artifacts (or use regional buckets)
+2. Session Service:
+   - Accept `preferredRegion` in session creation (optional, auto-detected from client IP)
+   - Region selection logic: preferred region → closest region with capacity → fallback to primary
+   - Store `sandboxRegion` on session record
+   - Proxy routes to region-specific sandbox endpoint
+3. DNS/routing:
+   - Route 53 latency-based routing for Session Service endpoints (or CloudFront)
+   - Regional ALB endpoints
+
+### Tests
+
+- Unit: Region selection logic (preferred, closest, fallback)
+- Integration: Create session in non-primary region, verify sandbox runs there
+
+### Definition of Done
+
+- Sandbox infrastructure deployed in 2+ regions
+- Sessions are created in the region closest to the user
+- Cross-region workspace access works
+- Failover to another region when primary is unavailable
+
+---
+
+## Step 22 — GPU-Enabled Sandbox (infra, session-service)
+
+**Repos:** `cowork-infra`, `cowork-session-service`
+
+Support GPU instances for ML workloads (model training, data processing).
+
+### Work
+
+1. Terraform:
+   - New ECS task definition with GPU resource requirements
+   - GPU-capable instance type in ECS capacity provider (p3/g4/g5 instances)
+   - Separate warm pool for GPU instances (expensive — small pool or on-demand only)
+2. Session Service:
+   - Accept `resourceProfile` in session creation: `standard` (default) or `gpu`
+   - Select task definition and capacity provider based on profile
+   - GPU session limits: lower concurrent limit (e.g. 1 per user)
+3. Agent runtime:
+   - No changes needed — same codebase, GPU is available as system resource
+   - `ExecuteCode` tool can access GPU via CUDA (if available in container)
+4. Policy:
+   - New capability `Compute.GPU` — controlled by policy bundle
+   - GPU sessions may have different cost/budget limits
+
+### Tests
+
+- Unit: Resource profile selection (standard vs GPU task definitions)
+- Unit: GPU session limits (lower concurrent cap)
+- Integration: Create GPU session, verify GPU is accessible in container
+
+### Definition of Done
+
+- GPU sandbox can be requested via session creation
+- GPU is accessible inside the container (CUDA, PyTorch, etc.)
+- Separate concurrency limits for GPU sessions
+- Cost tracking per resource profile
+
+---
+
+## Step 23 — Shared Workspace Across Sessions (workspace-service, session-service, web-app)
+
+**Repos:** `cowork-workspace-service`, `cowork-session-service`, `cowork-web-app`
+
+Allow multiple sessions to share a workspace — enabling iterative work across sessions and team collaboration.
+
+### Work
+
+1. Workspace Service:
+   - Shared workspace type: multiple sessions can reference the same `workspaceId`
+   - Workspace file locking (advisory): prevent concurrent writes to same file from different sessions
+   - Workspace access control: list of authorized `userId`s per workspace
+2. Session Service:
+   - `POST /sessions` accepts existing `workspaceId` for `cloud` sessions (reuse workspace)
+   - Validate user has access to the workspace
+   - Multiple active sessions on same workspace: each gets its own sandbox, but S3 workspace files are shared
+3. Sync conflict handling:
+   - Last-write-wins for file sync (simple, same as git)
+   - Conflict detection: if file changed in S3 since last sync, warn user before overwriting
+4. Web app:
+   - Workspace view: list sessions associated with a workspace
+   - Share workspace: invite other users
+   - Conflict resolution UI
+
+### Tests
+
+- Unit: Workspace access control (authorized user, unauthorized user)
+- Unit: File locking (advisory lock acquire, release, timeout)
+- Unit: Conflict detection (file changed since last sync)
+- Integration: Two sessions on same workspace, verify file changes are visible
+
+### Definition of Done
+
+- Multiple sessions can use the same workspace
+- Workspace files are shared via S3
+- File conflicts are detected and surfaced to user
+- Workspace access control enforced
+
+---
+
+# Full Dependency Graph
 
 ```
-Step 1 (HttpTransport)
-  ↓
-Step 2 (Registration) ──→ Step 3 (ECS Integration) ──→ Step 4 (Proxy)
-  ↓                                                        ↓
-Step 7 (Sandbox Mode) ←─────────────────────────────── Step 6 (Idle Timeout)
-  ↓                                                        ↓
-Step 8 (Contracts) ────→ Step 9 (E2E Integration) ←── Step 5 (Cloud Workspace)
-  ↓
-Step 10 (Web App)
-  ↓
-Step 11 (Terraform) ──→ Step 12 (Docker/CI)
-```
+Phase 3a (MVP):
+  Step 8 (Contracts) ─────────────────────────────────────────┐
+  Step 1 (HttpTransport) ──→ Step 7 (Sandbox Mode) ──┐       │
+  Step 2 (Registration) ──→ Step 3 (ECS) ──→ Step 4 (Proxy) ─┤
+  Step 5 (Cloud Workspace) ────────────────────────────────────┤
+  Step 6 (Idle Timeout) ──────────────────────────────────────┤
+                                                               ↓
+  Step 9 (E2E Integration) ──→ Step 10 (Web App) ──→ Step 12 (Docker/CI)
+  Step 11 (Terraform) ─────────────────────────────→ Step 12
 
-**Parallelizable work:**
-- Steps 1, 2, 5, 8 can start in parallel (no dependencies between them)
-- Step 10 (web app) can start after Step 8 (contracts) and progress in parallel with Steps 3, 4, 6, 7
-- Step 11 (Terraform) can start any time (no code dependency)
+Phase 3b (Optimization) — all depend on Phase 3a complete:
+  Step 13 (Warm Pool)
+  Step 14 (Connection Draining)
+  Step 15 (Snapshot/Restore)
+  Step 16 (Enhanced File Management)
+  Step 17 (Virus Scanning)
+
+Phase 3c (Scale) — all depend on Phase 3b complete:
+  Step 18 (OIDC Auth)
+  Step 19 (EventBridge Lifecycle)
+  Step 20 (Auto-Scaling Warm Pool) — depends on Step 13
+  Step 21 (Regional Deployment)
+  Step 22 (GPU Sandbox)
+  Step 23 (Shared Workspace)
+```
 
 ---
 
 ## Implementation Order (Recommended)
+
+### Phase 3a — MVP
 
 | Order | Step | Repo | Rationale |
 |-------|------|------|-----------|
@@ -500,3 +934,24 @@ Step 11 (Terraform) ──→ Step 12 (Docker/CI)
 | 10 | Step 10 — Web App | cowork-web-app | Can start earlier, but full testing needs Steps 1–7 |
 | 11 | Step 11 — Terraform | cowork-infra | Can start any time, needed for deploy |
 | 12 | Step 12 — Docker/CI | agent-runtime, infra | Final step before deploy |
+
+### Phase 3b — Optimization
+
+| Order | Step | Repo | Rationale |
+|-------|------|------|-----------|
+| 13 | Step 13 — Warm Pool | session-service, infra | Biggest UX improvement (instant start) |
+| 14 | Step 14 — Connection Draining | session-service, agent-runtime | Fixes shutdown UX |
+| 15 | Step 15 — Snapshot/Restore | workspace-service, session-service, web-app | Key feature: resume terminated sessions |
+| 16 | Step 16 — Enhanced File Management | cowork-web-app | Web app polish |
+| 17 | Step 17 — Virus Scanning | workspace-service, infra | Security hardening |
+
+### Phase 3c — Scale
+
+| Order | Step | Repo | Rationale |
+|-------|------|------|-----------|
+| 18 | Step 18 — OIDC Auth | session-service, web-app | Required for multi-tenant production |
+| 19 | Step 19 — EventBridge Lifecycle | session-service, infra | Operational reliability at scale |
+| 20 | Step 20 — Auto-Scaling Warm Pool | session-service, infra | Cost optimization (depends on Step 13) |
+| 21 | Step 21 — Regional Deployment | infra, session-service | Latency optimization |
+| 22 | Step 22 — GPU Sandbox | infra, session-service | ML workload support |
+| 23 | Step 23 — Shared Workspace | workspace-service, session-service, web-app | Collaboration feature |
