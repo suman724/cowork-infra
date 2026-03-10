@@ -12,6 +12,8 @@
 - **Existing patterns**: Same project structure, error handling, logging, CI, and Makefile conventions as existing repos.
 - **No desktop regression**: All agent-runtime changes are additive. Solo/desktop sessions must pass existing tests at every step.
 - **Step numbers = execution order**: Steps are numbered in the order they should be implemented.
+- **Wiring verification**: Every step must verify end-to-end wiring with adjacent components. After implementing, trace the data flow from caller to callee and back — check request/response types match, error codes are handled, timeouts are set, and no integration seams are left untested.
+- **Self-review before done**: Every step includes a mandatory self-review pass before marking complete. Review all changed files for: unhandled exceptions, missing error handling at boundaries, type mismatches between components, hardcoded values that should be configurable, missing structured logging, missing tests for error paths, and any deviation from existing patterns. Fix all issues found before proceeding.
 
 ---
 
@@ -45,6 +47,8 @@ Add schemas and SDK helpers for web execution. This unblocks all other repos.
 - `make check` passes on cowork-platform
 - Python and TypeScript bindings generated and importable
 - All downstream repos can import the new types
+- **Wiring check**: Import new types in session-service, workspace-service, agent-runtime — verify they compile/typecheck with no errors
+- **Self-review**: Review all schemas for field name consistency (camelCase in JSON, snake_case in Python), verify enum values match design doc, check codegen output for correctness
 
 ---
 
@@ -85,6 +89,8 @@ Extract a `Transport` protocol from the existing `StdioTransport`, then implemen
 - Can start agent-runtime with `--transport http`, hit `/health`, send a JSON-RPC request to `/rpc`, and receive SSE events on `/events`
 - Starting with `--transport stdio` (or no flag) behaves identically to before
 - File upload to `/upload` and download from `/files/{path}` work with a local workspace directory
+- **Wiring check**: Verify `MethodDispatcher` receives identical request/response types from both transports. Verify `EventEmitter` → event buffer → SSE stream chain delivers events without data loss. Verify JSON-RPC error codes propagate correctly through HttpTransport
+- **Self-review**: Review all changed files for unhandled exceptions (especially in SSE streaming and file upload), missing timeouts, missing structured logging on error paths, and ensure Transport protocol is satisfied by both implementations
 
 ---
 
@@ -119,6 +125,8 @@ Add the `/sessions/{sessionId}/register` endpoint and the new session status sta
 - `make check` passes on session-service
 - Registration endpoint works end-to-end with DynamoDB Local
 - Desktop session creation is not affected (existing tests pass unchanged)
+- **Wiring check**: Verify registration request/response types match what agent-runtime will send (from Step 2's HttpTransport). Verify new session fields are persisted and queryable. Verify state machine transitions are consistent — no orphaned states
+- **Self-review**: Review all changed files for missing validation (e.g. malformed taskArn), missing error handling on DynamoDB conditional updates, ensure new fields have proper defaults for desktop sessions (null/None, not breaking)
 
 ---
 
@@ -153,6 +161,8 @@ Implement `cloud` workspace scope — S3-backed workspace that sandboxes sync fi
 - Can create a `cloud` workspace, upload files, list them, download them, delete them
 - Workspace deletion cleans up both artifacts and workspace files
 - `local` and `general` workspace behavior unchanged
+- **Wiring check**: Verify file upload/download API matches what session-service proxy (Step 6) and agent-runtime workspace sync (Step 7) will call. Verify S3 key prefixes are consistent with artifact storage keys. Verify workspace creation response includes `s3_workspace_prefix`
+- **Self-review**: Review for missing S3 error handling (ClientError → service exceptions), missing size limits on file uploads, missing cleanup on partial failures, ensure delete cascades cover both artifacts and workspace files
 
 ---
 
@@ -189,6 +199,8 @@ Add ECS client to launch Fargate tasks when creating `cloud_sandbox` sessions.
 - Creating a `cloud_sandbox` session stores `expected_task_arn` and sets status to `SANDBOX_PROVISIONING`
 - RunTask failure results in `SESSION_FAILED` with structured error
 - Concurrent session limit rejects excess sessions with 409
+- **Wiring check**: Verify ECS RunTask overrides (env vars, security groups) match what agent-runtime expects in sandbox startup (Step 7). Verify `expected_task_arn` stored on session matches what container will read from ECS metadata. Verify error responses use platform contract types from Step 1
+- **Self-review**: Review for missing error handling on ECS API calls (ClientError subtypes), ensure session status rollback on RunTask failure is atomic, verify concurrent limit query uses correct GSI and status filters, check for race conditions between session creation and limit check
 
 ---
 
@@ -235,6 +247,8 @@ Add proxy endpoints that forward browser requests to the sandbox container.
 - Can proxy JSON-RPC, SSE, file upload/download through Session Service to a running sandbox
 - SSE reconnect with `Last-Event-ID` works through the proxy
 - Activity tracking updates DynamoDB at most once per 60s per session
+- **Wiring check**: Verify proxy forwards all headers correctly (Last-Event-ID, Content-Type, Authorization). Verify SSE proxy streams events byte-for-byte without corruption. Verify error responses from sandbox are translated to proxy error responses matching platform contract types. Test with real HttpTransport from Step 2 running in a subprocess
+- **Self-review**: Review for connection leak risks (SSE proxy must close upstream on client disconnect), missing timeouts on proxy connections, missing structured logging for proxy errors, ensure cache invalidation on session status changes, verify 403/404/409/503 error paths all return structured responses
 
 ---
 
@@ -277,6 +291,8 @@ Wire the sandbox startup flow: read session ID from env, self-register with Sess
 - Agent runtime in HTTP mode reads session ID, registers with Session Service, syncs workspace, serves HTTP
 - SIGTERM triggers graceful shutdown with workspace sync
 - Stdio mode is completely unaffected
+- **Wiring check**: Verify registration request matches Step 3's endpoint contract exactly (field names, types, auth). Verify workspace sync calls match Step 4's file upload/download API. Verify session token from registration response is used for all subsequent backend calls. Test full startup → register → serve → shutdown sequence against a real Session Service instance
+- **Self-review**: Review for missing error handling on registration failure (retry? fail fast?), missing cleanup if workspace sync fails on startup, ensure SIGTERM handler doesn't race with in-flight requests, verify ECS metadata endpoint parsing handles all edge cases
 
 ---
 
@@ -314,6 +330,8 @@ Add background task for idle timeout enforcement and provisioning timeout cleanu
 - Stuck provisioning sessions are cleaned up after 180s
 - Max duration sessions are terminated
 - Multiple lifecycle managers running concurrently don't cause errors (conditional updates)
+- **Wiring check**: Verify lifecycle manager queries use correct GSI and status filters matching Step 3's session model. Verify terminate flow calls sandbox shutdown endpoint (matching Step 7's HttpTransport) before calling ECS StopTask (matching Step 5's ECS client). Verify task status check queries the tasks table with correct index from session-service
+- **Self-review**: Review for missing error handling when sandbox is unreachable during shutdown (best-effort, don't block), ensure lifecycle manager doesn't crash on individual session failures (catch per-session, continue loop), verify conditional update expressions are correct, check that background task shuts down cleanly on app exit
 
 ---
 
@@ -348,6 +366,8 @@ Verify the full sandbox lifecycle works across services.
 - Reconnect replays missed events correctly
 - File upload/download works through proxy
 - Idle timeout and provisioning timeout tested
+- **Wiring check**: This step IS the wiring check — verify every integration seam from Steps 1–8 works together. Document any mismatches found and fix them in the originating step before proceeding
+- **Self-review**: Review test coverage for all error paths (sandbox crash mid-task, network timeout during proxy, workspace sync failure). Ensure test script has clear error reporting so failures are easy to diagnose
 
 ---
 
@@ -392,6 +412,8 @@ Set up the repo and build the core web UI.
 - Can send tasks, see streaming responses, approve/deny tool calls
 - Can upload/download files
 - Reconnect after page refresh shows full history
+- **Wiring check**: Verify SSE event types match what HttpTransport emits (Step 2). Verify JSON-RPC method names and params match agent-runtime handlers. Verify API client URLs and request/response shapes match session-service proxy endpoints (Step 6). Verify auth header format matches session-service expectations
+- **Self-review**: Review for missing error states in UI (sandbox provisioning failure, proxy 503, SSE disconnect without reconnect), ensure all API errors are shown to user with actionable messages, check for memory leaks in SSE client (event listener cleanup), verify Zustand stores handle all state transitions correctly
 
 ---
 
@@ -428,6 +450,8 @@ Add Terraform modules for sandbox ECS resources.
 - `terraform plan-dev` shows sandbox task definition, security groups, IAM roles, log groups
 - Session Service task role has `ecs:RunTask` and `ecs:StopTask` permissions
 - Sandbox task role has scoped S3 and CloudWatch access
+- **Wiring check**: Verify ECS task definition env vars match what agent-runtime expects (Step 7). Verify security group rules match proxy flow (Session Service → sandbox on port 8080). Verify IAM policies scope to correct S3 bucket and DynamoDB tables. Verify log group name matches what agent-runtime's structlog writes to
+- **Self-review**: Review for overly permissive IAM policies, missing tags on resources, hardcoded values that should be variables, ensure all resources are prefixed with `cowork-{env}-`
 
 ---
 
@@ -462,6 +486,8 @@ Add Dockerfile for agent-runtime and CI pipeline for sandbox builds.
 - `make docker-build` produces a working image
 - Container starts in HTTP mode, responds to health checks
 - CI builds and pushes image to ECR
+- **Wiring check**: Verify Dockerfile installs all dependencies needed for HTTP mode (uvicorn, fastapi). Verify entrypoint and health check match ECS task definition from Step 11. Verify container can reach Session Service URL for registration (network connectivity). Run the E2E test from Step 9 against the Docker container instead of a local process
+- **Self-review**: Review Dockerfile for unnecessary layers, missing non-root user, missing health check interval, ensure .dockerignore excludes tests/docs/dev files, verify CI pipeline triggers on correct branches
 
 ---
 
@@ -509,6 +535,8 @@ Pre-provision idle sandbox containers so sessions start in <3s instead of 15–4
 - Pool auto-replenishes after containers are claimed
 - Cold-start fallback works when pool is empty
 - Pool size is configurable per environment
+- **Wiring check**: Verify warm container assignment RPC matches HttpTransport's endpoint. Verify session creation flow still works end-to-end (both warm hit and cold miss paths). Verify pool containers use same task definition and security groups as cold-start containers from Step 5
+- **Self-review**: Review for race conditions in concurrent acquire (conditional update correctness), ensure pool replenishment doesn't exceed max, verify cleanup of stale pool entries (container crashed before claim)
 
 ---
 
@@ -546,6 +574,8 @@ Gracefully handle sandbox shutdown while SSE connections and in-flight requests 
 - No dropped events during graceful shutdown
 - Browser shows clean transition from live to terminated
 - In-flight requests complete before container stops
+- **Wiring check**: Verify shutdown SSE event type is handled by web app. Verify proxy correctly distinguishes 503-from-shutdown vs 503-from-transient-error. Verify workspace sync completes before container exits. Test with real proxy and real web app connected
+- **Self-review**: Review for edge cases (shutdown during file upload, shutdown during LLM streaming), ensure no goroutine/task leaks on shutdown, verify grace period is configurable
 
 ---
 
@@ -584,6 +614,8 @@ Allow users to resume work from a terminated sandbox by restoring the workspace 
 - Resume creates new sandbox with all previous workspace files restored
 - Conversation history from previous session is visible
 - Snapshot cleanup (auto-delete after 30 days)
+- **Wiring check**: Verify snapshot S3 keys don't collide with workspace file keys or artifact keys. Verify restore creates workspace sync that matches Step 7's startup flow. Verify web app's resume flow correctly polls for new session provisioning. Verify conversation history loads from Workspace Service API matching Step 4's endpoints
+- **Self-review**: Review for missing error handling on large workspace snapshots (timeout, partial copy), ensure snapshot cleanup doesn't delete active snapshots, verify restore works when original workspace has been deleted
 
 ---
 
@@ -636,6 +668,8 @@ Replace simple auth with OIDC for production multi-tenant use.
 - Session ownership enforced via JWT claims
 - Token renewal happens transparently
 - Simple auth still works as fallback (configurable, for dev environments)
+- **Wiring check**: Verify JWT claims extraction produces correct `userId`/`tenantId` that match session-service's existing field names. Verify proxy endpoints enforce ownership using JWT-derived userId. Verify web app attaches token to SSE connections (EventSource doesn't support headers — verify workaround via query param or cookie). Verify sandbox registration endpoint is excluded from OIDC validation (internal-only)
+- **Self-review**: Review for missing token refresh edge cases (refresh fails during active session), ensure JWKS cache invalidation works when keys rotate, verify no sensitive data in JWT is logged, check that 401 responses don't leak internal details
 
 ---
 
@@ -668,6 +702,8 @@ Move idle timeout and provisioning timeout checks from in-process background tas
 - Lambda correctly identifies and terminates idle/timed-out sessions
 - Session Service background task can be disabled via config
 - CloudWatch metrics on Lambda invocations and errors
+- **Wiring check**: Verify Lambda uses same DynamoDB table names, GSIs, and conditional update expressions as Step 8's in-process lifecycle manager. Verify Lambda calls same ECS StopTask API as Step 5's sandbox service. Verify feature flag correctly switches between Lambda and in-process mode without gaps in coverage
+- **Self-review**: Review for Lambda timeout configuration (must be long enough to process all idle sessions), ensure Lambda has correct IAM permissions for DynamoDB + ECS, verify error handling doesn't cause Lambda to retry on partial failures (use dead letter queue)
 
 ---
 
@@ -704,6 +740,8 @@ Scale warm pool size based on usage patterns instead of fixed target.
 - Warm pool scales down during low usage (cost savings)
 - Time-based schedules work for predictable patterns
 - CloudWatch dashboard shows pool metrics
+- **Wiring check**: Verify custom metrics published by session-service match CloudWatch alarm metric names exactly. Verify scaling actions call the same WarmPoolManager API from Step 13. Verify schedule-based scaling doesn't conflict with metrics-based scaling (priority rules)
+- **Self-review**: Review for missing bounds checks (pool size never goes negative, never exceeds max), ensure scaling decisions are logged for debugging, verify dashboard queries match published metric dimensions
 
 ---
 
@@ -742,6 +780,8 @@ Improve the file browser from basic list to a full workspace explorer.
 - Can view and edit files inline
 - Drag-and-drop upload works
 - Modified files are visually indicated
+- **Wiring check**: Verify file list API response structure matches tree view component's expected format. Verify inline editor save calls the correct sandbox file write endpoint. Verify file change indicators correctly parse `file_diff` artifact data from workspace-service
+- **Self-review**: Review for missing loading/error states in all file operations, ensure large file handling (don't load 10MB file into Monaco), verify drag-and-drop respects upload size limits from policy
 
 ---
 
@@ -777,6 +817,8 @@ Scan uploaded files for malware before they enter the sandbox workspace.
 - Infected files are rejected with clear error message
 - Clean files are available within seconds of upload
 - Scan infrastructure deployed via Terraform
+- **Wiring check**: Verify S3 event notification triggers on correct prefix (`workspace-files/`). Verify Lambda scan result tags are read by workspace-service before serving files. Verify scan status polling endpoint is called by web app upload flow. Verify infected file deletion uses same S3 client patterns as workspace-service
+- **Self-review**: Review for missing edge cases (scan timeout, Lambda cold start delay, file uploaded faster than scan completes), ensure scan doesn't block small file uploads excessively, verify Lambda has access to latest ClamAV definitions
 
 ---
 
@@ -821,6 +863,8 @@ Support GPU instances for ML workloads (model training, data processing).
 - GPU is accessible inside the container (CUDA, PyTorch, etc.)
 - Separate concurrency limits for GPU sessions
 - Cost tracking per resource profile
+- **Wiring check**: Verify GPU task definition is selected based on `resourceProfile` in session creation request. Verify GPU capacity provider has instances available. Verify policy bundle includes `Compute.GPU` capability for GPU sessions. Verify concurrent limit check distinguishes standard vs GPU sessions
+- **Self-review**: Review for missing fallback when GPU instances are unavailable (queue? reject?), ensure GPU container image includes CUDA drivers, verify cost tracking metrics are published correctly
 
 ---
 
@@ -861,6 +905,8 @@ Allow multiple sessions to share a workspace — enabling iterative work across 
 - Workspace files are shared via S3
 - File conflicts are detected and surfaced to user
 - Workspace access control enforced
+- **Wiring check**: Verify workspace access control is checked on session creation (session-service), file operations (workspace-service), and proxy requests (session-service). Verify workspace sync in agent-runtime handles concurrent writes from other sessions. Verify web app workspace view correctly fetches sessions from session-service and files from workspace-service
+- **Self-review**: Review for missing edge cases (session reads file while another session is writing), ensure advisory locks have TTL to prevent deadlocks, verify access control can't be bypassed via direct workspace-service calls, check that conflict resolution UI handles all conflict types
 
 ---
 
