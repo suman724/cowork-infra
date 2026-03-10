@@ -1,7 +1,6 @@
 # Web Execution — Implementation Plan
 
 **Parent design:** [web-execution.md](web-execution.md)
-**Phase:** 3a (MVP)
 **Repos touched:** `cowork-agent-runtime`, `cowork-session-service`, `cowork-workspace-service`, `cowork-web-app` (new), `cowork-platform`, `cowork-infra`
 
 ---
@@ -12,10 +11,44 @@
 - **Tests from the start**: Every step includes unit tests. Integration tests added at integration boundaries.
 - **Existing patterns**: Same project structure, error handling, logging, CI, and Makefile conventions as existing repos.
 - **No desktop regression**: All agent-runtime changes are additive. Solo/desktop sessions must pass existing tests at every step.
+- **Step numbers = execution order**: Steps are numbered in the order they should be implemented.
 
 ---
 
-## Step 1 — Transport Protocol and HttpTransport (agent-runtime)
+# Phase 3a — MVP
+
+---
+
+## Step 1 — Platform Contracts (cowork-platform)
+
+**Repo:** `cowork-platform`
+
+Add schemas and SDK helpers for web execution. This unblocks all other repos.
+
+### Work
+
+1. Add new event types to event schema: `SANDBOX_PROVISIONING`, `SANDBOX_READY`, `SANDBOX_TERMINATED`
+2. Add `SandboxRegistrationRequest` and `SandboxRegistrationResponse` schemas
+3. Add `ProxyErrorResponse` schema (sandbox_unreachable, session_not_active, etc.)
+4. Extend `SessionResponse` schema with sandbox-specific fields (`sandboxEndpoint`, `taskArn`, `networkAccess`, `lastActivityAt`)
+5. Extend `CreateSessionRequest` with `networkAccess` field
+6. Add `WorkspaceFileUpload` and `WorkspaceFileList` schemas
+7. Run codegen: generate Python (Pydantic) and TypeScript bindings
+
+### Tests
+
+- Schema validation tests for all new schemas
+- Codegen output matches expected types
+
+### Definition of Done
+
+- `make check` passes on cowork-platform
+- Python and TypeScript bindings generated and importable
+- All downstream repos can import the new types
+
+---
+
+## Step 2 — Transport Protocol and HttpTransport (agent-runtime)
 
 **Repo:** `cowork-agent-runtime`
 
@@ -55,7 +88,7 @@ Extract a `Transport` protocol from the existing `StdioTransport`, then implemen
 
 ---
 
-## Step 2 — Sandbox Self-Registration Endpoint (session-service)
+## Step 3 — Sandbox Self-Registration Endpoint (session-service)
 
 **Repo:** `cowork-session-service`
 
@@ -89,7 +122,41 @@ Add the `/sessions/{sessionId}/register` endpoint and the new session status sta
 
 ---
 
-## Step 3 — ECS Integration (session-service)
+## Step 4 — Cloud Workspace Support (workspace-service)
+
+**Repo:** `cowork-workspace-service`
+
+Implement `cloud` workspace scope — S3-backed workspace that sandboxes sync files to/from.
+
+### Work
+
+1. Update `WorkspaceService.create_workspace()`:
+   - `cloud` scope: always creates new workspace (like `general`), sets `workspace_scope = "cloud"`
+   - Store `s3_workspace_prefix = "{workspaceId}/workspace-files/"` on workspace record
+2. Add workspace file endpoints in `routes/workspaces.py`:
+   - `POST /workspaces/{id}/files` — upload files to S3 under workspace prefix
+   - `GET /workspaces/{id}/files/{path}` — download file from S3
+   - `GET /workspaces/{id}/files` — list files in workspace
+   - `DELETE /workspaces/{id}/files/{path}` — delete file from S3
+3. Add `s3_workspace_prefix` field to `WorkspaceDomain`
+4. Workspace deletion (`DELETE /workspaces/{id}`) already cascades artifacts; extend to also delete workspace files under the prefix
+
+### Tests
+
+- Unit: Cloud workspace creation, file upload/download/list/delete (InMemory stores)
+- Service: DynamoDB repo with new field
+- Integration: Full flow with LocalStack (S3 + DynamoDB)
+
+### Definition of Done
+
+- `make check` passes
+- Can create a `cloud` workspace, upload files, list them, download them, delete them
+- Workspace deletion cleans up both artifacts and workspace files
+- `local` and `general` workspace behavior unchanged
+
+---
+
+## Step 5 — ECS Integration (session-service)
 
 **Repo:** `cowork-session-service`
 
@@ -125,7 +192,7 @@ Add ECS client to launch Fargate tasks when creating `cloud_sandbox` sessions.
 
 ---
 
-## Step 4 — Proxy Layer (session-service)
+## Step 6 — Proxy Layer (session-service)
 
 **Repo:** `cowork-session-service`
 
@@ -171,77 +238,6 @@ Add proxy endpoints that forward browser requests to the sandbox container.
 
 ---
 
-## Step 5 — Cloud Workspace Support (workspace-service)
-
-**Repo:** `cowork-workspace-service`
-
-Implement `cloud` workspace scope — S3-backed workspace that sandboxes sync files to/from.
-
-### Work
-
-1. Update `WorkspaceService.create_workspace()`:
-   - `cloud` scope: always creates new workspace (like `general`), sets `workspace_scope = "cloud"`
-   - Store `s3_workspace_prefix = "{workspaceId}/workspace-files/"` on workspace record
-2. Add workspace file endpoints in `routes/workspaces.py`:
-   - `POST /workspaces/{id}/files` — upload files to S3 under workspace prefix
-   - `GET /workspaces/{id}/files/{path}` — download file from S3
-   - `GET /workspaces/{id}/files` — list files in workspace
-   - `DELETE /workspaces/{id}/files/{path}` — delete file from S3
-3. Add `s3_workspace_prefix` field to `WorkspaceDomain`
-4. Workspace deletion (`DELETE /workspaces/{id}`) already cascades artifacts; extend to also delete workspace files under the prefix
-
-### Tests
-
-- Unit: Cloud workspace creation, file upload/download/list/delete (InMemory stores)
-- Service: DynamoDB repo with new field
-- Integration: Full flow with LocalStack (S3 + DynamoDB)
-
-### Definition of Done
-
-- `make check` passes
-- Can create a `cloud` workspace, upload files, list them, download them, delete them
-- Workspace deletion cleans up both artifacts and workspace files
-- `local` and `general` workspace behavior unchanged
-
----
-
-## Step 6 — Idle Timeout and Provisioning Timeout (session-service)
-
-**Repo:** `cowork-session-service`
-
-Add background task for idle timeout enforcement and provisioning timeout cleanup.
-
-### Work
-
-1. Create `services/sandbox_lifecycle.py`:
-   - `SandboxLifecycleManager` — started as a background task on app startup
-   - `check_idle_sessions()` — query active sandbox sessions, check `lastActivityAt` against timeout, verify no running tasks for that session (busy sandbox is never idle), terminate idle ones with conditional DynamoDB update
-   - `check_provisioning_timeouts()` — query `SANDBOX_PROVISIONING` sessions older than 180s (3 min), transition to `SESSION_FAILED`
-   - Both use conditional updates for multi-instance safety
-2. Register lifecycle manager in FastAPI lifespan (start on startup, cancel on shutdown)
-3. Add config: `sandbox_idle_timeout_seconds` (default 1800), `sandbox_max_duration_seconds` (default 14400), `sandbox_provision_timeout_seconds` (default 180), `sandbox_lifecycle_check_interval_seconds` (default 300)
-4. Max duration enforcement: check `created_at + maxDuration < now` for active sandbox sessions
-
-### Tests
-
-- Unit: Idle timeout detection — session idle with no running task → terminated
-- Unit: Idle timeout skip — session idle but task still running → not terminated
-- Unit: Provisioning timeout detection (>180s → SESSION_FAILED)
-- Unit: Max duration enforcement
-- Unit: Conditional update conflict handling (simulated concurrent instance)
-- Unit: Lifecycle manager start/stop lifecycle
-
-### Definition of Done
-
-- `make check` passes
-- Idle sessions (no running task + no user activity) are terminated after configured timeout
-- Sessions with active tasks are never terminated by idle check, even if user is away
-- Stuck provisioning sessions are cleaned up after 180s
-- Max duration sessions are terminated
-- Multiple lifecycle managers running concurrently don't cause errors (conditional updates)
-
----
-
 ## Step 7 — Agent Runtime Sandbox Mode (agent-runtime)
 
 **Repo:** `cowork-agent-runtime`
@@ -284,32 +280,40 @@ Wire the sandbox startup flow: read session ID from env, self-register with Sess
 
 ---
 
-## Step 8 — Platform Contracts (cowork-platform)
+## Step 8 — Idle Timeout and Provisioning Timeout (session-service)
 
-**Repo:** `cowork-platform`
+**Repo:** `cowork-session-service`
 
-Add schemas and SDK helpers for web execution.
+Add background task for idle timeout enforcement and provisioning timeout cleanup.
 
 ### Work
 
-1. Add new event types to event schema: `SANDBOX_PROVISIONING`, `SANDBOX_READY`, `SANDBOX_TERMINATED`
-2. Add `SandboxRegistrationRequest` and `SandboxRegistrationResponse` schemas
-3. Add `ProxyErrorResponse` schema (sandbox_unreachable, session_not_active, etc.)
-4. Extend `SessionResponse` schema with sandbox-specific fields (`sandboxEndpoint`, `taskArn`, `networkAccess`, `lastActivityAt`)
-5. Extend `CreateSessionRequest` with `networkAccess` field
-6. Add `WorkspaceFileUpload` and `WorkspaceFileList` schemas
-7. Run codegen: generate Python (Pydantic) and TypeScript bindings
+1. Create `services/sandbox_lifecycle.py`:
+   - `SandboxLifecycleManager` — started as a background task on app startup
+   - `check_idle_sessions()` — query active sandbox sessions, check `lastActivityAt` against timeout, verify no running tasks for that session (busy sandbox is never idle), terminate idle ones with conditional DynamoDB update
+   - `check_provisioning_timeouts()` — query `SANDBOX_PROVISIONING` sessions older than 180s (3 min), transition to `SESSION_FAILED`
+   - Both use conditional updates for multi-instance safety
+2. Register lifecycle manager in FastAPI lifespan (start on startup, cancel on shutdown)
+3. Add config: `sandbox_idle_timeout_seconds` (default 1800), `sandbox_max_duration_seconds` (default 14400), `sandbox_provision_timeout_seconds` (default 180), `sandbox_lifecycle_check_interval_seconds` (default 300)
+4. Max duration enforcement: check `created_at + maxDuration < now` for active sandbox sessions
 
 ### Tests
 
-- Schema validation tests for all new schemas
-- Codegen output matches expected types
+- Unit: Idle timeout detection — session idle with no running task → terminated
+- Unit: Idle timeout skip — session idle but task still running → not terminated
+- Unit: Provisioning timeout detection (>180s → SESSION_FAILED)
+- Unit: Max duration enforcement
+- Unit: Conditional update conflict handling (simulated concurrent instance)
+- Unit: Lifecycle manager start/stop lifecycle
 
 ### Definition of Done
 
-- `make check` passes on cowork-platform
-- Python and TypeScript bindings generated and importable
-- All downstream repos can import the new types
+- `make check` passes
+- Idle sessions (no running task + no user activity) are terminated after configured timeout
+- Sessions with active tasks are never terminated by idle check, even if user is away
+- Stuck provisioning sessions are cleaned up after 180s
+- Max duration sessions are terminated
+- Multiple lifecycle managers running concurrently don't cause errors (conditional updates)
 
 ---
 
@@ -461,8 +465,6 @@ Add Dockerfile for agent-runtime and CI pipeline for sandbox builds.
 
 ---
 
----
-
 # Phase 3b — Optimization
 
 Prerequisite: Phase 3a complete and deployed.
@@ -585,8 +587,6 @@ Allow users to resume work from a terminated sandbox by restoring the workspace 
 
 ---
 
----
-
 # Phase 3c — Scale
 
 Prerequisite: Phase 3b complete and deployed.
@@ -648,7 +648,7 @@ Move idle timeout and provisioning timeout checks from in-process background tas
 ### Work
 
 1. Create Lambda function (`sandbox-lifecycle-checker`):
-   - Same logic as `SandboxLifecycleManager` from Step 6
+   - Same logic as `SandboxLifecycleManager` from Step 8
    - Query idle sessions, check for running tasks, terminate idle ones
    - Check provisioning timeouts, max duration
    - No conditional updates needed (single execution per interval)
@@ -659,7 +659,7 @@ Move idle timeout and provisioning timeout checks from in-process background tas
 
 ### Tests
 
-- Unit: Lambda handler with mocked DynamoDB/ECS (same tests as Step 6, adapted)
+- Unit: Lambda handler with mocked DynamoDB/ECS (same tests as Step 8, adapted)
 - Integration: EventBridge triggers Lambda, Lambda terminates idle session
 
 ### Definition of Done
@@ -704,8 +704,6 @@ Scale warm pool size based on usage patterns instead of fixed target.
 - Warm pool scales down during low usage (cost savings)
 - Time-based schedules work for predictable patterns
 - CloudWatch dashboard shows pool metrics
-
----
 
 ---
 
@@ -870,14 +868,14 @@ Allow multiple sessions to share a workspace — enabling iterative work across 
 
 ```
 Phase 3a (MVP):
-  Step 8 (Contracts) ─────────────────────────────────────────┐
-  Step 1 (HttpTransport) ──→ Step 7 (Sandbox Mode) ──┐       │
-  Step 2 (Registration) ──→ Step 3 (ECS) ──→ Step 4 (Proxy) ─┤
-  Step 5 (Cloud Workspace) ────────────────────────────────────┤
-  Step 6 (Idle Timeout) ──────────────────────────────────────┤
-                                                               ↓
+  Step 1 (Contracts) ──────────────────────────────────────────┐
+  Step 2 (HttpTransport) ──→ Step 7 (Sandbox Mode) ──┐        │
+  Step 3 (Registration) ──→ Step 5 (ECS) ──→ Step 6 (Proxy) ──┤
+  Step 4 (Cloud Workspace) ─────────────────────────────────────┤
+  Step 8 (Idle Timeout) ───────────────────────────────────────┤
+                                                                ↓
   Step 9 (E2E Integration) ──→ Step 10 (Web App) ──→ Step 12 (Docker/CI)
-  Step 11 (Terraform) ─────────────────────────────→ Step 12
+  Step 11 (Terraform) ──────────────────────────────→ Step 12
 
 Phase 3b (Optimization) — depends on Phase 3a:
   Step 13 (Warm Pool)
@@ -897,54 +895,3 @@ Phase 3e (Advanced) — depends on Phase 3d:
   Step 21 (GPU Sandbox)
   Step 22 (Shared Workspace)
 ```
-
----
-
-## Implementation Order (Recommended)
-
-### Phase 3a — MVP
-
-| Order | Step | Repo | Rationale |
-|-------|------|------|-----------|
-| 1 | Step 8 — Contracts | cowork-platform | Unblocks all repos — types needed everywhere |
-| 2 | Step 1 — HttpTransport | cowork-agent-runtime | Core transport layer, most complex new code |
-| 3 | Step 2 — Registration | cowork-session-service | Foundation for all sandbox lifecycle |
-| 4 | Step 5 — Cloud Workspace | cowork-workspace-service | Independent, needed for file flows |
-| 5 | Step 3 — ECS Integration | cowork-session-service | Builds on registration |
-| 6 | Step 4 — Proxy Layer | cowork-session-service | Builds on ECS integration |
-| 7 | Step 7 — Sandbox Mode | cowork-agent-runtime | Builds on HttpTransport + registration |
-| 8 | Step 6 — Idle Timeout | cowork-session-service | Builds on ECS integration |
-| 9 | Step 9 — E2E Integration | all | Validates everything works together |
-| 10 | Step 10 — Web App | cowork-web-app | Can start earlier, but full testing needs Steps 1–7 |
-| 11 | Step 11 — Terraform | cowork-infra | Can start any time, needed for deploy |
-| 12 | Step 12 — Docker/CI | agent-runtime, infra | Final step before deploy |
-
-### Phase 3b — Optimization
-
-| Order | Step | Repo | Rationale |
-|-------|------|------|-----------|
-| 13 | Step 13 — Warm Pool | session-service, infra | Biggest UX improvement (instant start) |
-| 14 | Step 14 — Connection Draining | session-service, agent-runtime | Fixes shutdown UX |
-| 15 | Step 15 — Snapshot/Restore | workspace-service, session-service, web-app | Key feature: resume terminated sessions |
-
-### Phase 3c — Scale
-
-| Order | Step | Repo | Rationale |
-|-------|------|------|-----------|
-| 16 | Step 16 — OIDC Auth | session-service, web-app | Required for multi-tenant production |
-| 17 | Step 17 — EventBridge Lifecycle | session-service, infra | Operational reliability at scale |
-| 18 | Step 18 — Auto-Scaling Warm Pool | session-service, infra | Cost optimization (depends on Step 13) |
-
-### Phase 3d — Polish
-
-| Order | Step | Repo | Rationale |
-|-------|------|------|-----------|
-| 19 | Step 19 — Enhanced File Management | cowork-web-app | Web app polish |
-| 20 | Step 20 — Virus Scanning | workspace-service, infra | Security hardening |
-
-### Phase 3e — Advanced
-
-| Order | Step | Repo | Rationale |
-|-------|------|------|-----------|
-| 21 | Step 21 — GPU Sandbox | infra, session-service | ML workload support |
-| 22 | Step 22 — Shared Workspace | workspace-service, session-service, web-app | Collaboration feature |
