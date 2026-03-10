@@ -30,9 +30,9 @@ cd /path/to/cowork
 docker-compose up -d
 
 # 2. Start backend services (each in a separate terminal)
-cd cowork-session-service && make run     # http://localhost:8001
+cd cowork-session-service && make run     # http://localhost:8000
 cd cowork-workspace-service && make run   # http://localhost:8002
-cd cowork-policy-service && make run      # http://localhost:8004
+cd cowork-policy-service && make run      # http://localhost:8001
 
 # 3. Start agent runtime in HTTP/sandbox mode (simulates a sandbox container)
 cd cowork-agent-runtime && make run-sandbox   # http://localhost:8080
@@ -46,7 +46,7 @@ cd cowork-web-app && make dev             # http://localhost:5173
 **Key env vars for local development:**
 - `AWS_ENDPOINT_URL=http://localhost:4566` — all services use LocalStack
 - `ENVIRONMENT=dev` — table/bucket names prefixed with `dev-`
-- `SESSION_SERVICE_URL=http://localhost:8001` — agent runtime → session service
+- `SESSION_SERVICE_URL=http://localhost:8000` — agent runtime → session service
 - `WORKSPACE_SERVICE_URL=http://localhost:8002` — agent runtime → workspace service
 - `SANDBOX_LOCAL_MODE=true` — skips ECS metadata lookup, uses localhost for self-registration
 - `SANDBOX_ENDPOINT=http://localhost:8080` — session service proxy target (local override, skips DynamoDB lookup)
@@ -298,7 +298,7 @@ Add proxy endpoints that forward browser requests to the sandbox container.
 - **Wiring check**: Verify proxy forwards all headers correctly (Last-Event-ID, Content-Type, Authorization). Verify SSE proxy streams events byte-for-byte without corruption. Verify error responses from sandbox are translated to proxy error responses matching platform contract types. Test with real HttpTransport from Step 2 running in a subprocess
 - **Self-review**: Review for connection leak risks (SSE proxy must close upstream on client disconnect), missing timeouts on proxy connections, missing structured logging for proxy errors, ensure cache invalidation on session status changes, verify 403/404/409/503 error paths all return structured responses
 - **Logical bug review**: Verify SSE proxy doesn't buffer entire response before forwarding (must stream chunk-by-chunk). Verify `lastActivityAt` batching timer resets correctly (not using wall clock that drifts). Verify cache TTL is per-session (not global — stale entry for session A shouldn't affect session B). Verify proxy doesn't forward internal sandbox errors (500s from sandbox should be wrapped in proxy error response, not passed through raw). Verify endpoint cache is invalidated when session status changes to terminated (don't proxy to dead sandbox)
-- **Local run**: Run session-service with `SANDBOX_ENDPOINT=http://localhost:8080` to bypass DynamoDB sandbox endpoint lookup. Run agent-runtime in HTTP mode on port 8080. Test full proxy flow: `curl http://localhost:8001/sessions/{id}/rpc` → verify it reaches agent-runtime. Test SSE: `curl http://localhost:8001/sessions/{id}/events` → verify events stream through
+- **Local run**: Run session-service with `SANDBOX_ENDPOINT=http://localhost:8080` to bypass DynamoDB sandbox endpoint lookup. Run agent-runtime in HTTP mode on port 8080. Test full proxy flow: `curl http://localhost:8000/sessions/{id}/rpc` → verify it reaches agent-runtime. Test SSE: `curl http://localhost:8000/sessions/{id}/events` → verify events stream through
 
 ---
 
@@ -344,7 +344,7 @@ Wire the sandbox startup flow: read session ID from env, self-register with Sess
 - **Wiring check**: Verify registration request matches Step 3's endpoint contract exactly (field names, types, auth). Verify workspace sync calls match Step 4's file upload/download API. Verify session token from registration response is used for all subsequent backend calls. Test full startup → register → serve → shutdown sequence against a real Session Service instance
 - **Self-review**: Review for missing error handling on registration failure (retry? fail fast?), missing cleanup if workspace sync fails on startup, ensure SIGTERM handler doesn't race with in-flight requests, verify ECS metadata endpoint parsing handles all edge cases
 - **Logical bug review**: Verify workspace sync downloads files BEFORE marking sandbox as ready (don't serve requests with empty workspace). Verify SIGTERM handler waits for workspace sync to complete before exiting (data loss risk). Verify registration retry has a max attempt limit (don't retry forever if session-service is down). Verify `SANDBOX_LOCAL_MODE` code path is tested — local mode must skip ECS metadata but still register with session-service. Verify file sync handles empty workspace (no files to sync — should not error)
-- **Local run**: Add `make run-sandbox` target to agent-runtime Makefile: `SANDBOX_LOCAL_MODE=true SESSION_ID=test-session-123 SESSION_SERVICE_URL=http://localhost:8001 WORKSPACE_SERVICE_URL=http://localhost:8002 python -m agent_host.main --transport http`. Verify: starts up, registers with local session-service, serves `/health`, accepts JSON-RPC on `/rpc`, streams events on `/events`
+- **Local run**: Add `make run-sandbox` target to agent-runtime Makefile: `SANDBOX_LOCAL_MODE=true SESSION_ID=test-session-123 SESSION_SERVICE_URL=http://localhost:8000 WORKSPACE_SERVICE_URL=http://localhost:8002 python -m agent_host.main --transport http`. Verify: starts up, registers with local session-service, serves `/health`, accepts JSON-RPC on `/rpc`, streams events on `/events`
 
 ---
 
@@ -471,7 +471,7 @@ Set up the repo and build the core web UI.
 - **Wiring check**: Verify SSE event types match what HttpTransport emits (Step 2). Verify JSON-RPC method names and params match agent-runtime handlers. Verify API client URLs and request/response shapes match session-service proxy endpoints (Step 6). Verify auth header format matches session-service expectations
 - **Self-review**: Review for missing error states in UI (sandbox provisioning failure, proxy 503, SSE disconnect without reconnect), ensure all API errors are shown to user with actionable messages, check for memory leaks in SSE client (event listener cleanup), verify Zustand stores handle all state transitions correctly
 - **Logical bug review**: Verify SSE client doesn't accumulate event listeners on reconnect (must remove old listener before adding new). Verify provisioning poll stops when component unmounts (memory leak / state update on unmounted component). Verify conversation store handles out-of-order events (SSE replay may deliver events the store already has). Verify session list doesn't show terminated sessions as active after page refresh. Verify file upload progress tracking handles network errors (don't show stuck progress bar)
-- **Local run**: `make dev` starts Vite dev server on `localhost:5173`. Configure `.env.development` with `VITE_SESSION_SERVICE_URL=http://localhost:8001`. Full local flow: create session in web UI → see provisioning → conversation loads → send task → see streaming response. Add instructions to `cowork-web-app/README.md` for local development setup
+- **Local run**: `make dev` starts Vite dev server on `localhost:5173`. Configure `.env.development` with `VITE_SESSION_SERVICE_URL=http://localhost:8000`. Full local flow: create session in web UI → see provisioning → conversation loads → send task → see streaming response. Add instructions to `cowork-web-app/README.md` for local development setup
 
 ---
 
