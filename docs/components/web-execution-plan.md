@@ -585,71 +585,6 @@ Allow users to resume work from a terminated sandbox by restoring the workspace 
 
 ---
 
-## Step 16 — Enhanced File Management (web-app)
-
-**Repo:** `cowork-web-app`
-
-Improve the file browser from basic list to a full workspace explorer.
-
-### Work
-
-1. Tree view: hierarchical directory display with expand/collapse
-2. Inline file viewer: syntax-highlighted code viewer for common languages
-3. Inline editor: Monaco-based editor for quick edits (saves back to sandbox)
-4. Drag-and-drop upload: drop files/folders onto file browser
-5. Multi-file download: select multiple files → download as zip
-6. File change indicators: show which files were modified by the agent (from `file_diff` artifacts)
-
-### Tests
-
-- Component: Tree view rendering with nested directories
-- Component: File viewer with syntax highlighting
-- Component: Editor save round-trip (edit → save → verify)
-- Unit: Change indicator logic from artifact data
-
-### Definition of Done
-
-- `make check` passes
-- File browser shows full directory tree
-- Can view and edit files inline
-- Drag-and-drop upload works
-- Modified files are visually indicated
-
----
-
-## Step 17 — Virus Scanning for Uploads (workspace-service, infra)
-
-**Repos:** `cowork-workspace-service`, `cowork-infra`
-
-Scan uploaded files for malware before they enter the sandbox workspace.
-
-### Work
-
-1. Integrate ClamAV (or AWS-native solution like S3 Object Lambda + ClamAV layer):
-   - S3 event notification on upload to `workspace-files/` prefix
-   - Lambda function scans the file with ClamAV
-   - Tag clean files as `scan-status: clean`, infected files as `scan-status: infected`
-2. Workspace Service:
-   - After upload, check scan status before making file available to sandbox
-   - If infected, delete file and return `400` with `file_infected` error
-   - If scan pending (async), return `202 Accepted` with scan status polling endpoint
-3. Terraform:
-   - Lambda function with ClamAV layer
-   - S3 event notification configuration
-   - IAM roles for Lambda → S3 access
-
-### Tests
-
-- Unit: Scan result handling (clean, infected, pending)
-- Integration: Upload file → verify scan triggered → verify clean file accessible
-
-### Definition of Done
-
-- Uploaded files are scanned before sandbox can access them
-- Infected files are rejected with clear error message
-- Clean files are available within seconds of upload
-- Scan infrastructure deployed via Terraform
-
 ---
 
 # Phase 3c — Scale
@@ -658,7 +593,7 @@ Prerequisite: Phase 3b complete and deployed.
 
 ---
 
-## Step 18 — OIDC Authentication (session-service, web-app)
+## Step 16 — OIDC Authentication (session-service, web-app)
 
 **Repos:** `cowork-session-service`, `cowork-web-app`
 
@@ -704,7 +639,7 @@ Replace simple auth with OIDC for production multi-tenant use.
 
 ---
 
-## Step 19 — EventBridge Lifecycle Manager (session-service, infra)
+## Step 17 — EventBridge Lifecycle Manager (session-service, infra)
 
 **Repos:** `cowork-session-service`, `cowork-infra`
 
@@ -736,7 +671,7 @@ Move idle timeout and provisioning timeout checks from in-process background tas
 
 ---
 
-## Step 20 — Auto-Scaling Warm Pool (session-service, infra)
+## Step 18 — Auto-Scaling Warm Pool (session-service, infra)
 
 **Repos:** `cowork-session-service`, `cowork-infra`
 
@@ -772,42 +707,88 @@ Scale warm pool size based on usage patterns instead of fixed target.
 
 ---
 
-## Step 21 — Regional Sandbox Deployment (infra, session-service)
+---
 
-**Repos:** `cowork-infra`, `cowork-session-service`
+# Phase 3d — Polish
 
-Deploy sandbox infrastructure in multiple AWS regions and route users to the closest one.
-
-### Work
-
-1. Terraform:
-   - Parameterize sandbox module for multi-region deployment
-   - Deploy ECS cluster, task definition, security groups, warm pool in each region
-   - Cross-region S3 replication for workspace artifacts (or use regional buckets)
-2. Session Service:
-   - Accept `preferredRegion` in session creation (optional, auto-detected from client IP)
-   - Region selection logic: preferred region → closest region with capacity → fallback to primary
-   - Store `sandboxRegion` on session record
-   - Proxy routes to region-specific sandbox endpoint
-3. DNS/routing:
-   - Route 53 latency-based routing for Session Service endpoints (or CloudFront)
-   - Regional ALB endpoints
-
-### Tests
-
-- Unit: Region selection logic (preferred, closest, fallback)
-- Integration: Create session in non-primary region, verify sandbox runs there
-
-### Definition of Done
-
-- Sandbox infrastructure deployed in 2+ regions
-- Sessions are created in the region closest to the user
-- Cross-region workspace access works
-- Failover to another region when primary is unavailable
+Prerequisite: Phase 3c complete and deployed.
 
 ---
 
-## Step 22 — GPU-Enabled Sandbox (infra, session-service)
+## Step 19 — Enhanced File Management (web-app)
+
+**Repo:** `cowork-web-app`
+
+Improve the file browser from basic list to a full workspace explorer.
+
+### Work
+
+1. Tree view: hierarchical directory display with expand/collapse
+2. Inline file viewer: syntax-highlighted code viewer for common languages
+3. Inline editor: Monaco-based editor for quick edits (saves back to sandbox)
+4. Drag-and-drop upload: drop files/folders onto file browser
+5. Multi-file download: select multiple files → download as zip
+6. File change indicators: show which files were modified by the agent (from `file_diff` artifacts)
+
+### Tests
+
+- Component: Tree view rendering with nested directories
+- Component: File viewer with syntax highlighting
+- Component: Editor save round-trip (edit → save → verify)
+- Unit: Change indicator logic from artifact data
+
+### Definition of Done
+
+- `make check` passes
+- File browser shows full directory tree
+- Can view and edit files inline
+- Drag-and-drop upload works
+- Modified files are visually indicated
+
+---
+
+## Step 20 — Virus Scanning for Uploads (workspace-service, infra)
+
+**Repos:** `cowork-workspace-service`, `cowork-infra`
+
+Scan uploaded files for malware before they enter the sandbox workspace.
+
+### Work
+
+1. Integrate ClamAV (or AWS-native solution like S3 Object Lambda + ClamAV layer):
+   - S3 event notification on upload to `workspace-files/` prefix
+   - Lambda function scans the file with ClamAV
+   - Tag clean files as `scan-status: clean`, infected files as `scan-status: infected`
+2. Workspace Service:
+   - After upload, check scan status before making file available to sandbox
+   - If infected, delete file and return `400` with `file_infected` error
+   - If scan pending (async), return `202 Accepted` with scan status polling endpoint
+3. Terraform:
+   - Lambda function with ClamAV layer
+   - S3 event notification configuration
+   - IAM roles for Lambda → S3 access
+
+### Tests
+
+- Unit: Scan result handling (clean, infected, pending)
+- Integration: Upload file → verify scan triggered → verify clean file accessible
+
+### Definition of Done
+
+- Uploaded files are scanned before sandbox can access them
+- Infected files are rejected with clear error message
+- Clean files are available within seconds of upload
+- Scan infrastructure deployed via Terraform
+
+---
+
+# Phase 3e — Advanced
+
+Prerequisite: Phase 3d complete and deployed.
+
+---
+
+## Step 21 — GPU-Enabled Sandbox (infra, session-service)
 
 **Repos:** `cowork-infra`, `cowork-session-service`
 
@@ -845,7 +826,7 @@ Support GPU instances for ML workloads (model training, data processing).
 
 ---
 
-## Step 23 — Shared Workspace Across Sessions (workspace-service, session-service, web-app)
+## Step 22 — Shared Workspace Across Sessions (workspace-service, session-service, web-app)
 
 **Repos:** `cowork-workspace-service`, `cowork-session-service`, `cowork-web-app`
 
@@ -898,20 +879,23 @@ Phase 3a (MVP):
   Step 9 (E2E Integration) ──→ Step 10 (Web App) ──→ Step 12 (Docker/CI)
   Step 11 (Terraform) ─────────────────────────────→ Step 12
 
-Phase 3b (Optimization) — all depend on Phase 3a complete:
+Phase 3b (Optimization) — depends on Phase 3a:
   Step 13 (Warm Pool)
   Step 14 (Connection Draining)
   Step 15 (Snapshot/Restore)
-  Step 16 (Enhanced File Management)
-  Step 17 (Virus Scanning)
 
-Phase 3c (Scale) — all depend on Phase 3b complete:
-  Step 18 (OIDC Auth)
-  Step 19 (EventBridge Lifecycle)
-  Step 20 (Auto-Scaling Warm Pool) — depends on Step 13
-  Step 21 (Regional Deployment)
-  Step 22 (GPU Sandbox)
-  Step 23 (Shared Workspace)
+Phase 3c (Scale) — depends on Phase 3b:
+  Step 16 (OIDC Auth)
+  Step 17 (EventBridge Lifecycle)
+  Step 18 (Auto-Scaling Warm Pool) — depends on Step 13
+
+Phase 3d (Polish) — depends on Phase 3c:
+  Step 19 (Enhanced File Management)
+  Step 20 (Virus Scanning)
+
+Phase 3e (Advanced) — depends on Phase 3d:
+  Step 21 (GPU Sandbox)
+  Step 22 (Shared Workspace)
 ```
 
 ---
@@ -942,16 +926,25 @@ Phase 3c (Scale) — all depend on Phase 3b complete:
 | 13 | Step 13 — Warm Pool | session-service, infra | Biggest UX improvement (instant start) |
 | 14 | Step 14 — Connection Draining | session-service, agent-runtime | Fixes shutdown UX |
 | 15 | Step 15 — Snapshot/Restore | workspace-service, session-service, web-app | Key feature: resume terminated sessions |
-| 16 | Step 16 — Enhanced File Management | cowork-web-app | Web app polish |
-| 17 | Step 17 — Virus Scanning | workspace-service, infra | Security hardening |
 
 ### Phase 3c — Scale
 
 | Order | Step | Repo | Rationale |
 |-------|------|------|-----------|
-| 18 | Step 18 — OIDC Auth | session-service, web-app | Required for multi-tenant production |
-| 19 | Step 19 — EventBridge Lifecycle | session-service, infra | Operational reliability at scale |
-| 20 | Step 20 — Auto-Scaling Warm Pool | session-service, infra | Cost optimization (depends on Step 13) |
-| 21 | Step 21 — Regional Deployment | infra, session-service | Latency optimization |
-| 22 | Step 22 — GPU Sandbox | infra, session-service | ML workload support |
-| 23 | Step 23 — Shared Workspace | workspace-service, session-service, web-app | Collaboration feature |
+| 16 | Step 16 — OIDC Auth | session-service, web-app | Required for multi-tenant production |
+| 17 | Step 17 — EventBridge Lifecycle | session-service, infra | Operational reliability at scale |
+| 18 | Step 18 — Auto-Scaling Warm Pool | session-service, infra | Cost optimization (depends on Step 13) |
+
+### Phase 3d — Polish
+
+| Order | Step | Repo | Rationale |
+|-------|------|------|-----------|
+| 19 | Step 19 — Enhanced File Management | cowork-web-app | Web app polish |
+| 20 | Step 20 — Virus Scanning | workspace-service, infra | Security hardening |
+
+### Phase 3e — Advanced
+
+| Order | Step | Repo | Rationale |
+|-------|------|------|-----------|
+| 21 | Step 21 — GPU Sandbox | infra, session-service | ML workload support |
+| 22 | Step 22 — Shared Workspace | workspace-service, session-service, web-app | Collaboration feature |
