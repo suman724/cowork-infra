@@ -768,35 +768,53 @@ Replace simple auth with OIDC for production multi-tenant use.
 
 **Repos:** `cowork-session-service`, `cowork-infra`
 
-Move idle timeout and provisioning timeout checks from in-process background tasks to EventBridge + Lambda for single-execution reliability at scale.
+Move idle timeout and provisioning timeout checks from in-process background tasks to EventBridge + Lambda for single-execution reliability at scale. The Lambda code lives in `cowork-session-service` alongside the existing lifecycle logic — same codebase, one set of tests, no drift.
 
 ### Work
 
-1. Create Lambda function (`sandbox-lifecycle-checker`):
-   - Same logic as `SandboxLifecycleManager` from Step 8
-   - Query idle sessions, check for running tasks, terminate idle ones
-   - Check provisioning timeouts, max duration
-   - No conditional updates needed (single execution per interval)
-2. EventBridge rule: trigger Lambda every 5 minutes
-3. Remove background task from Session Service (feature flag to switch between in-process and Lambda)
-4. Lambda shares the same DynamoDB/ECS client code as Session Service (extract to shared module or Lambda reads service config)
-5. Terraform: Lambda function, EventBridge rule, IAM roles, CloudWatch alarm on Lambda errors
+1. Refactor `services/sandbox_lifecycle.py` in session-service:
+   - Extract core lifecycle logic into a pure function: `check_and_terminate_idle_sessions(session_repo, task_repo, launcher, config) → list[TerminationResult]`
+   - Keep `SandboxLifecycleManager` (background task) as a thin wrapper that calls the core function on a timer
+   - Core function has no dependency on FastAPI, asyncio event loops, or app state — just repos and config
+2. Create `lambda_handler/` directory in session-service:
+   - `lambda_handler/__init__.py`
+   - `lambda_handler/lifecycle.py` — Lambda entry point:
+     - Instantiates DynamoDB repos and `EcsSandboxLauncher` from environment variables
+     - Calls the same `check_and_terminate_idle_sessions()` core function
+     - Returns structured result (sessions checked, terminated, errors)
+   - `lambda_handler/requirements.txt` — subset of session-service dependencies (no FastAPI/uvicorn)
+3. Add `make build-lambda` target to session-service Makefile:
+   - Builds a Lambda deployment zip from `lambda_handler/` + shared modules (`services/`, `repositories/`, `clients/`)
+   - Excludes FastAPI, uvicorn, test dependencies
+4. Add feature flag: `SANDBOX_LIFECYCLE_MODE` = `in_process` (default) | `lambda`
+   - `in_process`: existing background task runs (Phase 3a behavior)
+   - `lambda`: background task is disabled, EventBridge invokes Lambda
+5. Terraform (`cowork-infra`):
+   - Lambda function definition (runtime Python 3.12, handler `lambda_handler.lifecycle.handler`)
+   - EventBridge rule: trigger every 5 minutes
+   - IAM role: DynamoDB read/write (`dev-sessions`, `dev-tasks`), ECS StopTask, CloudWatch Logs
+   - S3 bucket for Lambda deployment artifact (or inline zip for small packages)
+   - CloudWatch alarm on Lambda errors
 
 ### Tests
 
-- Unit: Lambda handler with mocked DynamoDB/ECS (same tests as Step 8, adapted)
-- Integration: EventBridge triggers Lambda, Lambda terminates idle session
+- Unit: Core lifecycle function with mocked repos and launcher (same tests as Step 8, but calling the extracted function directly)
+- Unit: Lambda handler — verify it instantiates repos correctly from env vars and calls core function
+- Unit: `make build-lambda` produces a valid zip with all required modules
+- Integration: Lambda handler invoked locally against LocalStack DynamoDB — verify it terminates idle sessions
 
 ### Definition of Done
 
-- EventBridge rule triggers Lambda on schedule
-- Lambda correctly identifies and terminates idle/timed-out sessions
-- Session Service background task can be disabled via config
+- `make check` passes on session-service (all existing + new tests)
+- `make build-lambda` produces a deployable zip
+- Lambda handler and in-process background task produce identical behavior (same core function)
+- EventBridge rule triggers Lambda on schedule (verified in staging)
+- Session Service background task can be disabled via `SANDBOX_LIFECYCLE_MODE=lambda`
 - CloudWatch metrics on Lambda invocations and errors
-- **Wiring check**: Verify Lambda uses same DynamoDB table names, GSIs, and conditional update expressions as Step 8's in-process lifecycle manager. Verify Lambda calls same ECS StopTask API as Step 5's sandbox service. Verify feature flag correctly switches between Lambda and in-process mode without gaps in coverage
-- **Self-review**: Review for Lambda timeout configuration (must be long enough to process all idle sessions), ensure Lambda has correct IAM permissions for DynamoDB + ECS, verify error handling doesn't cause Lambda to retry on partial failures (use dead letter queue)
-- **Logical bug review**: Verify Lambda processes all sessions in a single invocation (paginate DynamoDB scan, don't stop at first page). Verify Lambda doesn't terminate sessions that were just created (race between creation and lifecycle check — check `createdAt` grace period). Verify feature flag transition doesn't create a gap (both Lambda and in-process running for a brief overlap is better than neither running)
-- **Local run**: Lambda logic is extracted to a shared module — test it locally as a regular Python function against LocalStack DynamoDB. No actual Lambda invocation needed for local testing
+- **Wiring check**: Verify Lambda imports the same repository classes and launcher as session-service (no copy-paste). Verify Lambda env vars match Terraform configuration (table names, cluster name). Verify feature flag transition doesn't create a gap (both Lambda and in-process running for a brief overlap is better than neither running). Verify Lambda deployment zip includes all transitive dependencies
+- **Self-review**: Review for Lambda timeout configuration (must be long enough to process all idle sessions), ensure Lambda has correct IAM permissions for DynamoDB + ECS, verify error handling doesn't cause Lambda to retry on partial failures (use dead letter queue). Verify `make build-lambda` doesn't accidentally include test files or dev dependencies
+- **Logical bug review**: Verify Lambda processes all sessions in a single invocation (paginate DynamoDB scan, don't stop at first page). Verify Lambda doesn't terminate sessions that were just created (race between creation and lifecycle check — check `createdAt` grace period). Verify feature flag transition doesn't create a gap (both Lambda and in-process running for a brief overlap is better than neither running). Verify the extracted core function doesn't hold references to async event loops or FastAPI app state (must be callable from sync Lambda context)
+- **Local run**: Invoke the Lambda handler locally: `python -c "from lambda_handler.lifecycle import handler; handler({}, None)"` with `AWS_ENDPOINT_URL=http://localhost:4566`. Verify it queries LocalStack DynamoDB and processes sessions. No actual Lambda deployment needed for local testing
 
 ---
 
