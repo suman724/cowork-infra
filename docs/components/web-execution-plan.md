@@ -34,10 +34,14 @@ cd cowork-session-service && make run     # http://localhost:8000
 cd cowork-workspace-service && make run   # http://localhost:8002
 cd cowork-policy-service && make run      # http://localhost:8001
 
-# 3. Start agent runtime in HTTP/sandbox mode (simulates a sandbox container)
+# 3. Agent runtime sandbox — started AUTOMATICALLY by session-service
+# When SANDBOX_LAUNCHER_TYPE=local, session-service spawns agent-runtime
+# as a subprocess on a random port when you create a cloud_sandbox session.
+# No manual start needed! The subprocess self-registers and session transitions
+# to SANDBOX_READY automatically.
+#
+# To start manually (for debugging):
 cd cowork-agent-runtime && make run-sandbox   # http://localhost:8080
-# This starts with --transport http and reads SESSION_ID from env
-# For local dev, it skips ECS metadata lookup and uses localhost for registration
 
 # 4. Start web app
 cd cowork-web-app && make dev             # http://localhost:5173
@@ -48,8 +52,9 @@ cd cowork-web-app && make dev             # http://localhost:5173
 - `ENVIRONMENT=dev` — table/bucket names prefixed with `dev-`
 - `SESSION_SERVICE_URL=http://localhost:8000` — agent runtime → session service
 - `WORKSPACE_SERVICE_URL=http://localhost:8002` — agent runtime → workspace service
-- `SANDBOX_LOCAL_MODE=true` — skips ECS metadata lookup, uses localhost for self-registration
-- `SANDBOX_ENDPOINT=http://localhost:8080` — session service proxy target (local override, skips DynamoDB lookup)
+- `SANDBOX_LAUNCHER_TYPE=local` — session-service spawns agent-runtime as subprocess instead of ECS RunTask
+- `AGENT_RUNTIME_PATH=../cowork-agent-runtime` — path to agent-runtime repo (used by LocalSandboxLauncher)
+- `SANDBOX_LOCAL_MODE=true` — agent-runtime skips ECS metadata lookup, uses localhost for self-registration
 
 **docker-compose.yml** already provides LocalStack with DynamoDB + S3. The `scripts/localstack-init.sh` script creates all tables and buckets on startup. When new tables, GSIs, or buckets are added in any step, `localstack-init.sh` must be updated in the same step.
 
@@ -212,43 +217,59 @@ Implement `cloud` workspace scope — S3-backed workspace that sandboxes sync fi
 
 ---
 
-## Step 5 — ECS Integration (session-service)
+## Step 5 — Sandbox Launcher and ECS Integration (session-service)
 
 **Repo:** `cowork-session-service`
 
-Add ECS client to launch Fargate tasks when creating `cloud_sandbox` sessions.
+Add a `SandboxLauncher` abstraction to launch sandbox containers. Two implementations: `EcsSandboxLauncher` for production (ECS Fargate) and `LocalSandboxLauncher` for local development (spawns agent-runtime as a subprocess). This lets us test the full provisioning lifecycle locally without ECS.
 
 ### Work
 
-1. Create `clients/ecs_client.py`:
-   - `run_task(session_id, config) → task_arn` — calls ECS `RunTask` with session-specific overrides (env vars, security group)
-   - `stop_task(task_arn)` — calls ECS `StopTask`
+1. Create `services/sandbox_launcher.py` — `SandboxLauncher` protocol:
+   - `launch(session_id, config) → LaunchResult(task_id, endpoint_hint)` — start a sandbox
+   - `stop(task_id)` — stop a sandbox
+   - `is_healthy(task_id) → bool` — check if sandbox is still running
+2. Create `clients/ecs_launcher.py` — `EcsSandboxLauncher`:
+   - `launch()` → calls ECS `RunTask` with session-specific overrides (env vars, security group), returns `task_arn`
+   - `stop()` → calls ECS `StopTask`
+   - `is_healthy()` → calls ECS `DescribeTasks`, checks `lastStatus`
    - Error handling: catch `ClientError`, raise `SandboxProvisionError`
-2. Create `services/sandbox_service.py`:
-   - `provision_sandbox(session)` — calls ECS client, stores `expected_task_arn` on session record
-   - `terminate_sandbox(session)` — sends shutdown to sandbox endpoint (best-effort), calls `stop_task`, updates status with conditional write
-3. Update `POST /sessions` handler: after creating session record, call `sandbox_service.provision_sandbox()`. If RunTask fails, transition to `SESSION_FAILED`.
-4. Add `aioboto3` dependency for async ECS calls
-5. Add config: `ecs_cluster`, `ecs_task_definition`, `ecs_subnets`, `ecs_security_groups`, `sandbox_image`
-6. Concurrent session limit: query active sandbox sessions for user before provisioning, reject with 409 if over limit
+   - Add `aioboto3` dependency for async ECS calls
+3. Create `clients/local_launcher.py` — `LocalSandboxLauncher`:
+   - `launch()` → spawns `python -m agent_host.main --transport http --port {free_port}` as a subprocess, returns `(pid, http://localhost:{port})`
+   - `stop()` → sends SIGTERM to subprocess, waits up to 30s, then SIGKILL
+   - `is_healthy()` → checks if subprocess is alive and `/health` returns 200
+   - Picks a free port using `socket.bind(('', 0))` before spawning
+   - Passes env vars to subprocess: `SESSION_ID`, `SESSION_SERVICE_URL`, `WORKSPACE_SERVICE_URL`, `AWS_ENDPOINT_URL`, `SANDBOX_LOCAL_MODE=true`
+4. Create `services/sandbox_service.py`:
+   - `provision_sandbox(session)` — calls `launcher.launch()`, stores `expected_task_arn` (or `local:{pid}`) on session record
+   - `terminate_sandbox(session)` — sends shutdown to sandbox endpoint (best-effort), calls `launcher.stop()`, updates status with conditional write
+5. Update `POST /sessions` handler: after creating session record, call `sandbox_service.provision_sandbox()`. If launch fails, transition to `SESSION_FAILED`.
+6. Add config: `sandbox_launcher_type` (`ecs` or `local`, default `ecs`), `ecs_cluster`, `ecs_task_definition`, `ecs_subnets`, `ecs_security_groups`, `sandbox_image`, `agent_runtime_path` (for local launcher — path to agent-runtime repo)
+7. Concurrent session limit: query active sandbox sessions for user before provisioning, reject with 409 if over limit
+8. Wire launcher selection in `dependencies.py`: read `SANDBOX_LAUNCHER_TYPE` from config, instantiate the correct implementation via FastAPI `Depends`
 
 ### Tests
 
-- Unit: `SandboxService` with mocked ECS client — provision success, provision failure, terminate
+- Unit: `SandboxService` with mocked launcher — provision success, provision failure, terminate
+- Unit: `LocalSandboxLauncher` — spawn, stop, health check (use a simple HTTP server as stand-in, not real agent-runtime)
+- Unit: `EcsSandboxLauncher` with mocked boto3 — RunTask success/failure, StopTask, DescribeTasks
 - Unit: Concurrent session limit enforcement (at limit → 409, under limit → allowed)
-- Unit: RunTask failure → session transitions to SESSION_FAILED
-- Service: Full session creation flow with mocked ECS (DynamoDB Local for session persistence)
+- Unit: Launch failure → session transitions to SESSION_FAILED
+- Service: Full session creation flow with `LocalSandboxLauncher` (DynamoDB Local for session persistence, real subprocess spawn)
 
 ### Definition of Done
 
 - `make check` passes
-- Creating a `cloud_sandbox` session stores `expected_task_arn` and sets status to `SANDBOX_PROVISIONING`
-- RunTask failure results in `SESSION_FAILED` with structured error
+- Creating a `cloud_sandbox` session stores task identifier and sets status to `SANDBOX_PROVISIONING`
+- Launch failure results in `SESSION_FAILED` with structured error
 - Concurrent session limit rejects excess sessions with 409
-- **Wiring check**: Verify ECS RunTask overrides (env vars, security groups) match what agent-runtime expects in sandbox startup (Step 7). Verify `expected_task_arn` stored on session matches what container will read from ECS metadata. Verify error responses use platform contract types from Step 1
-- **Self-review**: Review for missing error handling on ECS API calls (ClientError subtypes), ensure session status rollback on RunTask failure is atomic, verify concurrent limit query uses correct GSI and status filters, check for race conditions between session creation and limit check
-- **Logical bug review**: Verify concurrent session limit count query filters by correct statuses (`SANDBOX_PROVISIONING` + `SANDBOX_READY` + running sessions, not terminated). Verify RunTask failure doesn't leave session in `SANDBOX_PROVISIONING` forever (must transition to `SESSION_FAILED`). Verify `expected_task_arn` is stored BEFORE RunTask returns (not after — race with fast-starting container). Verify ECS client handles throttling (too many RunTask calls)
-- **Local run**: For local dev, ECS calls are mocked — `SANDBOX_LOCAL_MODE=true` skips RunTask and returns a fake task ARN. Session creation still writes to DynamoDB. Test the full session creation flow against LocalStack, verify session record has correct status and fields
+- `SANDBOX_LAUNCHER_TYPE=local`: session creation spawns a real agent-runtime subprocess on a random port, subprocess self-registers, session transitions to `SANDBOX_READY` — **full lifecycle works locally with zero AWS dependencies**
+- `SANDBOX_LAUNCHER_TYPE=ecs`: session creation calls ECS RunTask (tested with mocked boto3)
+- **Wiring check**: Verify ECS RunTask overrides (env vars, security groups) match what agent-runtime expects in sandbox startup (Step 7). Verify `expected_task_arn` stored on session matches what container will read from ECS metadata. Verify `LocalSandboxLauncher` passes the same env vars to subprocess that ECS task definition would set. Verify error responses use platform contract types from Step 1
+- **Self-review**: Review for missing error handling on ECS API calls (ClientError subtypes), ensure session status rollback on launch failure is atomic, verify concurrent limit query uses correct GSI and status filters, check for race conditions between session creation and limit check. Review `LocalSandboxLauncher` for subprocess cleanup (no zombie processes on failure)
+- **Logical bug review**: Verify concurrent session limit count query filters by correct statuses (`SANDBOX_PROVISIONING` + `SANDBOX_READY` + running sessions, not terminated). Verify launch failure doesn't leave session in `SANDBOX_PROVISIONING` forever (must transition to `SESSION_FAILED`). Verify `expected_task_arn` is stored BEFORE launch returns (not after — race with fast-starting container). Verify ECS client handles throttling (too many RunTask calls). Verify `LocalSandboxLauncher` doesn't leak file descriptors (subprocess stdout/stderr must be captured or redirected). Verify free port selection doesn't race (port freed between `socket.bind` and subprocess start — use SO_REUSEADDR or accept the rare collision)
+- **Local run**: Set `SANDBOX_LAUNCHER_TYPE=local` and `AGENT_RUNTIME_PATH=../cowork-agent-runtime` in `.env`. Run `make run`. Create a `cloud_sandbox` session via `curl POST http://localhost:8000/sessions`. Verify: subprocess spawns, registers, session status transitions to `SANDBOX_READY`, proxy endpoints work (Step 6). This is the **primary local testing flow** for all sandbox features
 
 ---
 
@@ -382,10 +403,10 @@ Add background task for idle timeout enforcement and provisioning timeout cleanu
 - Stuck provisioning sessions are cleaned up after 180s
 - Max duration sessions are terminated
 - Multiple lifecycle managers running concurrently don't cause errors (conditional updates)
-- **Wiring check**: Verify lifecycle manager queries use correct GSI and status filters matching Step 3's session model. Verify terminate flow calls sandbox shutdown endpoint (matching Step 7's HttpTransport) before calling ECS StopTask (matching Step 5's ECS client). Verify task status check queries the tasks table with correct index from session-service
+- **Wiring check**: Verify lifecycle manager queries use correct GSI and status filters matching Step 3's session model. Verify terminate flow calls sandbox shutdown endpoint (matching Step 7's HttpTransport) before calling `launcher.stop()` (matching Step 5's SandboxLauncher). Verify task status check queries the tasks table with correct index from session-service
 - **Self-review**: Review for missing error handling when sandbox is unreachable during shutdown (best-effort, don't block), ensure lifecycle manager doesn't crash on individual session failures (catch per-session, continue loop), verify conditional update expressions are correct, check that background task shuts down cleanly on app exit
 - **Logical bug review**: Verify idle check compares `lastActivityAt` using UTC consistently (not mixing local time). Verify provisioning timeout uses `createdAt` of the session, not `lastActivityAt` (which may not be set yet). Verify max duration check uses session `createdAt`, not task `createdAt`. Verify the "running task" check queries the tasks table with status filter (only `running` tasks count, not `completed` or `failed`). Verify conditional update prevents double-termination (two lifecycle checks running concurrently on different instances)
-- **Local run**: Run session-service locally, create a sandbox session (with `SANDBOX_LOCAL_MODE=true`), wait for idle timeout (set to 30s for testing via env var). Verify session transitions to `SANDBOX_TERMINATED`. Verify lifecycle manager logs appear in structured format
+- **Local run**: Run session-service with `SANDBOX_LAUNCHER_TYPE=local`, create a sandbox session, wait for idle timeout (set to 30s for testing via env var). Verify the `LocalSandboxLauncher` subprocess is killed and session transitions to `SANDBOX_TERMINATED`. Verify lifecycle manager logs appear in structured format
 
 ---
 
@@ -393,13 +414,13 @@ Add background task for idle timeout enforcement and provisioning timeout cleanu
 
 **Repos:** `cowork-agent-runtime`, `cowork-session-service`, `cowork-workspace-service`
 
-Verify the full sandbox lifecycle works across services.
+Verify the full sandbox lifecycle works across services. Uses `LocalSandboxLauncher` — session-service spawns agent-runtime subprocesses automatically, no ECS needed.
 
 ### Work
 
-1. Create integration test script (similar to `test-chat.py` for desktop):
+1. Create integration test script `scripts/test-web-sandbox.py` (similar to `test-chat.py` for desktop):
    - `POST /sessions` with `cloud_sandbox` → verify `SANDBOX_PROVISIONING`
-   - Mock/start sandbox container → `POST /register` → verify `SANDBOX_READY`
+   - Wait for `LocalSandboxLauncher` to spawn subprocess → subprocess self-registers → verify `SANDBOX_READY`
    - `GET /sessions/{id}/events` via proxy → verify SSE stream opens
    - `POST /sessions/{id}/rpc` with `start_task` → verify task runs
    - Verify events stream through proxy
@@ -412,7 +433,7 @@ Verify the full sandbox lifecycle works across services.
 
 ### Tests
 
-- Integration: Full lifecycle with DynamoDB Local + LocalStack + real agent-runtime process
+- Integration: Full lifecycle with LocalStack + `LocalSandboxLauncher` (real agent-runtime subprocesses, no ECS)
 
 ### Definition of Done
 
@@ -423,7 +444,7 @@ Verify the full sandbox lifecycle works across services.
 - **Wiring check**: This step IS the wiring check — verify every integration seam from Steps 1–8 works together. Document any mismatches found and fix them in the originating step before proceeding
 - **Self-review**: Review test coverage for all error paths (sandbox crash mid-task, network timeout during proxy, workspace sync failure). Ensure test script has clear error reporting so failures are easy to diagnose
 - **Logical bug review**: Verify test assertions check for correct status transitions (not just final state). Verify SSE reconnect test actually disconnects mid-stream (not just opens a new connection). Verify file upload test checks content integrity (not just 200 status). Verify idle timeout test doesn't race with the lifecycle check interval (use short interval for tests)
-- **Local run**: Create `scripts/test-web-sandbox.py` (similar to existing `test-chat.py`). Must run entirely locally: `docker-compose up -d && make run` (all services) + script. The script runs the full lifecycle: create session → register sandbox → proxy RPC → stream SSE → upload file → idle timeout. Add a `make test-sandbox` target to agent-runtime Makefile that runs this script
+- **Local run**: The E2E test IS the local run — `scripts/test-web-sandbox.py` runs entirely locally: `docker-compose up -d` + session-service with `SANDBOX_LAUNCHER_TYPE=local` + workspace-service + policy-service. The script creates a session, session-service auto-spawns agent-runtime subprocess, and the test drives the full lifecycle: provisioning → ready → proxy RPC → stream SSE → upload file → idle timeout. Add `make test-sandbox` target to cowork-agent-runtime Makefile. No AWS credentials needed
 
 ---
 
@@ -549,7 +570,7 @@ Add Dockerfile for agent-runtime and CI pipeline for sandbox builds.
 - **Wiring check**: Verify Dockerfile installs all dependencies needed for HTTP mode (uvicorn, fastapi). Verify entrypoint and health check match ECS task definition from Step 11. Verify container can reach Session Service URL for registration (network connectivity). Run the E2E test from Step 9 against the Docker container instead of a local process
 - **Self-review**: Review Dockerfile for unnecessary layers, missing non-root user, missing health check interval, ensure .dockerignore excludes tests/docs/dev files, verify CI pipeline triggers on correct branches
 - **Logical bug review**: Verify Dockerfile doesn't copy `.env` or secrets into the image. Verify health check endpoint matches the one HttpTransport exposes (`/health`, not `/healthz`). Verify entrypoint uses exec form (not shell form — PID 1 issue for SIGTERM handling). Verify non-root user has write access to `/workspace` directory inside container
-- **Local run**: `make docker-build && docker run -p 8080:8080 -e SANDBOX_LOCAL_MODE=true -e SESSION_ID=test -e SESSION_SERVICE_URL=http://host.docker.internal:8001 cowork-sandbox:latest` — verify container starts, `/health` returns 200, `/rpc` accepts JSON-RPC. Add this to agent-runtime README
+- **Local run**: `make docker-build && docker run -p 8080:8080 -e SANDBOX_LOCAL_MODE=true -e SESSION_ID=test -e SESSION_SERVICE_URL=http://host.docker.internal:8000 -e WORKSPACE_SERVICE_URL=http://host.docker.internal:8002 -e AWS_ENDPOINT_URL=http://host.docker.internal:4566 cowork-sandbox:latest` — verify container starts, `/health` returns 200, `/rpc` accepts JSON-RPC. Add this to agent-runtime README. Can also test with `SANDBOX_LAUNCHER_TYPE=local` in session-service pointing `AGENT_RUNTIME_PATH` to the Docker image (future enhancement)
 
 ---
 
