@@ -31,7 +31,7 @@ docs/   ← Architecture design docs, ADRs, runbooks, threat models
 ## S3 Conventions
 
 - Bucket: `{env}-workspace-artifacts`
-- Object key: `{workspaceId}/{artifactId}`
+- Object key: `{workspaceId}/{sessionId}/{artifactType}/{artifactId}`
 
 ## Design Docs (in `docs/`)
 

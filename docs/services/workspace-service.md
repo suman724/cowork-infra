@@ -273,7 +273,7 @@ Stored attributes: `workspaceId`, `artifactId`, `sessionId`, `taskId`, `artifact
 Stores raw artifact content. Each object is addressed by:
 
 ```
-s3://{env}-workspace-artifacts/{workspaceId}/{artifactId}
+s3://{env}-workspace-artifacts/{workspaceId}/{sessionId}/{artifactType}/{artifactId}
 ```
 
 The `s3Key` attribute in the DynamoDB artifact record is the full S3 object key.
