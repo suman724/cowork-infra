@@ -1,6 +1,6 @@
 # Web Execution — Component Design
 
-**Repos:** `cowork-web-app` (new), `cowork-agent-runtime`, `cowork-session-service`
+**Repos:** `cowork-web-app` (new), `cowork-agent-runtime`, `cowork-session-service`, `cowork-workspace-service`, `cowork-platform`, `cowork-infra`
 **Bounded Context:** WebExecution
 **Phase:** 3
 **Depends on:** Session Service, Workspace Service, Policy Service, LLM Gateway
@@ -755,14 +755,20 @@ The sandbox container exposes `GET /health` (liveness) and `GET /ready` (readine
 - Warm pool for instant provisioning (<3s)
 - Connection draining on sandbox shutdown
 - Workspace snapshot/restore (resume from terminated sessions)
-- Enhanced file management (inline editor, tree view)
-- Virus scanning for uploads
 
 ### Phase 3c — Scale
 
 - OIDC authentication (Auth0, Okta, Cognito)
+- EventBridge lifecycle manager (replace in-process background tasks)
 - Auto-scaling warm pool based on usage patterns
-- Regional sandbox deployment (closest to user)
+
+### Phase 3d — Polish
+
+- Enhanced file management (inline editor, tree view, Monaco)
+- Virus scanning for uploads
+
+### Phase 3e — Advanced
+
 - GPU-enabled sandbox option for ML workloads
 - Shared workspace across sessions (team collaboration)
 
