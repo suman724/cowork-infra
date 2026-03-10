@@ -706,9 +706,9 @@ The sandbox container exposes `GET /health` (liveness) and `GET /ready` (readine
 - File upload and download
 - Reconnect via sandbox in-memory replay
 - Network access toggle
-- OIDC authentication
 - Basic web UI (conversation, approval, file browser)
 - Idle timeout and max duration enforcement
+- Simple auth (API key or static token) — sufficient for internal/dev use
 
 ### Phase 3b — Optimization
 
@@ -720,6 +720,7 @@ The sandbox container exposes `GET /health` (liveness) and `GET /ready` (readine
 
 ### Phase 3c — Scale
 
+- OIDC authentication (Auth0, Okta, Cognito)
 - Auto-scaling warm pool based on usage patterns
 - Regional sandbox deployment (closest to user)
 - GPU-enabled sandbox option for ML workloads
