@@ -426,8 +426,11 @@ sequenceDiagram
 | Unit tests | `InMemorySessionRepository` — no infrastructure needed |
 | Service tests | DynamoDB Local: `docker run -p 8000:8000 amazon/dynamodb-local` |
 | Integration tests | LocalStack: `docker run -p 4566:4566 localstack/localstack` |
+| E2E sandbox tests | `make test-web-sandbox` — requires all services running + `SANDBOX_LAUNCHER_TYPE=local` |
 
 Set `AWS_ENDPOINT_URL=http://localhost:8000` (DynamoDB Local) or `http://localhost:4566` (LocalStack) to point the service at a local emulator. The same repository code runs in all environments.
+
+**E2E Web Sandbox Test** (`scripts/test-web-sandbox.py`): Tests the full sandbox lifecycle end-to-end — session creation, sandbox provisioning via `LocalSandboxLauncher`, proxy RPC/SSE/file operations, idle timeout, and provisioning timeout. Requires session-service, policy-service, workspace-service, and LocalStack running locally.
 
 ---
 

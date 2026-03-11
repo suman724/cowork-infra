@@ -549,7 +549,7 @@ Add background task for idle timeout enforcement and provisioning timeout cleanu
 
 ---
 
-## Step 9 — End-to-End Integration Test
+## Step 9 — End-to-End Integration Test ✅ Done
 
 **Repos:** `cowork-agent-runtime`, `cowork-session-service`, `cowork-workspace-service`
 
