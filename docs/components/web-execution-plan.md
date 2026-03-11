@@ -5,6 +5,37 @@
 
 ---
 
+## Status Tracker
+
+| Step | Name | Repo | Status | Branch | Notes |
+|------|------|------|--------|--------|-------|
+| 1 | Platform Contracts | `cowork-platform` | ✅ Done | `feature/web-execution-design` | Schemas, codegen, SDK helpers |
+| 2 | Transport Protocol & HttpTransport | `cowork-agent-runtime` | ✅ Done | `feature/web-execution-design` | Transport protocol, HttpTransport, EventBuffer, GetEvents RPC |
+| 2b | Desktop App Event Replay | `cowork-desktop-app` | ⏳ Pending | — | Event replay on view navigation; not blocking web MVP but required |
+| 3 | Sandbox Self-Registration | `cowork-session-service` | 🔄 In Progress | — | Registration endpoint, sandbox session states |
+| 4 | Cloud Workspace Support | `cowork-workspace-service` | ⏳ Pending | — | S3-backed workspace file CRUD |
+| 5 | Sandbox Launcher & ECS | `cowork-session-service` | ⏳ Pending | — | EcsSandboxLauncher + LocalSandboxLauncher |
+| 6 | Proxy Layer | `cowork-session-service` | ⏳ Pending | — | Browser → Session Service → Sandbox forwarding |
+| 7 | Agent Runtime Sandbox Mode | `cowork-agent-runtime` | ⏳ Pending | — | Self-registration, workspace sync, sandbox startup |
+| 7b | Skills Adaptation for Web | `cowork-agent-runtime` | ⏳ Pending | — | Workspace-based skills, SKILLS_DIR env var |
+| 8 | Idle/Provisioning Timeout | `cowork-session-service` | ⏳ Pending | — | Timeout enforcement, background cleanup |
+| 9 | End-to-End Integration Test | Multiple | ⏳ Pending | — | Full flow: create → provision → register → task → shutdown |
+| 10 | Web App Foundation | `cowork-web-app` (new) | ⏳ Pending | — | React SPA, session create, SSE events |
+| 11 | Terraform Infrastructure | `cowork-infra` | ⏳ Pending | — | ECS task def, ALB, security groups |
+| 12 | Docker and CI | `cowork-agent-runtime`, `cowork-infra` | ⏳ Pending | — | Dockerfile, CI pipeline |
+| 13 | Warm Pool | `cowork-session-service`, `cowork-infra` | ⏳ Pending | — | Pre-provisioned idle containers |
+| 14 | Connection Draining | `cowork-session-service`, `cowork-agent-runtime` | ⏳ Pending | — | Graceful shutdown with in-flight requests |
+| 15 | Workspace Snapshot/Restore | `cowork-workspace-service` | ⏳ Pending | — | Session resume from S3 snapshot |
+| 16 | OIDC Authentication | `cowork-session-service`, `cowork-web-app` | ⏳ Pending | — | Browser auth flow |
+| 17 | EventBridge Lifecycle Manager | `cowork-session-service`, `cowork-infra` | ⏳ Pending | — | ECS task state change events |
+| 18 | Auto-Scaling Warm Pool | `cowork-session-service`, `cowork-infra` | ⏳ Pending | — | Dynamic warm pool sizing |
+| 19 | Enhanced File Management | `cowork-web-app` | ⏳ Pending | — | File tree, drag-and-drop upload |
+| 20 | Virus Scanning for Uploads | `cowork-workspace-service`, `cowork-infra` | ⏳ Pending | — | S3 event → Lambda → ClamAV |
+| 21 | GPU-Enabled Sandbox | `cowork-infra`, `cowork-session-service` | ⏳ Pending | — | GPU task definitions |
+| 22 | Shared Workspace Across Sessions | Multiple | ⏳ Pending | — | Workspace reuse for cloud sessions |
+
+---
+
 ## Principles
 
 - **Incremental delivery**: Each step produces a testable, working unit. No step depends on untested work from a prior step.
@@ -1148,6 +1179,14 @@ Allow multiple sessions to share a workspace — enabling iterative work across 
 - **Logical bug review**: Verify workspace access control is checked on every file operation (not just workspace creation). Verify advisory lock TTL is shorter than session idle timeout (lock shouldn't outlive session). Verify conflict detection compares S3 ETag (not timestamp — clock skew). Verify workspace deletion is blocked when active sessions exist (don't delete workspace under a running session). Verify shared workspace file sync handles concurrent modifications (last-write-wins must be consistent, not data-corrupting)
 - **Local run**: Test shared workspace flow locally with two agent-runtime instances on different ports, both pointing at same workspace. Upload file from one, verify visible from other. Document multi-instance local testing in README
 - **Documentation**: Update CLAUDE.md, README.md, and design docs in `cowork-infra/docs/` for any changed behavior, new endpoints, new config options, or architectural changes introduced in this step
+
+---
+
+# Known Issues
+
+Issues discovered during implementation that need to be addressed:
+
+- **LLM uses ExecuteCode tool for knowledge questions**: Regression — the model calls `Code.Execute` tool even when answering from pretrained knowledge (e.g. "tell me how AWS ECS works"). The system prompt or tool descriptions in `cowork-agent-runtime` need to instruct the LLM to only use tools when the user's request requires taking an action, not for answering knowledge questions. Likely in `cowork-agent-runtime` system prompt or tool definition area. Investigate and fix.
 
 ---
 

@@ -206,6 +206,33 @@ Returns a single task by ID.
 
 ---
 
+### POST /sessions/{sessionId}/register — Sandbox Self-Registration
+
+Called by the sandbox container after startup. Validates the task ARN matches what was stored at launch time, stores the sandbox endpoint, transitions status to `SANDBOX_READY`, and returns the policy bundle.
+
+**Request:**
+```json
+{
+  "sandboxEndpoint": "http://10.0.1.42:8080",
+  "taskArn": "arn:aws:ecs:us-east-1:123456789:task/cowork-dev/abc123"
+}
+```
+
+**Response (200):**
+```json
+{
+  "sessionId": "sess_789",
+  "workspaceId": "ws_456",
+  "workspaceServiceUrl": "http://workspace-service:8002",
+  "llmGatewayEndpoint": "",
+  "policyBundle": { ... }
+}
+```
+
+**Errors:**
+- 404 — session not found
+- 409 — session not in `SANDBOX_PROVISIONING` state, or task ARN mismatch
+
 ### GET /sessions/{sessionId} — Get Session Metadata
 
 **Response:**
@@ -271,9 +298,14 @@ sequenceDiagram
 | `tenantId` | string | Tenant |
 | `userId` | string | User |
 | `executionEnvironment` | enum | `desktop` or `cloud_sandbox` |
-| `status` | enum | `SESSION_CREATED`, `SESSION_RUNNING`, `SESSION_PAUSED`, `SESSION_COMPLETED`, `SESSION_FAILED`, `SESSION_CANCELLED` |
+| `status` | enum | `SESSION_CREATED`, `SESSION_RUNNING`, `SESSION_PAUSED`, `SESSION_COMPLETED`, `SESSION_FAILED`, `SESSION_CANCELLED`, `SANDBOX_PROVISIONING`, `SANDBOX_READY`, `SANDBOX_TERMINATED` |
 | `createdAt` | datetime | Session creation time |
 | `expiresAt` | datetime | Policy bundle expiry — session must not continue past this |
+| `sandboxEndpoint` | string? | Internal IP:port of sandbox container (cloud_sandbox only, set at registration) |
+| `taskArn` | string? | ECS task ARN (cloud_sandbox only) |
+| `expectedTaskArn` | string? | Expected task ARN for registration validation (cloud_sandbox only) |
+| `networkAccess` | enum? | `enabled` or `disabled` — outbound internet for sandbox (cloud_sandbox only) |
+| `lastActivityAt` | datetime? | Last user interaction time for idle timeout (cloud_sandbox only) |
 
 ---
 
