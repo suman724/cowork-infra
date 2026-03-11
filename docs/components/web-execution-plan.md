@@ -21,7 +21,7 @@
 | 8 | Idle/Provisioning Timeout | `cowork-session-service` | ✅ Done | `feature/web-execution-design` | SandboxLifecycleManager, conditional updates, idle/provisioning/max-duration |
 | 9 | End-to-End Integration Test | Multiple | ✅ Done | `feature/web-execution-design` | Full flow: create → provision → register → task → shutdown |
 | 10 | Web App Foundation | `cowork-web-app` (new) | ⏳ Pending | — | React SPA, session create, SSE events |
-| 11 | Terraform Infrastructure | `cowork-infra` | ⏳ Pending | — | ECS task def, ALB, security groups |
+| 11 | Terraform Infrastructure | `cowork-infra` | ✅ Done | `feature/web-execution-design` | Sandbox module, SG, IAM, session-service RunTask perms |
 | 12 | Docker and CI | `cowork-agent-runtime`, `cowork-infra` | ⏳ Pending | — | Dockerfile, CI pipeline |
 | 13 | Warm Pool | `cowork-session-service`, `cowork-infra` | ⏳ Pending | — | Pre-provisioned idle containers |
 | 14 | Connection Draining | `cowork-session-service`, `cowork-agent-runtime` | ⏳ Pending | — | Graceful shutdown with in-flight requests |

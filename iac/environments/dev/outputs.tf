@@ -84,3 +84,20 @@ output "policy_service_name" {
   description = "Policy service ECS service name"
   value       = module.policy_service.service_name
 }
+
+# --- Sandbox ---
+
+output "sandbox_task_definition_arn" {
+  description = "Sandbox ECS task definition ARN (used by Session Service RunTask)"
+  value       = module.sandbox.task_definition_arn
+}
+
+output "sandbox_security_group_id" {
+  description = "Sandbox security group ID"
+  value       = module.sandbox.security_group_id
+}
+
+output "sandbox_log_group_name" {
+  description = "Sandbox CloudWatch log group name"
+  value       = module.sandbox.log_group_name
+}

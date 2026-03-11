@@ -85,3 +85,32 @@ variable "approval_service_desired_count" {
   type        = number
   default     = 2
 }
+
+# --- Sandbox (Agent Runtime) ---
+
+variable "sandbox_image" {
+  description = "Docker image for agent-runtime sandbox"
+  type        = string
+}
+
+variable "sandbox_cpu" {
+  description = "CPU units for sandbox tasks (512 recommended for agent loop)"
+  type        = number
+  default     = 512
+}
+
+variable "sandbox_memory" {
+  description = "Memory (MiB) for sandbox tasks (1024 recommended for agent loop)"
+  type        = number
+  default     = 1024
+}
+
+variable "llm_gateway_endpoint" {
+  description = "LLM Gateway endpoint URL (passed to sandbox containers)"
+  type        = string
+}
+
+variable "llm_gateway_auth_token_arn" {
+  description = "ARN of the Secrets Manager secret containing LLM Gateway auth token"
+  type        = string
+}
