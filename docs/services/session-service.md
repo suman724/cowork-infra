@@ -129,7 +129,7 @@ Five proxy endpoints:
 |--------|------|-------------|
 | `POST` | `/sessions/{sessionId}/rpc` | Forward JSON-RPC to sandbox `/rpc` |
 | `GET` | `/sessions/{sessionId}/events` | SSE proxy (streaming, `Last-Event-ID` pass-through) |
-| `POST` | `/sessions/{sessionId}/upload` | Forward multipart file upload |
+| `POST` | `/sessions/{sessionId}/upload` | Unified upload: persist to S3 via Workspace Service, then sync to sandbox |
 | `GET` | `/sessions/{sessionId}/files/{path}` | File download from sandbox workspace |
 | `GET` | `/sessions/{sessionId}/files` | File listing or workspace archive download |
 
@@ -142,6 +142,21 @@ Key behaviors:
 - **Connection pool:** Separate `httpx.AsyncClient` for sandbox connections (not shared with Policy/Workspace clients).
 
 Config: `PROXY_ENDPOINT_CACHE_TTL_SECONDS` (30), `PROXY_ACTIVITY_BATCH_SECONDS` (60), `PROXY_TIMEOUT_SECONDS` (30), `PROXY_SSE_TIMEOUT_SECONDS` (14400).
+
+**Unified File Upload (`POST /sessions/{sessionId}/upload`):**
+
+`FileUploadService` handles file uploads in two phases:
+1. **S3 persist** — Forward to Workspace Service `POST /workspaces/{workspaceId}/files?path=X` (multipart). This is the durable write.
+2. **Sandbox sync** (best-effort) — Send `workspace.sync` JSON-RPC to the sandbox's `/rpc` endpoint with `{"direction":"pull","paths":["X"]}`. Failure does not fail the upload.
+
+State handling:
+- **Terminal states** (`SESSION_CANCELLED`, `SANDBOX_TERMINATED`) → reject with 409
+- **Non-terminal, no sandbox** (`SANDBOX_PROVISIONING`, `SESSION_CREATED`) → S3 persist only, `sandboxSynced: false`
+- **Syncable states** (`SANDBOX_READY`, `SESSION_RUNNING`, `WAITING_FOR_*`, `SESSION_PAUSED`) with sandbox endpoint → S3 persist + sync attempt
+
+Response: `{"path": "...", "size": N, "persisted": true, "sandboxSynced": true|false}`
+
+Config: `UPLOAD_SYNC_TIMEOUT_SECONDS` (10).
 
 **Sandbox Lifecycle Manager:**
 
