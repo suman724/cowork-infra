@@ -151,8 +151,32 @@ Called by the Local Agent Host to upload tool output artifacts or session histor
 ```json
 {
   "artifactId": "art_123",
-  "artifactUri": "workspaces/ws_456/artifacts/art_123"
+  "artifactUri": "s3://ws_456/sess_789/tool_output/art_123"
 }
+```
+
+Note: `artifactUri` is the S3 key for the artifact content.
+
+---
+
+### GET /workspaces/{workspaceId}/artifacts — List Artifacts
+
+Called by the Desktop App to list all artifacts in a workspace.
+
+**Response:**
+```json
+[
+  {
+    "artifactId": "art_123",
+    "workspaceId": "ws_456",
+    "sessionId": "sess_789",
+    "artifactType": "tool_output",
+    "artifactName": "pytest_output.txt",
+    "contentType": "text/plain",
+    "sizeBytes": 1234,
+    "createdAt": "2026-02-21T14:00:00Z"
+  }
+]
 ```
 
 ---
@@ -162,6 +186,26 @@ Called by the Local Agent Host to upload tool output artifacts or session histor
 Called by the Desktop App to fetch session history or tool output for display.
 
 **Response:** Artifact payload (JSON for `session_history`, binary for file artifacts)
+
+---
+
+### GET /workspaces/{workspaceId}/sessions/{sessionId}/history — Get Session History
+
+Convenience endpoint that retrieves the latest `session_history` artifact for a session and returns its messages as a JSON array.
+
+**Response:**
+```json
+[
+  {
+    "messageId": "msg_001",
+    "role": "user",
+    "content": "Refactor the API client",
+    "timestamp": "2026-02-21T14:01:00Z"
+  }
+]
+```
+
+Returns an empty array `[]` (HTTP 200) if no history exists for the session.
 
 ---
 
@@ -184,7 +228,9 @@ Called by the Desktop App to show the conversation history list for a project. S
       "sessionId": "sess_789",
       "createdAt": "2026-02-21T14:00:00Z",
       "lastTaskAt": "2026-02-21T16:00:00Z",
-      "taskCount": 4
+      "taskCount": 4,
+      "name": "Fix login bug",
+      "autoNamed": true
     }
   ],
   "nextToken": "eyJvZmZzZXQiOiAyMH0="
@@ -192,6 +238,14 @@ Called by the Desktop App to show the conversation history list for a project. S
 ```
 
 `nextToken` is only present when more pages exist. Pass it as a query parameter to fetch the next page.
+
+---
+
+### DELETE /workspaces/{workspaceId} — Delete Workspace
+
+Deletes a workspace and all its artifacts (metadata from DynamoDB, content from S3). Uses metadata-first deletion ordering.
+
+**Response:** `204 No Content`
 
 ---
 
@@ -213,6 +267,8 @@ Called by the Desktop App to delete all artifacts for a specific session within 
 ### Workspace File Endpoints (cloud scope only)
 
 File operations are only available for `cloud`-scoped workspaces. Non-cloud workspaces return `400`.
+
+**Primary callers:** Session Service (`FileUploadService` — persists uploaded files to S3 during unified upload flow) and Agent Runtime (`download_workspace()` / `upload_workspace()` — syncs files between S3 and sandbox local disk). See [workspace-file-sync.md](../design/workspace-file-sync.md) for the full upload architecture.
 
 #### POST /workspaces/{workspaceId}/files — Upload File
 
@@ -310,7 +366,7 @@ Stores artifact metadata. Artifact content lives in S3; this table holds the poi
 |-----|--------------|----------|-----|
 | `sessionId-type-index` | `sessionId` | `artifactType#createdAt` | Retrieve `session_history` for a session; list tool outputs |
 
-Stored attributes: `workspaceId`, `artifactId`, `sessionId`, `taskId`, `artifactType`, `artifactName`, `contentType`, `s3Key`, `createdAt`
+Stored attributes: `workspaceId`, `artifactId`, `sessionId`, `taskId`, `artifactType`, `artifactName`, `contentType`, `sizeBytes`, `s3Key`, `createdAt`
 
 ### S3 — `{env}-workspace-artifacts` bucket
 

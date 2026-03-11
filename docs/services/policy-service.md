@@ -41,7 +41,7 @@ A policy bundle is a JSON document returned to the Session Service, which passes
 
 ```json
 {
-  "policyBundleVersion": "2026-02-21.1",
+  "policyBundleVersion": "2026-02-21.a1b2c3d4",
   "schemaVersion": "1.0",
   "tenantId": "tenant_abc",
   "userId": "user_123",
@@ -64,9 +64,9 @@ A policy bundle is a JSON document returned to the Session Service, which passes
   ],
   "llmPolicy": {
     "allowedModels": ["claude-sonnet-4-6"],
-    "maxInputTokens": 64000,
-    "maxOutputTokens": 4000,
-    "maxSessionTokens": 250000
+    "maxInputTokens": 200000,
+    "maxOutputTokens": 16384,
+    "maxSessionTokens": 1000000
   },
   "approvalRules": [
     {
@@ -146,7 +146,7 @@ The `llmPolicy` block controls what the agent is allowed to send to and receive 
 
 ## Policy Bundle Versioning and Expiry
 
-- `policyBundleVersion` — a dated version string (e.g. `2026-02-21.1`) identifying when this policy was generated
+- `policyBundleVersion` — a dated version string (e.g. `2026-02-21.a1b2c3d4` — ISO date + 8-char hex UUID suffix) identifying when this policy was generated
 - `schemaVersion` — the schema version of the bundle format, used by the client for compatibility checks
 - `expiresAt` — bundles are short-lived; the client must not use an expired bundle. On expiry, the session must end or re-authenticate.
 - Policy bundles are not refreshed mid-session in Phase 1. Policy revocation mid-session is a Phase 3 feature.
@@ -170,7 +170,7 @@ When per-tenant policy authoring is introduced in Phase 3, policies move into Dy
 | Key | Value |
 |-----|-------|
 | Partition key | `tenantId` (String) |
-| Sort key | `policyVersion` (String) — e.g. `2026-02-21.1` |
+| Sort key | `policyVersion` (String) — e.g. `2026-02-21.a1b2c3d4` |
 
 | GSI | Partition key | Sort key | Use |
 |-----|--------------|----------|-----|

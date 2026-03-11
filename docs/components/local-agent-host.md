@@ -90,32 +90,34 @@ agent-host/
 
 ```mermaid
 flowchart TD
-  session["session/<br/><small>JSON-RPC server<br/>session lifecycle</small>"]
+  server["server/<br/><small>transport layer<br/>JSON-RPC dispatch</small>"]
+  session["session/<br/><small>session clients<br/>checkpoint</small>"]
   loop["loop/<br/><small>agent loop<br/>step execution</small>"]
   llm["llm/<br/><small>LLM client<br/>streaming</small>"]
   policy["policy/<br/><small>policy enforcer<br/>capability checks</small>"]
-  state["state/<br/><small>checkpoint<br/>crash recovery</small>"]
-  routing["routing/<br/><small>tool dispatch<br/>parallel execution</small>"]
   thread["thread/<br/><small>message thread<br/>token counting</small>"]
+  memory["memory/<br/><small>working + persistent<br/>memory</small>"]
   approval["approval/<br/><small>approval flow<br/>user decision</small>"]
+  budget["budget/<br/><small>token budget<br/>tracking</small>"]
   events["events/<br/><small>audit + telemetry<br/>fire-and-forget</small>"]
 
-  session --> loop
+  server --> loop
   loop --> llm
-  loop --> routing
   loop --> policy
   loop --> approval
-  loop --> state
+  loop --> session
   loop --> thread
+  loop --> memory
+  loop --> budget
   loop --> events
-  session --> events
-  routing -. "ToolRouter interface" .-> TR["Local Tool Runtime<br/><small>(separate package)</small>"]
+  server --> events
+  loop -. "ToolRouter interface" .-> TR["Local Tool Runtime<br/><small>(separate package)</small>"]
 ```
 
 **Dependency rules:**
-- `session/` is the process entry point — it starts the JSON-RPC server and delegates task execution to `loop/`
+- `server/` is the process entry point — it provides the transport layer (Stdio or Http) and delegates task execution to `loop/`
 - `loop/` orchestrates all other modules but never imports external packages directly
-- `routing/` depends on a `ToolRouter` interface defined in `agent-host/` — it never imports from `tool-runtime/` directly
+- Tool dispatch goes through a `ToolRouter` interface — `loop/` never imports from `tool_runtime/` directly
 - `policy/` is a pure function module — no I/O, no state, only the policy bundle passed in at init
 - `events/` is fire-and-forget — callers do not wait for event delivery
 
@@ -969,7 +971,7 @@ Each LLM request is assembled from:
 | `model` | `llmPolicy.allowedModels[0]` (first allowed model in Phase 1) |
 | `max_tokens` | `llmPolicy.maxOutputTokens` |
 | `messages` | From `thread/` module (after context window truncation) |
-| `tools` | From `routing/` module (`getAvailableTools()`) — filtered by granted capabilities |
+| `tools` | From `ToolRouter` interface (`get_available_tools()`) — filtered by granted capabilities |
 | `system` | System prompt from `thread/` module |
 
 ### 6.3 Response Parsing
@@ -1032,7 +1034,7 @@ interface ToolRouter {
 
 > ToolRequest and ToolResult schemas: [architecture.md, Section 6.2](../architecture.md#62-tool-schemas--local-agent-host--local-tool-runtime)
 
-The `routing/` module in `agent-host/` calls this interface. The `tool-runtime/` package provides the implementation. No direct imports cross the package boundary.
+The `loop/` module in `agent_host/` calls this interface. The `tool_runtime/` package provides the implementation via `tool_runtime/router/`. No direct imports cross the package boundary.
 
 ### 7.2 Tool-to-Capability Mapping
 

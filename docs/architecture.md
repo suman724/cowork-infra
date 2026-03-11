@@ -670,6 +670,7 @@ Separate agent-runtime download — Desktop App downloads and manages `cowork-ag
 | `cowork-approval-service` | Approval Service (FastAPI) | Python | Approval |
 | `cowork-observability` | Audit Service, Telemetry Service (FastAPI) | Python | ObservabilityAudit |
 | `cowork-backend-tools` | Backend Tool Service (FastAPI, Phase 3, optional) | Python | ToolExecution |
+| `cowork-web-app` | Web UI for cloud sandbox sessions (React, Vite) | TypeScript | WebExecution |
 | `cowork-platform` | JSON Schema contracts, generated bindings, SDK | Python + TypeScript | Shared |
 | `cowork-infra` | IaC, CI/CD, secrets management, architecture docs | — | Operations |
 
@@ -721,14 +722,21 @@ Desktop App (installed)
 
 ```
 cowork-desktop-app/
-  app/            ← Desktop App UI (screens, approval dialogs, patch preview)
-  updater/        ← agent-runtime version check, download, verification, launch
+  src/
+    main/           ← Electron main process (IPC handlers, agent-runtime spawn, session/workspace clients)
+    renderer/       ← React UI (views: conversation, approval, patch, settings, home)
+    shared/         ← IPC channel definitions and shared types
 
 cowork-agent-runtime/
-  agent_host/     ← Local Agent Host (agent loop, session client, LLM client, JSON-RPC server)
-  tool_runtime/   ← Local Tool Runtime (built-in tools, MCP client, platform adapters)
-  build/          ← Platform-specific packaging (macOS arm64/x86_64, Windows x64)
-  pyproject.toml  ← Python project config
+  src/
+    agent_host/     ← Local Agent Host (agent loop, session client, LLM client, JSON-RPC server)
+    tool_runtime/   ← Local Tool Runtime (built-in tools, MCP client, platform adapters)
+  scripts/          ← Helper scripts (test-chat.py, test-web-sandbox.py)
+  pyproject.toml    ← Python project config
+
+cowork-web-app/
+  src/              ← React + Vite web app for cloud sandbox sessions
+  public/           ← Static assets
 
 cowork-observability/
   audit/          ← Audit Service (append-only event ingest, DynamoDB)
@@ -783,7 +791,7 @@ The same design works for web by running the agent runtime in a backend sandbox 
 1. Browser → `POST /sessions` with `executionEnvironment: "cloud_sandbox"` → Session Service creates session in `SANDBOX_PROVISIONING`, launches ECS task, creates `cloud`-scoped workspace
 2. ECS container starts, agent runtime detects sandbox mode (`SESSION_ID` env var set + `--transport http`), reads ECS task metadata (container IP, task ARN) via the ECS metadata endpoint, calls `POST /sessions/{id}/register` with `sandboxEndpoint`, `taskArn`, and `REGISTRATION_TOKEN` → Session Service validates token and ARN, returns policy bundle + workspace ID, transitions to `SANDBOX_READY`
 3. Agent runtime syncs workspace files down from Workspace Service via individual file CRUD (`GET /workspaces/{id}/files/{path}`) into the local working directory
-4. Browser → Session Service proxy endpoints (`/sessions/{id}/rpc`, `/sessions/{id}/events`) → forwarded to sandbox `HttpTransport`
+4. Browser → Session Service proxy endpoints (`/sessions/{id}/rpc`, `/sessions/{id}/events`) → forwarded to sandbox `HttpTransport`. File uploads (`POST /sessions/{id}/upload`) use two-phase flow: S3 persist via Workspace Service, then `workspace.sync` RPC to sandbox (see [workspace-file-sync.md](docs/design/workspace-file-sync.md))
 5. Sandbox agent runtime uses `HttpTransport` (HTTP + SSE) instead of `StdioTransport` (stdio)
 6. On SIGTERM (idle timeout, max duration, or explicit termination) → agent uploads modified workspace files to Workspace Service (`POST /workspaces/{id}/files`) → calls `POST /sessions/{id}/shutdown` → exits cleanly → `SANDBOX_TERMINATED` (terminal state)
 
@@ -821,21 +829,19 @@ flowchart LR
     AuditService["Audit Service"]
     TelemetryService["Telemetry Service"]
 
-    subgraph SandboxRuntime["Sandbox Runtime"]
+    subgraph SandboxRuntime["Sandbox Runtime (ECS Task)"]
       SandboxAgentHost["Sandbox Agent Host"]
       SandboxToolRuntime["Sandbox Tool Runtime"]
-      SandboxStateStore["Sandbox State Store"]
       SandboxAgentHost --> SandboxToolRuntime
-      SandboxAgentHost --> SandboxStateStore
     end
 
+    SessionService -->|proxy| SandboxAgentHost
     SessionService --> PolicyService
     WorkspaceService --> ArtifactStore["Artifact Store"]
   end
 
-  WebApp <--> SessionService
+  WebApp <-->|RPC, SSE, upload| SessionService
   SandboxAgentHost <--> LLMGateway
-  SandboxAgentHost <--> ApprovalService
   SandboxAgentHost <--> WorkspaceService
   SandboxAgentHost --> AuditService
   SandboxAgentHost --> TelemetryService

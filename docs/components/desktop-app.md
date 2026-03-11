@@ -68,61 +68,69 @@ The Desktop App has two external communication paths:
 ### Package layout
 
 ```
-desktop/
-  app/
-    shell/          — Application window, menu bar, tray icon, lifecycle
+src/
+  main/               — Electron main process
+    index.ts          — App entry point, window lifecycle
+    ipc-handlers.ts   — IPC channel handlers (main ↔ renderer bridge)
+    agent-runtime.ts  — Agent-runtime process spawning, health monitoring
+    json-rpc-client.ts — JSON-RPC 2.0 client for agent-runtime communication
+    session-client.ts — Session Service HTTP client
+    workspace-client.ts — Workspace Service HTTP client
+    settings-store.ts — Persistent user preferences (electron-store)
+    preload.ts        — Context bridge (secure IPC exposure to renderer)
+  renderer/           — React UI (Vite-bundled)
     views/
-      conversation/ — Active conversation view (message list, prompt input, streaming)
-      history/      — Conversation history browser (past sessions, workspace list)
-      approval/     — Local Approval UI (approval dialogs, risk display)
-      patch/        — Patch preview (file diff viewer, before/after)
-      settings/     — User preferences, connection settings
-    ipc/            — JSON-RPC client, request/response handling, event listener
-    state/          — Application state management (current session, UI state)
-    workspace/      — Workspace Service client (fetch history, list sessions)
-  updater/
-    manifest/       — Version manifest fetching and parsing
-    download/       — Agent-runtime download, integrity verification
-    launch/         — Process spawning, health monitoring, restart logic
+      conversation/   — Active conversation view (message list, prompt input, streaming)
+      home/           — Home/landing view (project list, recent sessions)
+      approval/       — Local Approval UI (approval dialogs, risk display)
+      patch/          — Patch preview (file diff viewer, before/after)
+      settings/       — User preferences, connection settings
+    components/       — Shared React components
+    hooks/            — React hooks (session state, events, IPC)
+    state/            — Application state management (Zustand stores)
+    lib/              — Utility functions
+  shared/             — Cross-process types
+    ipc-channels.ts   — IPC channel name constants and type definitions
+    types.ts          — Shared TypeScript types (main ↔ renderer)
 ```
 
 ### Module dependencies
 
 ```mermaid
 flowchart TD
-  shell["shell/<br/><small>app window<br/>lifecycle</small>"]
+  main["main/<br/><small>Electron main process<br/>window lifecycle</small>"]
+  agentRuntime["main/agent-runtime<br/><small>process spawn<br/>health monitor</small>"]
+  jsonRpc["main/json-rpc-client<br/><small>JSON-RPC 2.0</small>"]
+  sessionClient["main/session-client<br/><small>Session Service</small>"]
+  workspaceClient["main/workspace-client<br/><small>Workspace Service</small>"]
+  ipcHandlers["main/ipc-handlers<br/><small>IPC bridge</small>"]
+
   conversation["views/conversation/<br/><small>message list<br/>prompt input</small>"]
-  history["views/history/<br/><small>past sessions<br/>workspace browser</small>"]
+  home["views/home/<br/><small>project list<br/>recent sessions</small>"]
   approval["views/approval/<br/><small>approval dialogs</small>"]
   patch["views/patch/<br/><small>diff viewer</small>"]
   settings["views/settings/<br/><small>preferences</small>"]
-  ipc["ipc/<br/><small>JSON-RPC client<br/>event listener</small>"]
-  state["state/<br/><small>app state</small>"]
-  workspace["workspace/<br/><small>Workspace Service<br/>client</small>"]
-  updater["updater/<br/><small>agent-runtime<br/>lifecycle</small>"]
+  hooks["hooks/<br/><small>React hooks</small>"]
+  state["state/<br/><small>Zustand stores</small>"]
 
-  shell --> conversation
-  shell --> history
-  shell --> settings
-  shell --> updater
-  conversation --> ipc
-  conversation --> state
-  conversation --> approval
-  conversation --> patch
-  history --> workspace
-  history --> state
-  approval --> ipc
-  approval --> state
-  ipc --> state
-  updater --> ipc
+  main --> agentRuntime
+  main --> ipcHandlers
+  agentRuntime --> jsonRpc
+  ipcHandlers --> jsonRpc
+  ipcHandlers --> sessionClient
+  ipcHandlers --> workspaceClient
+  conversation --> hooks
+  home --> hooks
+  approval --> hooks
+  hooks --> state
 ```
 
 **Dependency rules:**
-- `shell/` is the application entry point — it manages the window and routes to views
-- All views read from and write to `state/` for consistent UI state
-- Only `ipc/` communicates with the Local Agent Host — views never send JSON-RPC directly
-- Only `workspace/` communicates with the Workspace Service — views call workspace methods
-- `updater/` manages the agent-runtime process and passes the IPC connection to `ipc/`
+- `main/` is the Electron main process entry point — it manages windows, spawns agent-runtime, and bridges IPC
+- `main/ipc-handlers` exposes backend functionality to the renderer via Electron's context bridge
+- All renderer views use `hooks/` for data access, which reads from `state/` (Zustand stores)
+- Views never call JSON-RPC or HTTP directly — all communication flows through IPC handlers in the main process
+- `main/agent-runtime` manages the agent-runtime child process and provides the JSON-RPC connection
 
 ---
 
@@ -133,25 +141,23 @@ flowchart TD
 ```mermaid
 sequenceDiagram
   participant User
-  participant Shell as App Shell
-  participant Updater as Updater
+  participant Main as Main Process
+  participant AR as agent-runtime.ts
   participant AH as Local Agent Host
   participant WS as Workspace Service
 
-  User->>Shell: Launch Desktop App
-  Shell->>Updater: Check agent-runtime availability
-  Updater-->>Shell: agent-runtime ready (version X.Y.Z)
-  Shell->>Shell: Show main window (history view)
-  User->>Shell: Open project or start new chat
-  Shell->>Updater: Spawn agent-runtime process
-  Updater->>AH: Start process (stdio / local socket)
-  Updater-->>Shell: IPC connection established
-  Shell->>Shell: Switch to conversation view
+  User->>Main: Launch Desktop App
+  Main->>Main: Show main window (home view)
+  User->>Main: Open project or start new chat
+  Main->>AR: Spawn agent-runtime process
+  AR->>AH: Start process (stdio)
+  AR-->>Main: JSON-RPC connection established
+  Main->>Main: Switch to conversation view
 ```
 
-**Phase 1:** The agent-runtime binary is bundled in the desktop installer. The updater simply locates and spawns it.
+**Phase 1:** The agent-runtime binary is bundled in the desktop installer. `agent-runtime.ts` locates and spawns it.
 
-**Phase 4:** The updater checks the version manifest, downloads if needed, verifies integrity, then spawns.
+**Phase 4:** A separate updater module checks the version manifest, downloads if needed, verifies integrity, then spawns.
 
 ### 3.2 Shutdown Sequence
 
@@ -547,20 +553,20 @@ When the user selects "Continue" on a past session:
 ```mermaid
 sequenceDiagram
   participant User
-  participant DA as Desktop App
+  participant Main as Main Process
   participant WS as Workspace Service
-  participant Updater as Updater
+  participant AR as agent-runtime.ts
   participant AH as Local Agent Host
 
-  User->>DA: Select past session → "Continue"
-  DA->>WS: Fetch session_history artifact
-  WS-->>DA: ConversationMessage[]
-  DA->>Updater: Spawn agent-runtime
-  Updater->>AH: Start process
-  DA->>AH: CreateSession (workspaceHint with same workspace)
-  AH-->>DA: New sessionId, same workspaceId
-  DA->>DA: Bootstrap message list from session_history
-  DA->>AH: StartTask (user's new prompt, with thread context)
+  User->>Main: Select past session → "Continue"
+  Main->>WS: Fetch session_history artifact
+  WS-->>Main: ConversationMessage[]
+  Main->>AR: Spawn agent-runtime
+  AR->>AH: Start process
+  Main->>AH: CreateSession (workspaceHint with same workspace)
+  AH-->>Main: New sessionId, same workspaceId
+  Main->>Main: Bootstrap message list from session_history
+  Main->>AH: StartTask (user's new prompt, with thread context)
 ```
 
 The new session gets a fresh `sessionId` but reuses the same `workspaceId`. The conversation thread is bootstrapped from the `session_history` artifact — the user sees their past messages and can continue seamlessly.
@@ -573,7 +579,7 @@ The Desktop App authenticates to the Workspace Service using the same tenant/use
 
 ## 8. Agent-Runtime Lifecycle
 
-The `updater/` package manages the full lifecycle of the agent-runtime binary.
+The `main/agent-runtime.ts` module manages the full lifecycle of the agent-runtime binary.
 
 ### 8.1 Phase 1 — Bundled
 
@@ -584,7 +590,7 @@ macOS:  AppName.app/Contents/Resources/agent-runtime
 Windows: C:\Program Files\AppName\agent-runtime.exe
 ```
 
-The updater locates the bundled binary, verifies it exists, and spawns it.
+`agent-runtime.ts` locates the bundled binary, verifies it exists, and spawns it.
 
 ### 8.2 Phase 4 — Independent Download
 

@@ -96,31 +96,36 @@ Session creation triggers ECS task provisioning. Because ECS provisioning takes 
 sequenceDiagram
   participant Browser as Browser
   participant SS as Session Service
+  participant PS as Policy Service
   participant ECS as ECS (AWS)
   participant Sandbox as Sandbox Container
 
   Browser->>SS: POST /sessions (executionEnvironment: cloud_sandbox)
-  SS->>SS: Create session record (status: SESSION_CREATED)
-  SS->>ECS: RunTask (sessionId, config)
-  SS-->>Browser: 201 {sessionId, status: "provisioning"}
+  SS->>SS: Create session record (status: SANDBOX_PROVISIONING, generate registrationToken)
+  SS->>ECS: RunTask (sessionId, registrationToken, config)
+  SS->>SS: Store expectedTaskArn
+  SS-->>Browser: 201 {sessionId, workspaceId, status: "SANDBOX_PROVISIONING"}
 
   Browser->>SS: GET /sessions/{sessionId} (poll)
-  SS-->>Browser: {status: "provisioning"}
+  SS-->>Browser: {status: "SANDBOX_PROVISIONING"}
 
-  Sandbox->>Sandbox: Start, read ECS metadata for task IP
-  Sandbox->>SS: POST /sessions/{sessionId}/register {sandboxEndpoint}
-  SS->>SS: Store sandbox endpoint, update status → SESSION_RUNNING
-  SS-->>Sandbox: 200 OK
+  Sandbox->>Sandbox: Start, read ECS metadata for task IP and ARN
+  Sandbox->>SS: POST /sessions/{sessionId}/register {sandboxEndpoint, taskArn, registrationToken}
+  SS->>SS: Validate token + ARN match
+  SS->>PS: GET policy bundle
+  PS-->>SS: Policy bundle
+  SS->>SS: Store sandbox endpoint, update status → SANDBOX_READY
+  SS-->>Sandbox: 200 {sessionId, workspaceId, policyBundle, workspaceServiceUrl}
 
   Browser->>SS: GET /sessions/{sessionId} (poll)
-  SS-->>Browser: {status: "running"}
+  SS-->>Browser: {status: "SANDBOX_READY"}
   Browser->>SS: GET /sessions/{sessionId}/events (SSE stream)
   SS->>Sandbox: Proxy SSE connection
 ```
 
 **Key decisions:**
 
-1. **Async provisioning (not blocking)**: `POST /sessions` returns immediately with `status: "provisioning"`. The browser polls `GET /sessions/{sessionId}` until status becomes `SESSION_RUNNING`. This avoids HTTP request timeouts during ECS provisioning.
+1. **Async provisioning (not blocking)**: `POST /sessions` returns immediately with `status: "SANDBOX_PROVISIONING"`. The browser polls `GET /sessions/{sessionId}` until status becomes `SANDBOX_READY`. This avoids HTTP request timeouts during ECS provisioning.
 
 2. **Sandbox self-registration**: The container reads its own IP from the ECS task metadata endpoint (`$ECS_CONTAINER_METADATA_URI_V4`) and registers with the Session Service. This avoids the Session Service needing to poll ECS for task IPs.
 
@@ -136,8 +141,7 @@ The existing session status state machine is extended with sandbox-specific stat
 
 | Status | Meaning |
 |--------|---------|
-| `SESSION_CREATED` | Session record created, ECS task requested |
-| `SANDBOX_PROVISIONING` | ECS task is starting (new) |
+| `SANDBOX_PROVISIONING` | Session record created, ECS task starting (initial status for sandbox sessions) |
 | `SANDBOX_READY` | Container registered, ready to accept work (new) |
 | `SESSION_RUNNING` | Task in progress |
 | `SESSION_PAUSED` | Waiting for user input / approval |
@@ -157,7 +161,7 @@ Sandboxes are terminated when any of these conditions are met:
 | Session completed/failed/cancelled | — | No |
 | Idle timeout (no user activity) | 30 minutes | Yes (policy) |
 | Max session duration | 4 hours | Yes (policy) |
-| Concurrent session limit per user | 3 | Yes (policy) |
+| Concurrent session limit per user | 5 | Yes (policy) |
 
 On termination:
 1. Agent runtime performs graceful shutdown (flush logs, sync final state to Workspace Service)
@@ -186,17 +190,17 @@ Both channels are proxied through the Session Service — the browser connects t
 
 ### 4.3 HttpTransport
 
-A new `HttpTransport` class in `agent_host/server/` provides the same interface as `StdioTransport` but over HTTP:
+A new `HttpTransport` class in `agent_host/server/` provides the same interface as `StdioTransport` but over HTTP. Built on **Starlette** (not FastAPI) for minimal overhead — the transport layer needs routing and streaming, not dependency injection or OpenAPI generation.
 
 ```python
 # agent_host/server/http_transport.py
 
 class HttpTransport:
-    """HTTP transport for web execution.
+    """HTTP transport for web execution (Starlette ASGI app, served by uvicorn).
 
     Exposes:
     - POST /rpc     — JSON-RPC 2.0 request handling (same MethodDispatcher)
-    - GET  /events  — SSE stream of SessionEvents
+    - GET  /events  — SSE stream of SessionEvents (supports Last-Event-ID replay)
     - GET  /health  — Container health check
     """
 ```
@@ -237,14 +241,14 @@ The Session Service routes browser requests to the correct sandbox using the reg
 ```
 Browser → POST /sessions/{sessionId}/rpc     → Session Service → POST http://{sandboxIp}:8080/rpc
 Browser → GET  /sessions/{sessionId}/events   → Session Service → GET  http://{sandboxIp}:8080/events (SSE proxy)
-Browser → POST /sessions/{sessionId}/upload   → Session Service → multipart forward to sandbox
+Browser → POST /sessions/{sessionId}/upload   → Session Service → S3 persist + sandbox sync (two-phase)
 ```
 
 **Proxy implementation:** The Session Service resolves `sandboxEndpoint` from the DynamoDB session record (not in-memory — Session Service runs multiple instances behind ALB, so any instance may handle any request). A short TTL cache (e.g. 30s) avoids repeated DynamoDB reads for the same session. On proxy requests, it:
 1. Looks up the sandbox endpoint from the session record (cached)
 2. Validates the session is in an active state and the caller owns the session
 3. Updates `lastActivityAt` on the session record (batched, not per-request — see Section 10.5)
-4. Forwards the request (streaming for SSE, buffered for RPC/upload)
+4. Forwards the request (streaming for SSE, buffered for RPC; upload uses two-phase orchestration — see Section 5.2)
 5. Returns the sandbox response to the browser
 
 **SSE proxy:** SSE is a long-lived connection. The proxy uses `httpx.AsyncClient.stream()` with `StreamingResponse` to pipe chunks from the sandbox to the browser. Connection drops on either side are detected and cleaned up. Proxy timeout is set to match `maxSessionDuration` (default 4h).
@@ -262,32 +266,43 @@ Web sessions use a `cloud`-scoped workspace. Unlike `local` workspaces (which re
 | Aspect | Local Workspace | Cloud Workspace |
 |--------|----------------|-----------------|
 | Source files | User's filesystem | S3 bucket → synced to container local disk |
-| File upload | Not needed (direct access) | Upload via Session Service → sandbox |
+| File upload | Not needed (direct access) | Upload via Session Service → S3 (Workspace Service) + sandbox sync |
 | Persistence | Files persist on user's machine | Ephemeral in container, durable in S3 |
 | Artifact storage | Upload to Workspace Service | Same — upload to Workspace Service |
 
 ### 5.2 File Upload Flow
 
-Users can upload files at session creation or during a session:
+Users can upload files at session creation or during a session. Uploads use a **two-phase flow**: S3 persist first (always durable), then sandbox sync (best-effort). See [workspace-file-sync.md](../design/workspace-file-sync.md) for the full design.
 
 ```mermaid
 sequenceDiagram
   participant Browser as Browser
   participant SS as Session Service
-  participant Sandbox as Sandbox Container
+  participant WS as Workspace Service
   participant S3 as S3
+  participant Sandbox as Sandbox Container
 
-  Browser->>SS: POST /sessions/{sessionId}/upload (multipart)
-  SS->>Sandbox: Forward multipart upload
-  Sandbox->>Sandbox: Write files to workspace directory
-  Sandbox->>S3: Sync workspace to S3
-  Sandbox-->>SS: 200 OK {files: [...]}
-  SS-->>Browser: 200 OK {files: [...]}
+  Browser->>SS: POST /sessions/{sessionId}/upload?path=X (multipart)
+  SS->>WS: POST /workspaces/{workspaceId}/files?path=X (multipart)
+  WS->>S3: PutObject
+  WS-->>SS: 200 OK {path, size}
+  alt Sandbox is running (SANDBOX_READY / SESSION_RUNNING / ...)
+    SS->>Sandbox: JSON-RPC workspace.sync {direction: "pull", paths: ["X"]}
+    Sandbox->>WS: GET /workspaces/{workspaceId}/files/X
+    WS->>S3: GetObject
+    WS-->>Sandbox: file content
+    Sandbox-->>SS: {synced: ["X"]}
+  end
+  SS-->>Browser: 200 OK {path, size, persisted: true, sandboxSynced: true|false}
 ```
 
+**Key behaviors:**
+- **Non-terminal sessions** always accept uploads — even during `SANDBOX_PROVISIONING` (before sandbox is running). Files persist to S3 immediately and sync to sandbox when it becomes ready (sandbox calls `download_workspace()` on startup).
+- **Terminal sessions** (`SESSION_CANCELLED`, `SANDBOX_TERMINATED`) reject uploads with `409`.
+- **Sandbox sync failure** does not fail the upload — the response includes `sandboxSynced: false` so the client knows the file is saved but not yet on the sandbox.
+
 **Upload limits:**
-- Max file size: 50 MB per file
-- Max total upload per session: 500 MB
+- Max file size: 50 MB per file (client-side guard + server-side 413)
 - Allowed file types: configurable via policy (default: common source code, documents, images)
 
 ### 5.3 Workspace Sync
@@ -296,7 +311,8 @@ The sandbox container syncs its local workspace to S3 periodically and on key ev
 
 | Trigger | Direction |
 |---------|-----------|
-| Session start (files uploaded) | S3 → Container |
+| Session start (`download_workspace()`) | S3 → Container |
+| `workspace.sync` RPC from Session Service (after upload) | S3 → Container (targeted files) |
 | After each task completion | Container → S3 |
 | Every N steps (configurable, default 10) | Container → S3 |
 | Session end (graceful shutdown) | Container → S3 |
@@ -500,24 +516,28 @@ Called by the sandbox container during startup:
 ```json
 {
   "sandboxEndpoint": "http://10.0.1.42:8080",
-  "taskArn": "arn:aws:ecs:us-east-1:123456789:task/cowork-dev/abc123"
+  "taskArn": "arn:aws:ecs:us-east-1:123456789:task/cowork-dev/abc123",
+  "registrationToken": "uuid-generated-at-session-creation"
 }
 ```
 
 **Behavior:**
 1. Validate the session exists and is in `SANDBOX_PROVISIONING` state
-2. Validate the `taskArn` matches the ARN stored at `RunTask` time (prevents sandbox impersonation)
-3. Store `sandboxEndpoint` on the session record
-4. Update session status to `SANDBOX_READY`
-5. Return a session-scoped auth token for the sandbox to use with backend services
+2. Validate the `registrationToken` matches the token stored at session creation time
+3. Validate the `taskArn` matches the ARN stored at `RunTask` time (prevents sandbox impersonation)
+4. Store `sandboxEndpoint` on the session record
+5. Fetch policy bundle from Policy Service (deferred from session creation)
+6. Update session status to `SANDBOX_READY`
+7. Return session config, workspace info, and policy bundle
 
 **Response:**
 ```json
 {
-  "sessionToken": "sandbox_tok_...",
+  "sessionId": "sess_789",
+  "workspaceId": "ws_456",
   "workspaceServiceUrl": "https://...",
-  "llmGatewayEndpoint": "https://..."
-}
+  "llmGatewayEndpoint": "",
+  "policyBundle": { ... }
 ```
 
 ### 10.3 Session Record Extensions
@@ -574,7 +594,7 @@ To avoid a DynamoDB write on every request, updates are batched: the proxy cache
 
 ### 10.6 Concurrent Session Limit
 
-At session creation time (`POST /sessions` with `executionEnvironment: cloud_sandbox`), the Session Service queries the `tenantId-userId-index` GSI to count active sandbox sessions for the user (status in `SANDBOX_PROVISIONING`, `SANDBOX_READY`, `SESSION_RUNNING`, `SESSION_PAUSED`). If the count exceeds the limit (default: 3), the request is rejected with `409 Conflict` and a structured error.
+At session creation time (`POST /sessions` with `executionEnvironment: cloud_sandbox`), the Session Service queries the `tenantId-userId-index` GSI to count active sandbox sessions for the user (status in `SANDBOX_PROVISIONING`, `SANDBOX_READY`, `SESSION_RUNNING`, `SESSION_PAUSED`). If the count exceeds the limit (default: 5), the request is rejected with `409 Conflict` and a structured error.
 
 ---
 
@@ -654,19 +674,21 @@ sequenceDiagram
   participant WS as Workspace Service
 
   B->>SS: POST /sessions (cloud_sandbox)
+  SS->>SS: Create session (SANDBOX_PROVISIONING, generate registrationToken)
+  SS->>ECS: RunTask (registrationToken, sessionId)
+  SS->>SS: Store expectedTaskArn
+  SS-->>B: 201 {sessionId, workspaceId, status: SANDBOX_PROVISIONING}
+
+  S->>SS: POST /register {endpoint, taskArn, registrationToken}
   SS->>PS: GET policy bundle
   PS-->>SS: Policy bundle
-  SS->>SS: Create session (SANDBOX_PROVISIONING)
-  SS->>ECS: RunTask
-  SS-->>B: 201 {sessionId, status: provisioning}
+  SS-->>S: {sessionId, workspaceId, policyBundle, workspaceServiceUrl}
+  S->>WS: download_workspace() (sync files from S3)
 
-  S->>SS: POST /register {endpoint}
-  SS-->>S: {sessionToken, config}
-
-  B->>SS: GET /sessions/{id} → status: running
-  B->>SS: POST /upload (files)
-  SS->>S: Forward files
-  S->>S: Write to /workspace
+  B->>SS: GET /sessions/{id} → status: SANDBOX_READY
+  B->>SS: POST /upload?path=X (multipart)
+  SS->>WS: Persist to S3
+  SS->>S: workspace.sync RPC (best-effort)
 
   B->>SS: GET /events (SSE)
   SS->>S: Proxy SSE

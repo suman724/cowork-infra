@@ -376,7 +376,7 @@ Add proxy endpoints that forward browser requests to the sandbox container.
 2. Create `routes/proxy.py`:
    - `POST /sessions/{sessionId}/rpc` — forward JSON-RPC to sandbox `/rpc`, return response
    - `GET /sessions/{sessionId}/events` — SSE proxy: `httpx.AsyncClient.stream()` → `StreamingResponse`
-   - `POST /sessions/{sessionId}/upload` — forward multipart to sandbox `/upload`
+   - `POST /sessions/{sessionId}/upload` — unified upload: S3 persist via Workspace Service + sandbox sync via `workspace.sync` RPC (see [workspace-file-sync.md](../design/workspace-file-sync.md))
    - `GET /sessions/{sessionId}/files/{path:path}` — forward to sandbox `/files/{path}`
    - `GET /sessions/{sessionId}/files` — forward to sandbox `/files?archive=true`
 3. Error handling:
@@ -1016,15 +1016,16 @@ Prerequisite: Phase 3c complete and deployed.
 ## Step 19 — Enhanced File Management (web-app)
 
 **Repo:** `cowork-web-app`
+**Prerequisite:** [Workspace File Sync](../design/workspace-file-sync.md) (unified upload with S3 persistence + sandbox sync)
 
-Improve the file browser from basic list to a full workspace explorer.
+Improve the file browser from basic list to a full workspace explorer. Basic upload (button + drag-and-drop with sync status display) is already implemented as part of workspace file sync — this step adds advanced browsing and editing.
 
 ### Work
 
 1. Tree view: hierarchical directory display with expand/collapse
 2. Inline file viewer: syntax-highlighted code viewer for common languages
-3. Inline editor: Monaco-based editor for quick edits (saves back to sandbox)
-4. Drag-and-drop upload: drop files/folders onto file browser
+3. Inline editor: Monaco-based editor for quick edits (saves via unified upload endpoint)
+4. Drag-and-drop upload: drop files/folders onto file browser (basic single-file drag-and-drop already implemented)
 5. Multi-file download: select multiple files → download as zip
 6. File change indicators: show which files were modified by the agent (from `file_diff` artifacts)
 
@@ -1042,7 +1043,7 @@ Improve the file browser from basic list to a full workspace explorer.
 - Can view and edit files inline
 - Drag-and-drop upload works
 - Modified files are visually indicated
-- **Wiring check**: Verify file list API response structure matches tree view component's expected format. Verify inline editor save calls the correct sandbox file write endpoint. Verify file change indicators correctly parse `file_diff` artifact data from workspace-service
+- **Wiring check**: Verify file list API response structure matches tree view component's expected format. Verify inline editor save calls the unified upload endpoint (`POST /sessions/{id}/upload?path=X`). Verify file change indicators correctly parse `file_diff` artifact data from workspace-service
 - **Self-review**: Review for missing loading/error states in all file operations, ensure large file handling (don't load 10MB file into Monaco), verify drag-and-drop respects upload size limits from policy
 - **Logical bug review**: Verify tree view handles symlinks and circular references (if present in workspace). Verify inline editor doesn't lose unsaved changes on SSE event (agent modifies same file). Verify multi-file download zip generation handles special characters in filenames. Verify file change indicators correctly match artifact `file_diff` paths to tree view paths (relative vs absolute)
 - **Local run**: `make dev` with all backend services running locally. Upload files, browse tree, edit inline, download — all against LocalStack

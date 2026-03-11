@@ -291,7 +291,7 @@ The `session_history` artifact makes this possible. The Local State Store is not
 |------|---------------|-------------------|-----------------|-----------------|
 | **Project session** | `local` | Auto-resolved from `workspaceHint` (local directory path) | Reused across sessions — one per project | Uploaded to Workspace Service after each task |
 | **General chat** | `general` | Auto-created fresh for each session | Single-use — not shared across general chat sessions | Uploaded to Workspace Service after each task |
-| **Web session** (Phase 3+) | `cloud` | Auto-created or resolved | TBD | Uploaded to Workspace Service after each task |
+| **Web session** | `cloud` | Auto-created fresh per sandbox session (S3-backed) | Single-use — one workspace per sandbox session | Uploaded to Workspace Service after each task |
 
 ---
 

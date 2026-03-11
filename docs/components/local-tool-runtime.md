@@ -61,17 +61,13 @@ flowchart LR
 ### Package layout
 
 ```
-tool-runtime/
+tool_runtime/
   router/         — ToolRouter implementation, tool registry, dispatch
-  tools/
-    file/         — ReadFile, WriteFile, DeleteFile implementations
-    shell/        — RunCommand implementation
-    network/      — HttpRequest, FetchUrl, WebSearch implementations
-    code/         — ExecuteCode implementation (Python script execution)
+  tools/          — Tool implementations (file, shell, network, code — registered via router)
   code/           — Code execution engine (PythonExecutor, preamble, CodeExecutionResult)
   platform/       — OS abstraction layer (path handling, shell resolution, encoding)
-  mcp/            — MCP client: discovery, connection, lifecycle, manifest translation (Phase 2+)
   output/         — Output formatting, truncation, artifact extraction
+  mcp/            — MCP client: discovery, connection, lifecycle, manifest translation (Phase 2+ — not yet implemented)
 ```
 
 ### Module dependencies

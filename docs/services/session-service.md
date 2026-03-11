@@ -69,7 +69,7 @@ Called by the Local Agent Host at startup to establish a new session.
 }
 ```
 
-**Response:**
+**Response (desktop):**
 ```json
 {
   "sessionId": "sess_789",
@@ -78,11 +78,27 @@ Called by the Local Agent Host at startup to establish a new session.
   "compatibilityStatus": "compatible",
   "policyBundle": { ... },
   "featureFlags": {
-    "approvalUiEnabled": true,
+    "approvalUiEnabled": false,
     "mcpEnabled": false
   }
 }
 ```
+
+**Response (cloud_sandbox):**
+```json
+{
+  "sessionId": "sess_789",
+  "workspaceId": "ws_456",
+  "name": "",
+  "status": "SANDBOX_PROVISIONING",
+  "featureFlags": {
+    "approvalUiEnabled": false,
+    "mcpEnabled": false
+  }
+}
+```
+
+Note: Sandbox sessions do not include `policyBundle` or `compatibilityStatus` in the creation response — the policy bundle is fetched and returned during the registration step (`POST /sessions/{id}/register`).
 
 > **LLM Gateway configuration** (endpoint and auth token) is not included in the response. The agent-runtime reads both from local environment variables (`LLM_GATEWAY_ENDPOINT`, `LLM_GATEWAY_AUTH_TOKEN`). This avoids sending credentials in API responses. LLM Gateway configuration will be revisited in a later phase.
 
@@ -293,13 +309,14 @@ Returns a single task by ID.
 
 ### POST /sessions/{sessionId}/register — Sandbox Self-Registration
 
-Called by the sandbox container after startup. Validates the task ARN matches what was stored at launch time, stores the sandbox endpoint, transitions status to `SANDBOX_READY`, and returns the policy bundle.
+Called by the sandbox container after startup. Validates the registration token and task ARN match what was stored at launch time, stores the sandbox endpoint, fetches the policy bundle from the Policy Service, transitions status to `SANDBOX_READY`, and returns the policy bundle and service URLs.
 
 **Request:**
 ```json
 {
   "sandboxEndpoint": "http://10.0.1.42:8080",
-  "taskArn": "arn:aws:ecs:us-east-1:123456789:task/cowork-dev/abc123"
+  "taskArn": "arn:aws:ecs:us-east-1:123456789:task/cowork-dev/abc123",
+  "registrationToken": "uuid-generated-at-session-creation"
 }
 ```
 
@@ -314,9 +331,11 @@ Called by the sandbox container after startup. Validates the task ARN matches wh
 }
 ```
 
+**Registration token flow:** A UUID registration token is generated during session creation and stored on the session record *before* the sandbox container is launched. The token is passed to the container as the `REGISTRATION_TOKEN` environment variable. At registration time, the container must present this token — preventing unauthorized containers from registering against a session.
+
 **Errors:**
 - 404 — session not found
-- 409 — session not in `SANDBOX_PROVISIONING` state, or task ARN mismatch
+- 409 — session not in `SANDBOX_PROVISIONING` state, task ARN mismatch, or registration token mismatch
 
 ### GET /sessions/{sessionId} — Get Session Metadata
 
@@ -338,7 +357,7 @@ Called by the sandbox container after startup. Validates the task ARN matches wh
 
 ---
 
-## Session Handshake Flow
+## Session Handshake Flow (Desktop)
 
 ```mermaid
 sequenceDiagram
@@ -353,6 +372,33 @@ sequenceDiagram
   SessionService->>PolicyService: GET policy bundle (tenantId, userId, capabilities)
   PolicyService-->>SessionService: Policy bundle
   SessionService-->>LocalAgentHost: sessionId, workspaceId, policyBundle, featureFlags
+```
+
+## Sandbox Handshake Flow (cloud_sandbox)
+
+```mermaid
+sequenceDiagram
+  participant Browser
+  participant SessionService as Session Service
+  participant WorkspaceService as Workspace Service
+  participant PolicyService as Policy Service
+  participant ECS as ECS
+  participant Sandbox as Sandbox Container
+
+  Browser->>SessionService: POST /sessions (executionEnvironment: cloud_sandbox)
+  SessionService->>WorkspaceService: Create cloud workspace
+  WorkspaceService-->>SessionService: workspaceId
+  SessionService->>SessionService: Generate registrationToken, status → SANDBOX_PROVISIONING
+  SessionService->>ECS: RunTask (sessionId, registrationToken)
+  SessionService->>SessionService: Store expectedTaskArn
+  SessionService-->>Browser: sessionId, workspaceId, status: SANDBOX_PROVISIONING
+
+  Sandbox->>SessionService: POST /sessions/{id}/register (endpoint, taskArn, registrationToken)
+  SessionService->>SessionService: Validate token + ARN
+  SessionService->>PolicyService: GET policy bundle
+  PolicyService-->>SessionService: Policy bundle
+  SessionService->>SessionService: Store endpoint, status → SANDBOX_READY
+  SessionService-->>Sandbox: sessionId, workspaceId, policyBundle, workspaceServiceUrl
 ```
 
 ---
@@ -386,11 +432,16 @@ sequenceDiagram
 | `status` | enum | `SESSION_CREATED`, `SESSION_RUNNING`, `SESSION_PAUSED`, `SESSION_COMPLETED`, `SESSION_FAILED`, `SESSION_CANCELLED`, `SANDBOX_PROVISIONING`, `SANDBOX_READY`, `SANDBOX_TERMINATED` |
 | `createdAt` | datetime | Session creation time |
 | `expiresAt` | datetime | Policy bundle expiry — session must not continue past this |
+| `updatedAt` | datetime | Last update time |
 | `sandboxEndpoint` | string? | Internal IP:port of sandbox container (cloud_sandbox only, set at registration) |
 | `taskArn` | string? | ECS task ARN (cloud_sandbox only) |
 | `expectedTaskArn` | string? | Expected task ARN for registration validation (cloud_sandbox only) |
+| `registrationToken` | string? | One-time UUID token for sandbox self-registration validation (cloud_sandbox only, generated at session creation) |
 | `networkAccess` | enum? | `enabled` or `disabled` — outbound internet for sandbox (cloud_sandbox only) |
 | `lastActivityAt` | datetime? | Last user interaction time for idle timeout (cloud_sandbox only) |
+| `desktopAppVersion` | string? | Desktop app version from `clientInfo` (desktop only) |
+| `agentHostVersion` | string? | Agent host version from `clientInfo` (desktop only) |
+| `supportedCapabilities` | list[string]? | Capabilities the client supports |
 
 ---
 
@@ -413,7 +464,7 @@ sequenceDiagram
 
 ### Stored attributes
 
-`sessionId`, `tenantId`, `userId`, `workspaceId`, `executionEnvironment`, `status`, `name`, `autoNamed`, `createdAt`, `expiresAt`, `ttl`, `clientInfo`
+`sessionId`, `tenantId`, `userId`, `workspaceId`, `executionEnvironment`, `status`, `name`, `autoNamed`, `createdAt`, `expiresAt`, `updatedAt`, `ttl`, `desktopAppVersion`, `agentHostVersion`, `supportedCapabilities`, `sandboxEndpoint`, `taskArn`, `expectedTaskArn`, `registrationToken`, `networkAccess`, `lastActivityAt`
 
 ---
 
