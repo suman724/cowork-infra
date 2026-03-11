@@ -148,6 +148,7 @@ Both transports use the same `MethodDispatcher` and `EventEmitter`, ensuring ide
 | `GetPatchPreview` | DA → AH | Return pending file changes for user review |
 | `ApproveAction` | DA → AH | Deliver user's approval or denial decision |
 | `Shutdown` | DA → AH | Clean session teardown |
+| `workspace.sync` | SS → AH | Trigger targeted file sync between S3 and sandbox (HTTP transport only) |
 
 `SessionEvent` notifications flow AH → DA (no reply expected). These stream live progress during task execution.
 
@@ -275,15 +276,39 @@ When the agent host runs inside a sandbox container (e.g., cloud workspace), it 
 
 **Workspace file sync (`workspace_sync.py`):**
 
-- **On startup**: Downloads files from the Workspace Service into the local workspace directory. Runs before the agent starts serving requests.
-- **On SIGTERM**: Uploads modified workspace files back to the Workspace Service before the process exits. Integrates with the existing graceful shutdown flow in [Section 3.4](#34-session-teardown).
+- **On startup**: `download_workspace()` downloads all files from the Workspace Service into the local workspace directory. Runs before the agent starts serving requests. The startup sync gate (`_startup_sync_complete: asyncio.Event`) is set after this completes (even on failure), unblocking any pending `workspace.sync` RPCs.
+- **On SIGTERM**: `upload_workspace()` uploads modified workspace files back to the Workspace Service before the process exits. Integrates with the existing graceful shutdown flow in [Section 3.4](#34-session-teardown).
+- **Targeted sync** (via `workspace.sync` RPC): `download_files()` and `upload_files()` sync specific file paths between S3 and the sandbox filesystem. Called by Session Service after file uploads.
+
+**`workspace.sync` RPC (HTTP transport only):**
+
+Session Service calls this method to notify the sandbox that files have been uploaded to S3 and need to be pulled into the local workspace.
+
+```json
+{
+  "jsonrpc": "2.0", "id": 1,
+  "method": "workspace.sync",
+  "params": { "direction": "pull", "paths": ["src/main.py"] }
+}
+```
+
+| Param | Type | Description |
+|-------|------|-------------|
+| `direction` | `"pull"` or `"push"` | `pull` = S3 → sandbox, `push` = sandbox → S3 |
+| `paths` | `string[]` (optional) | Specific files to sync. Omit for full sync. |
+
+Returns `{ "synced": [...], "failed": [...], "direction": "pull" }`.
+
+**Concurrency controls:**
+- **Startup sync gate** (`asyncio.Event`): `workspace.sync` RPCs block until the initial `download_workspace()` completes. 30s timeout, after which `WorkspaceSyncError` is returned.
+- **Sync serialization lock** (`asyncio.Lock`): Only one sync operation runs at a time, preventing concurrent pull/push from corrupting the workspace.
 
 **Error codes:**
 
 | Code | Name | When |
 |------|------|------|
 | `-32060` | `SandboxStartupError` | Registration call fails, missing env vars, or invalid registration token |
-| `-32061` | `WorkspaceSyncError` | Workspace file download or upload fails |
+| `-32061` | `WorkspaceSyncError` | Workspace file download/upload fails, startup sync not complete, invalid direction, missing sync context |
 
 ---
 
