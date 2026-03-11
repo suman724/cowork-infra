@@ -56,6 +56,7 @@ The Workspace Service is the canonical backend store for agent-produced artifact
 | `tenantId` | string | Tenant |
 | `userId` | string | Owner |
 | `localPath` | string (optional) | The local directory this workspace maps to — present for `local`-scoped workspaces only |
+| `s3WorkspacePrefix` | string (optional) | S3 key prefix for workspace files — present for `cloud`-scoped workspaces: `{workspaceId}/workspace-files/` |
 | `createdAt` | datetime | |
 | `lastActiveAt` | datetime | Updated on every artifact upload — used for auto-purge |
 
@@ -65,7 +66,7 @@ The Workspace Service is the canonical backend store for agent-produced artifact
 |-------|---------|-------|
 | `local` | Maps to a project directory on client machine. No source files uploaded. | Reused across many sessions for the same project |
 | `general` | General chat with no project directory. May have files scoped to this session. | Single-use — one workspace per session |
-| `cloud` | Files in cloud sandbox (Phase 3+) | TBD |
+| `cloud` | S3-backed workspace for sandbox sessions. Files stored under `{workspaceId}/workspace-files/`. Supports file CRUD via `/files` endpoints. | Always new — one workspace per sandbox session |
 
 ---
 
@@ -209,6 +210,49 @@ Called by the Desktop App to delete all artifacts for a specific session within 
 
 ---
 
+### Workspace File Endpoints (cloud scope only)
+
+File operations are only available for `cloud`-scoped workspaces. Non-cloud workspaces return `400`.
+
+#### POST /workspaces/{workspaceId}/files — Upload File
+
+Multipart form upload with `path` query parameter specifying the relative file path.
+
+**Query Parameters:**
+- `path` (required): Relative file path (e.g., `src/main.py`). Validated against directory traversal.
+
+**Request:** Multipart form with `file` field.
+
+**Response:**
+```json
+{
+  "path": "src/main.py",
+  "size": 1234
+}
+```
+
+#### GET /workspaces/{workspaceId}/files — List Files
+
+**Response:**
+```json
+[
+  {"path": "src/main.py", "size": 1234},
+  {"path": "README.md", "size": 567}
+]
+```
+
+#### GET /workspaces/{workspaceId}/files/{path} — Download File
+
+Returns raw file content with `application/octet-stream` content type.
+
+#### DELETE /workspaces/{workspaceId}/files/{path} — Delete File
+
+**Response:** `204 No Content`
+
+**Security:** File paths are validated to prevent directory traversal. Absolute paths, `..` components, and paths that normalize to escape the workspace prefix are all rejected.
+
+---
+
 ## Workspace Lifecycle
 
 ```
@@ -251,7 +295,7 @@ Stores workspace records.
 
 *`localPathKey` is a composite attribute: `{tenantId}#{userId}#{localPath}` — populated only for `local`-scoped workspaces.
 
-Stored attributes: `workspaceId`, `tenantId`, `userId`, `workspaceScope`, `localPath`, `localPathKey`, `createdAt`, `lastActiveAt`
+Stored attributes: `workspaceId`, `tenantId`, `userId`, `workspaceScope`, `localPath`, `localPathKey`, `s3WorkspacePrefix`, `createdAt`, `lastActiveAt`
 
 ### DynamoDB — `{env}-artifacts` table
 
