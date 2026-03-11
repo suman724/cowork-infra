@@ -303,8 +303,8 @@ Capabilities are issued in the policy bundle and enforced by **Local Policy Enfo
 ### Tool Architecture
 
 - **Phase 1 — built-in tools:** File, shell, and network tools run directly inside the Local Tool Runtime, always available.
+- **Phase 1 — skills:** The SkillLoader discovers skill definitions from multiple sources and registers them as tools. Skills are loaded at session startup with the following priority order (higher priority wins on name collision): **policy bundle > workspace > user > built-in**. Workspace-level skills are discovered from `{workspace}/.cowork/skills/` — this allows project-specific skills to be checked into a repository.
 - **Phase 2+ — MCP extension:** Local Tool Runtime acts as an MCP client. It discovers and connects to remote MCP servers over streamable HTTP, translating their tool manifests to the internal `ToolRequest`/`ToolResult` contract. MCP servers are never invoked directly by the agent loop — capability checks and approval gates always happen in the routing layer first.
-- **Skills are deferred** to Phase 4, once recurring tool sequences are well understood from usage patterns.
 
 ---
 
@@ -776,11 +776,20 @@ The same design works for web by running the agent runtime in a backend sandbox 
 
 **Sandbox session lifecycle:**
 1. Browser → `POST /sessions` with `executionEnvironment: "cloud_sandbox"` → Session Service creates session in `SANDBOX_PROVISIONING`, launches ECS task, creates `cloud`-scoped workspace
-2. ECS container starts, reads task metadata, calls `POST /sessions/{id}/register` with `sandboxEndpoint` and `taskArn` → Session Service validates ARN, fetches policy bundle, transitions to `SANDBOX_READY`
-3. Browser → Session Service proxy endpoints (`/sessions/{id}/rpc`, `/sessions/{id}/events`) → forwarded to sandbox `HttpTransport`
-4. Sandbox agent runtime uses `HttpTransport` (HTTP + SSE) instead of `StdioTransport` (stdio)
-5. Sandbox syncs workspace files via Workspace Service (`POST /workspaces/{id}/files`, `GET /workspaces/{id}/files/{path}`)
-6. On idle timeout, max duration, or explicit termination → `SANDBOX_TERMINATED` (terminal state)
+2. ECS container starts, agent runtime detects sandbox mode (`SESSION_ID` env var set + `--transport http`), reads ECS task metadata (container IP, task ARN) via the ECS metadata endpoint, calls `POST /sessions/{id}/register` with `sandboxEndpoint`, `taskArn`, and `REGISTRATION_TOKEN` → Session Service validates token and ARN, returns policy bundle + workspace ID, transitions to `SANDBOX_READY`
+3. Agent runtime syncs workspace files down from Workspace Service via individual file CRUD (`GET /workspaces/{id}/files/{path}`) into the local working directory
+4. Browser → Session Service proxy endpoints (`/sessions/{id}/rpc`, `/sessions/{id}/events`) → forwarded to sandbox `HttpTransport`
+5. Sandbox agent runtime uses `HttpTransport` (HTTP + SSE) instead of `StdioTransport` (stdio)
+6. On SIGTERM (idle timeout, max duration, or explicit termination) → agent uploads modified workspace files to Workspace Service (`POST /workspaces/{id}/files`) → calls `POST /sessions/{id}/shutdown` → exits cleanly → `SANDBOX_TERMINATED` (terminal state)
+
+**Sandbox environment variables:**
+
+| Variable | Purpose |
+|----------|---------|
+| `SESSION_ID` | Triggers sandbox self-registration mode when set |
+| `REGISTRATION_TOKEN` | One-time token for `POST /sessions/{id}/register` authentication |
+| `SANDBOX_LOCAL_MODE` | When `true`, skips ECS metadata lookup (for local dev/test) |
+| `SKILLS_DIR` | Optional override for the skills discovery directory |
 
 **Transport modes:**
 - **StdioTransport** (desktop): JSON-RPC over stdin/stdout. Desktop App manages the process lifecycle.

@@ -78,7 +78,8 @@ agent-host/
   llm/             — LLM Gateway streaming client (openai SDK), response models, error classifier
   thread/          — Message thread management, context compaction, token counting
   memory/          — Working memory (task tracker, plan, notes) + persistent memory (project instructions, auto-memory)
-  skills/          — Skill definitions, loader (built-in/markdown/policy)
+  skills/          — Skill definitions, loader (built-in/user/workspace/policy)
+  sandbox/         — Sandbox startup (self-registration, workspace file sync)
   policy/          — Local Policy Enforcer (capability checks, path/command enforcement, risk assessment)
   budget/          — Token budget tracking (pre-check + record_usage)
   approval/        — Approval gate (asyncio Futures for user approval flow)
@@ -175,6 +176,8 @@ Step-by-step algorithm for `CreateSession`:
 
 > Session Service API: [services/session-service.md](../services/session-service.md)
 
+Steps 6–13 above are extracted into a shared `_activate_session()` helper, which is also used by `ResumeSession` and `init_from_registration()` (see [Section 3.5](#35-sandbox-mode)).
+
 ### 3.3 Session State Machine
 
 The state machine is **two-level**: a session-level machine governs overall lifecycle, and a task-level machine governs agent loop execution within a running session.
@@ -247,6 +250,40 @@ Step-by-step algorithm for `Shutdown`:
 7. Close LLM client connection
 8. Close JSON-RPC server
 9. Exit process
+
+### 3.5 Sandbox Mode
+
+When the agent host runs inside a sandbox container (e.g., cloud workspace), it performs **self-registration** instead of waiting for a `CreateSession` JSON-RPC call from the Desktop App. The `sandbox/` module (`startup.py`, `workspace_sync.py`) handles this flow.
+
+**Environment variables (sandbox-specific):**
+
+| Variable | Purpose |
+|----------|---------|
+| `SESSION_ID` | Pre-assigned session ID for this sandbox instance |
+| `REGISTRATION_TOKEN` | One-time token for self-registration with Session Service |
+| `SANDBOX_LOCAL_MODE` | If `true`, skip registration and use local-only mode (for development) |
+
+**Startup algorithm (`SessionManager.init_from_registration()`):**
+
+1. Read `SESSION_ID` and `REGISTRATION_TOKEN` from environment
+2. Call Session Service `POST /sessions/{SESSION_ID}/register` with the registration token
+3. Receive response: `workspaceId`, `policyBundle`, `featureFlags` (same shape as `CreateSession` response)
+4. Validate policy bundle (same checks as `CreateSession` step 5)
+5. **Workspace file sync**: Download workspace files from the Workspace Service into the local workspace directory before the agent starts serving requests
+6. Call `_activate_session()` (shared helper — steps 6–13 of `CreateSession`)
+7. Agent host is now ready to accept `StartTask` calls
+
+**Workspace file sync (`workspace_sync.py`):**
+
+- **On startup**: Downloads files from the Workspace Service into the local workspace directory. Runs before the agent starts serving requests.
+- **On SIGTERM**: Uploads modified workspace files back to the Workspace Service before the process exits. Integrates with the existing graceful shutdown flow in [Section 3.4](#34-session-teardown).
+
+**Error codes:**
+
+| Code | Name | When |
+|------|------|------|
+| `-32060` | `SandboxStartupError` | Registration call fails, missing env vars, or invalid registration token |
+| `-32061` | `WorkspaceSyncError` | Workspace file download or upload fails |
 
 ---
 
@@ -747,10 +784,13 @@ Each skill is a directory containing a `SKILL.md` file with YAML frontmatter and
 
 **Skill Loading:**
 
-`SkillLoader` discovers skills from three sources (in priority order):
+`SkillLoader` accepts an optional `workspace_dir` parameter (passed by `SessionManager` when a workspace is active) and discovers skills from four sources. Later sources override earlier ones when names collide:
 1. **Built-in markdown** — embedded markdown strings parsed with the same frontmatter parser
-2. **User directories** — `~/.cowork/skills/<name>/SKILL.md` authored by users
-3. **Policy bundle** — skills provided via the policy bundle from the Policy Service
+2. **User directories** — `~/.cowork/skills/<name>/SKILL.md` authored by users (path overridable via `SKILLS_DIR` env var)
+3. **Workspace skills** — `{workspace_dir}/.cowork/skills/<name>/SKILL.md` discovered from the active workspace directory
+4. **Policy bundle** — skills provided via the policy bundle from the Policy Service
+
+`SessionManager` passes both `workspace_dir` and `config.skills_dir` (from `SKILLS_DIR` env var) to `SkillLoader` during session activation.
 
 **Skill Execution:**
 
@@ -1388,6 +1428,8 @@ Consolidated reference for all error categories:
 | **Network** | Audit / Telemetry unreachable | Silently retry. Never blocks the loop. |
 | **State Store** | Checkpoint write failure | Log warning, continue loop. Next checkpoint will try again. |
 | **State Store** | Checkpoint read failure | Delete corrupt file, notify Desktop App, start fresh session |
+| **Sandbox** | Registration failed (`-32060`) | Log error, exit process. Orchestrator retries sandbox creation. |
+| **Sandbox** | Workspace sync failed (`-32061`) | Log error, exit process. Files may be stale or missing. |
 
 ---
 
