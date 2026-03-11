@@ -119,6 +119,30 @@ Configuration:
 - `AGENT_RUNTIME_PATH` — path to agent-runtime repo (local launcher only)
 - `SESSION_SERVICE_URL` — passed to sandbox as env var for self-registration
 
+**Proxy Layer:**
+
+`ProxyService` forwards browser traffic to sandbox containers through Session Service. The browser never connects directly to sandboxes.
+
+Five proxy endpoints:
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/sessions/{sessionId}/rpc` | Forward JSON-RPC to sandbox `/rpc` |
+| `GET` | `/sessions/{sessionId}/events` | SSE proxy (streaming, `Last-Event-ID` pass-through) |
+| `POST` | `/sessions/{sessionId}/upload` | Forward multipart file upload |
+| `GET` | `/sessions/{sessionId}/files/{path}` | File download from sandbox workspace |
+| `GET` | `/sessions/{sessionId}/files` | File listing or workspace archive download |
+
+Key behaviors:
+- **Endpoint caching:** `sandboxEndpoint` cached per session with configurable TTL (default 30s). Invalidated on sandbox termination or connection errors.
+- **Ownership validation:** Every proxy request verifies `user_id` matches session owner. Returns 403 if not.
+- **State validation:** Only sessions in proxyable states (`SANDBOX_READY`, `SESSION_RUNNING`, `WAITING_FOR_*`, `SESSION_PAUSED`) are forwarded. Returns 409 otherwise.
+- **Activity tracking:** `lastActivityAt` updated on `POST /rpc` and `POST /upload` only (not SSE keepalives). Batched — writes DynamoDB at most once per 60s per session.
+- **Error mapping:** Sandbox unreachable → 503, session not found → 404, inactive → 409, wrong owner → 403.
+- **Connection pool:** Separate `httpx.AsyncClient` for sandbox connections (not shared with Policy/Workspace clients).
+
+Config: `PROXY_ENDPOINT_CACHE_TTL_SECONDS` (30), `PROXY_ACTIVITY_BATCH_SECONDS` (60), `PROXY_TIMEOUT_SECONDS` (30), `PROXY_SSE_TIMEOUT_SECONDS` (14400).
+
 ---
 
 ### POST /sessions/{sessionId}/resume — Resume Session

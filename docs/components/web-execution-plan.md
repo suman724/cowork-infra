@@ -15,7 +15,7 @@
 | 3 | Sandbox Self-Registration | `cowork-session-service` | ✅ Done | `feature/web-execution-design` | Registration endpoint, sandbox session states, conditional write, URL validation |
 | 4 | Cloud Workspace Support | `cowork-workspace-service` | ✅ Done | `feature/web-execution-design` | s3WorkspacePrefix, file CRUD, path traversal prevention |
 | 5 | Sandbox Launcher & ECS | `cowork-session-service` | ✅ Done | `feature/web-execution-design` | EcsSandboxLauncher + LocalSandboxLauncher |
-| 6 | Proxy Layer | `cowork-session-service` | ⏳ Pending | — | Browser → Session Service → Sandbox forwarding |
+| 6 | Proxy Layer | `cowork-session-service` | ✅ Done | `feature/web-execution-design` | ProxyService + 5 proxy endpoints |
 | 7 | Agent Runtime Sandbox Mode | `cowork-agent-runtime` | ⏳ Pending | — | Self-registration, workspace sync, sandbox startup |
 | 7b | Skills Adaptation for Web | `cowork-agent-runtime` | ⏳ Pending | — | Workspace-based skills, SKILLS_DIR env var |
 | 8 | Idle/Provisioning Timeout | `cowork-session-service` | ⏳ Pending | — | Timeout enforcement, background cleanup |
