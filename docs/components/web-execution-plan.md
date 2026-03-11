@@ -17,6 +17,8 @@
 - **Logical bug review**: Every step must include a dedicated pass to check for logical bugs — race conditions, off-by-one errors, null/None dereferences, incorrect state transitions, missing edge cases, wrong comparison operators, inverted boolean logic, and incorrect error propagation. Fix all issues before marking complete.
 - **Local-first development**: Every infrastructure change (DynamoDB tables, GSIs, S3 buckets) must be reflected in `scripts/localstack-init.sh` so the full stack runs locally on a developer's MacBook via `docker-compose up`. Every step's Definition of Done includes verifying the feature works against LocalStack, not just in unit tests.
 - **Local run instructions**: Each repo must have a `make run` target and `.env.example` that allows running the service locally against LocalStack. Integration tests and manual testing should be possible without AWS credentials, using only `docker-compose up` + `make run` in each service.
+- **Documentation sync**: Every step must update all relevant documentation — CLAUDE.md files in affected repos, design docs in `cowork-infra/docs/`, README files, and any other docs that describe changed behavior. This is mandatory and must be included in the Definition of Done.
+- **Pre-step review**: Before starting any step, review the existing code and design docs for the areas being changed. Understand current behavior before modifying it. Check what has already been completed to avoid regressions or duplicate work.
 
 ---
 
@@ -93,6 +95,7 @@ Add schemas and SDK helpers for web execution. This unblocks all other repos.
 - **Wiring check**: Import new types in session-service, workspace-service, agent-runtime — verify they compile/typecheck with no errors
 - **Self-review**: Review all schemas for field name consistency (camelCase in JSON, snake_case in Python), verify enum values match design doc, check codegen output for correctness
 - **Logical bug review**: Verify enum values are exhaustive (no missing states), verify optional vs required fields are correct (e.g. `sandboxEndpoint` must be optional — only present after registration), verify schema defaults don't conflict with domain logic
+- **Documentation**: Update CLAUDE.md, README.md, and design docs in `cowork-infra/docs/` for any changed behavior, new endpoints, new config options, or architectural changes introduced in this step
 
 ---
 
@@ -137,6 +140,55 @@ Extract a `Transport` protocol from the existing `StdioTransport`, then implemen
 - **Self-review**: Review all changed files for unhandled exceptions (especially in SSE streaming and file upload), missing timeouts, missing structured logging on error paths, and ensure Transport protocol is satisfied by both implementations
 - **Logical bug review**: Verify event buffer doesn't lose events under high throughput (ring buffer overwrite vs backpressure). Verify SSE `since` parameter handles edge cases: `since=0` (replay all), `since` greater than max ID (return empty), `since` for an ID that was evicted from buffer (return error, not silent data loss). Verify concurrent SSE clients each get their own stream and don't interfere. Verify file upload path traversal prevention (resolve path, verify within workspace root)
 - **Local run**: `make run-sandbox` starts agent-runtime in HTTP mode on `localhost:8080`. Verify `/health`, `/rpc`, `/events`, `/upload`, `/files` all work locally
+- **Documentation**: Update CLAUDE.md, README.md, and design docs in `cowork-infra/docs/` for any changed behavior, new endpoints, new config options, or architectural changes introduced in this step
+
+---
+
+## Step 2b — Desktop App Event Replay (cowork-desktop-app)
+
+**Repo:** `cowork-desktop-app`
+**Branch:** `feature/web-execution-design` (branch from latest `main`)
+**Depends on:** Step 2 (EventBuffer refactor — shared buffer at EventEmitter level, `GetEvents` JSON-RPC method in agent-runtime)
+
+The `EventBuffer` introduced in Step 2 is shared by both transports, enabling event replay for **all** clients — not just SSE/HTTP. This step adds replay support to the Desktop App so it can recover missed events when the user navigates away from a running session and returns.
+
+### Problem
+
+Currently, the Desktop App dispatches events from `useSessionEvents()` to Zustand stores in real time. If the user navigates away from the conversation view (e.g., to settings or history) while a task is running, and the Electron renderer clears/resets store state on view switch, events emitted during that window are lost. The user returns to a stale or incomplete conversation.
+
+### Work
+
+1. **Agent-runtime: `GetEvents` JSON-RPC method** — Add a new handler that returns buffered events since a given ID. The Desktop App calls this when reconnecting to a running session:
+   ```
+   Request:  { "method": "GetEvents", "params": { "sinceId": 42 } }
+   Response: { "events": [...], "gapDetected": false, "latestId": 87 }
+   ```
+2. **Desktop App: Track last seen event ID** — In the main process (`AgentRuntimeManager` or `JsonRpcClient`), track the monotonic event ID from each `SessionEvent` notification. Store it in memory (not persisted — process restart = full reload from workspace history).
+3. **Desktop App: Replay on view return** — When the user navigates back to the conversation view for an active session:
+   - Call `GetEvents({ sinceId: lastSeenId })` via JSON-RPC
+   - Dispatch each missed event through the same `useSessionEvents` handler (deduplicate by event ID)
+   - Update `lastSeenId` to the latest returned ID
+4. **Desktop App: Handle gap detection** — If `gapDetected: true` (events were evicted from the ring buffer), fall back to loading full session history from Workspace Service (same as current historical session loading).
+5. **Agent-runtime: Include event ID in SessionEvent notifications** — Add an `eventId` field to the `SessionEvent` JSON-RPC notification payload so the Desktop App can track the last seen ID.
+
+### Tests
+
+- Unit (agent-runtime): `GetEvents` handler — returns events since ID, handles gap detection, empty buffer
+- Unit (desktop-app): Event ID tracking in main process — increments on each notification
+- Unit (desktop-app): Replay logic — missed events dispatched in order, duplicates filtered
+- Unit (desktop-app): Gap fallback — triggers full history reload from Workspace Service
+- Integration: Navigate away during task, navigate back, verify no missing messages
+
+### Definition of Done
+
+- `make check` passes on both `cowork-agent-runtime` and `cowork-desktop-app`
+- User can navigate away from a running session and return with no visible data loss
+- Events emitted while user was away appear in correct order after returning
+- If too many events were missed (buffer overflow), full history is loaded from Workspace Service
+- **Wiring check**: Verify `GetEvents` response shape matches what Desktop App expects. Verify `eventId` field is present in all `SessionEvent` notifications. Verify replay events go through the same validation path as live events in `useSessionEvents`
+- **Self-review**: Verify no race conditions between live event dispatch and replay (events could arrive while replay is in progress). Verify `lastSeenId` is reset on session change (don't carry over between sessions). Verify gap fallback actually clears store state before reloading
+- **Logical bug review**: Verify deduplication works (same event dispatched both live and via replay should not appear twice). Verify replay doesn't re-trigger side effects (e.g., approval dialogs). Verify `lastSeenId` is 0 for fresh sessions (not undefined/null)
+- **Documentation**: Update CLAUDE.md, README.md, and design docs in `cowork-infra/docs/` for any changed behavior, new endpoints, new config options, or architectural changes introduced in this step
 
 ---
 
@@ -175,6 +227,7 @@ Add the `/sessions/{sessionId}/register` endpoint and the new session status sta
 - **Self-review**: Review all changed files for missing validation (e.g. malformed taskArn), missing error handling on DynamoDB conditional updates, ensure new fields have proper defaults for desktop sessions (null/None, not breaking)
 - **Logical bug review**: Verify state machine has no impossible transitions (e.g. can't go from `SANDBOX_TERMINATED` back to `SANDBOX_READY`). Verify `expected_task_arn` comparison is exact string match (not prefix/contains). Verify registration is idempotent — calling register twice with same data doesn't fail. Verify conditional update expression handles `ConditionalCheckFailedException` gracefully (race between registration and timeout)
 - **Local run**: Run session-service locally with `make run`, test registration endpoint via `curl` against LocalStack DynamoDB. Verify new fields are persisted and queryable
+- **Documentation**: Update CLAUDE.md, README.md, and design docs in `cowork-infra/docs/` for any changed behavior, new endpoints, new config options, or architectural changes introduced in this step
 
 ---
 
@@ -214,6 +267,7 @@ Implement `cloud` workspace scope — S3-backed workspace that sandboxes sync fi
 - **Self-review**: Review for missing S3 error handling (ClientError → service exceptions), missing size limits on file uploads, missing cleanup on partial failures, ensure delete cascades cover both artifacts and workspace files
 - **Logical bug review**: Verify file path sanitization prevents directory traversal (e.g. `../../etc/passwd` must be rejected). Verify file listing pagination handles empty directories. Verify workspace deletion with thousands of files uses batch delete (not one-by-one). Verify `cloud` workspace creation returns `s3_workspace_prefix` in response (not just stored internally). Verify file upload content-type is preserved in S3 metadata
 - **Local run**: Run workspace-service locally with `make run` against LocalStack. Upload files via `curl`, verify they appear in LocalStack S3 (`awslocal s3 ls s3://dev-workspace-artifacts/{workspaceId}/workspace-files/`)
+- **Documentation**: Update CLAUDE.md, README.md, and design docs in `cowork-infra/docs/` for any changed behavior, new endpoints, new config options, or architectural changes introduced in this step
 
 ---
 
@@ -270,6 +324,7 @@ Add a `SandboxLauncher` abstraction to launch sandbox containers. Two implementa
 - **Self-review**: Review for missing error handling on ECS API calls (ClientError subtypes), ensure session status rollback on launch failure is atomic, verify concurrent limit query uses correct GSI and status filters, check for race conditions between session creation and limit check. Review `LocalSandboxLauncher` for subprocess cleanup (no zombie processes on failure)
 - **Logical bug review**: Verify concurrent session limit count query filters by correct statuses (`SANDBOX_PROVISIONING` + `SANDBOX_READY` + running sessions, not terminated). Verify launch failure doesn't leave session in `SANDBOX_PROVISIONING` forever (must transition to `SESSION_FAILED`). Verify `expected_task_arn` is stored BEFORE launch returns (not after — race with fast-starting container). Verify ECS client handles throttling (too many RunTask calls). Verify `LocalSandboxLauncher` doesn't leak file descriptors (subprocess stdout/stderr must be captured or redirected). Verify free port selection doesn't race (port freed between `socket.bind` and subprocess start — use SO_REUSEADDR or accept the rare collision)
 - **Local run**: Set `SANDBOX_LAUNCHER_TYPE=local` and `AGENT_RUNTIME_PATH=../cowork-agent-runtime` in `.env`. Run `make run`. Create a `cloud_sandbox` session via `curl POST http://localhost:8000/sessions`. Verify: subprocess spawns, registers, session status transitions to `SANDBOX_READY`, proxy endpoints work (Step 6). This is the **primary local testing flow** for all sandbox features
+- **Documentation**: Update CLAUDE.md, README.md, and design docs in `cowork-infra/docs/` for any changed behavior, new endpoints, new config options, or architectural changes introduced in this step
 
 ---
 
@@ -320,6 +375,7 @@ Add proxy endpoints that forward browser requests to the sandbox container.
 - **Self-review**: Review for connection leak risks (SSE proxy must close upstream on client disconnect), missing timeouts on proxy connections, missing structured logging for proxy errors, ensure cache invalidation on session status changes, verify 403/404/409/503 error paths all return structured responses
 - **Logical bug review**: Verify SSE proxy doesn't buffer entire response before forwarding (must stream chunk-by-chunk). Verify `lastActivityAt` batching timer resets correctly (not using wall clock that drifts). Verify cache TTL is per-session (not global — stale entry for session A shouldn't affect session B). Verify proxy doesn't forward internal sandbox errors (500s from sandbox should be wrapped in proxy error response, not passed through raw). Verify endpoint cache is invalidated when session status changes to terminated (don't proxy to dead sandbox)
 - **Local run**: Run session-service with `SANDBOX_ENDPOINT=http://localhost:8080` to bypass DynamoDB sandbox endpoint lookup. Run agent-runtime in HTTP mode on port 8080. Test full proxy flow: `curl http://localhost:8000/sessions/{id}/rpc` → verify it reaches agent-runtime. Test SSE: `curl http://localhost:8000/sessions/{id}/events` → verify events stream through
+- **Documentation**: Update CLAUDE.md, README.md, and design docs in `cowork-infra/docs/` for any changed behavior, new endpoints, new config options, or architectural changes introduced in this step
 
 ---
 
@@ -347,6 +403,7 @@ Wire the sandbox startup flow: read session ID from env, self-register with Sess
    - Skip `CreateSession` JSON-RPC handler (session already exists)
    - Load session context from registration response instead of creating new
 5. Graceful shutdown: on SIGTERM, sync workspace to S3, complete in-flight operations (30s grace)
+6. **Skills for sandbox mode** — see Step 7b for full details. In this step, ensure the skill loader can operate in sandbox mode (no home directory). Skills must come from workspace files or policy bundle, not `~/.cowork/skills/`.
 
 ### Tests
 
@@ -354,6 +411,7 @@ Wire the sandbox startup flow: read session ID from env, self-register with Sess
 - Unit: Workspace sync (mock S3 operations)
 - Unit: Graceful shutdown sequence
 - Unit: SIGTERM handling
+- Unit: Skill loader in sandbox mode (no home directory, skills from workspace)
 - Integration: Full sandbox startup → register → serve → shutdown flow (with mocked Session Service)
 
 ### Definition of Done
@@ -366,6 +424,53 @@ Wire the sandbox startup flow: read session ID from env, self-register with Sess
 - **Self-review**: Review for missing error handling on registration failure (retry? fail fast?), missing cleanup if workspace sync fails on startup, ensure SIGTERM handler doesn't race with in-flight requests, verify ECS metadata endpoint parsing handles all edge cases
 - **Logical bug review**: Verify workspace sync downloads files BEFORE marking sandbox as ready (don't serve requests with empty workspace). Verify SIGTERM handler waits for workspace sync to complete before exiting (data loss risk). Verify registration retry has a max attempt limit (don't retry forever if session-service is down). Verify `SANDBOX_LOCAL_MODE` code path is tested — local mode must skip ECS metadata but still register with session-service. Verify file sync handles empty workspace (no files to sync — should not error)
 - **Local run**: Add `make run-sandbox` target to agent-runtime Makefile: `SANDBOX_LOCAL_MODE=true SESSION_ID=test-session-123 SESSION_SERVICE_URL=http://localhost:8000 WORKSPACE_SERVICE_URL=http://localhost:8002 python -m agent_host.main --transport http`. Verify: starts up, registers with local session-service, serves `/health`, accepts JSON-RPC on `/rpc`, streams events on `/events`
+- **Documentation**: Update CLAUDE.md, README.md, and design docs in `cowork-infra/docs/` for any changed behavior, new endpoints, new config options, or architectural changes introduced in this step
+
+---
+
+## Step 7b — Skills Adaptation for Web Execution (agent-runtime)
+
+**Repo:** `cowork-agent-runtime`
+**Depends on:** Step 7 (Sandbox Mode)
+
+Skills currently load from `~/.cowork/skills/` on the host filesystem. In a sandbox (ECS container), there is no home directory with user-created skills. This step ensures skills work correctly in web execution mode.
+
+### Problem
+
+The `SkillLoader` (`skills/skill_loader.py`) discovers skills from three sources:
+1. **Built-in skills** — bundled in the agent-runtime package (work in sandbox as-is)
+2. **User skills** — loaded from `~/.cowork/skills/<name>/SKILL.md` (home directory, **not available in sandbox**)
+3. **Policy skills** — injected via policy bundle (work in sandbox as-is)
+
+In web execution mode, user skills must come from a different source.
+
+### Work
+
+1. **Audit skill sources** — Review all three skill loading paths in `SkillLoader` to understand dependencies on the local filesystem
+2. **Workspace-based skills** — In sandbox mode, look for user skills in the workspace directory (e.g., `/workspace/.cowork/skills/`) instead of `~/.cowork/skills/`. This way, users can include custom skills in their uploaded workspace files
+3. **Configurable skill directory** — Add `SKILLS_DIR` env var to override the default user skills path. In sandbox mode, default to `/workspace/.cowork/skills/`; in desktop mode, keep `~/.cowork/skills/`
+4. **Graceful degradation** — If no user skills directory exists in the sandbox, load only built-in and policy skills without errors
+5. **Project-level skills** — Also check workspace root for `.cowork/skills/` (project-level skills). This pattern already benefits desktop mode (project-specific skills) and works naturally in sandbox mode (skills uploaded with workspace)
+
+### Tests
+
+- Unit: SkillLoader with no home directory (sandbox simulation) — loads built-in + policy skills only
+- Unit: SkillLoader with workspace-based skills directory — discovers and loads skills correctly
+- Unit: `SKILLS_DIR` env var override — uses specified directory
+- Unit: Missing skills directory — graceful degradation, no errors
+- Integration: Upload workspace with custom skills, verify they load in sandbox mode
+
+### Definition of Done
+
+- Skills work in sandbox mode without home directory access
+- Users can include custom skills in workspace files
+- Built-in and policy skills always load regardless of mode
+- Desktop mode behavior unchanged (no regression)
+- `make check` passes
+- **Wiring check**: Verify skill loading paths in sandbox mode resolve within the workspace directory. Verify workspace sync (Step 7) preserves the `.cowork/skills/` directory structure. Verify uploaded skills pass through the same validation as filesystem skills
+- **Self-review**: Verify no path traversal is possible via skill file paths. Verify skill files from workspace are size-limited (same as local skills). Verify error messages clearly indicate where skills were searched
+- **Logical bug review**: Verify skill name collisions between built-in, workspace, and policy skills are resolved in a predictable order (policy > workspace > built-in). Verify markdown skill parsing handles edge cases (empty files, invalid YAML frontmatter). Verify skill directory creation doesn't fail in read-only filesystems
+- **Documentation**: Update CLAUDE.md, README.md, and design docs in `cowork-infra/docs/` for any changed behavior, new endpoints, new config options, or architectural changes introduced in this step
 
 ---
 
@@ -407,6 +512,7 @@ Add background task for idle timeout enforcement and provisioning timeout cleanu
 - **Self-review**: Review for missing error handling when sandbox is unreachable during shutdown (best-effort, don't block), ensure lifecycle manager doesn't crash on individual session failures (catch per-session, continue loop), verify conditional update expressions are correct, check that background task shuts down cleanly on app exit
 - **Logical bug review**: Verify idle check compares `lastActivityAt` using UTC consistently (not mixing local time). Verify provisioning timeout uses `createdAt` of the session, not `lastActivityAt` (which may not be set yet). Verify max duration check uses session `createdAt`, not task `createdAt`. Verify the "running task" check queries the tasks table with status filter (only `running` tasks count, not `completed` or `failed`). Verify conditional update prevents double-termination (two lifecycle checks running concurrently on different instances)
 - **Local run**: Run session-service with `SANDBOX_LAUNCHER_TYPE=local`, create a sandbox session, wait for idle timeout (set to 30s for testing via env var). Verify the `LocalSandboxLauncher` subprocess is killed and session transitions to `SANDBOX_TERMINATED`. Verify lifecycle manager logs appear in structured format
+- **Documentation**: Update CLAUDE.md, README.md, and design docs in `cowork-infra/docs/` for any changed behavior, new endpoints, new config options, or architectural changes introduced in this step
 
 ---
 
@@ -445,6 +551,7 @@ Verify the full sandbox lifecycle works across services. Uses `LocalSandboxLaunc
 - **Self-review**: Review test coverage for all error paths (sandbox crash mid-task, network timeout during proxy, workspace sync failure). Ensure test script has clear error reporting so failures are easy to diagnose
 - **Logical bug review**: Verify test assertions check for correct status transitions (not just final state). Verify SSE reconnect test actually disconnects mid-stream (not just opens a new connection). Verify file upload test checks content integrity (not just 200 status). Verify idle timeout test doesn't race with the lifecycle check interval (use short interval for tests)
 - **Local run**: The E2E test IS the local run — `scripts/test-web-sandbox.py` runs entirely locally: `docker-compose up -d` + session-service with `SANDBOX_LAUNCHER_TYPE=local` + workspace-service + policy-service. The script creates a session, session-service auto-spawns agent-runtime subprocess, and the test drives the full lifecycle: provisioning → ready → proxy RPC → stream SSE → upload file → idle timeout. Add `make test-sandbox` target to cowork-agent-runtime Makefile. No AWS credentials needed
+- **Documentation**: Update CLAUDE.md, README.md, and design docs in `cowork-infra/docs/` for any changed behavior, new endpoints, new config options, or architectural changes introduced in this step
 
 ---
 
@@ -493,6 +600,7 @@ Set up the repo and build the core web UI.
 - **Self-review**: Review for missing error states in UI (sandbox provisioning failure, proxy 503, SSE disconnect without reconnect), ensure all API errors are shown to user with actionable messages, check for memory leaks in SSE client (event listener cleanup), verify Zustand stores handle all state transitions correctly
 - **Logical bug review**: Verify SSE client doesn't accumulate event listeners on reconnect (must remove old listener before adding new). Verify provisioning poll stops when component unmounts (memory leak / state update on unmounted component). Verify conversation store handles out-of-order events (SSE replay may deliver events the store already has). Verify session list doesn't show terminated sessions as active after page refresh. Verify file upload progress tracking handles network errors (don't show stuck progress bar)
 - **Local run**: `make dev` starts Vite dev server on `localhost:5173`. Configure `.env.development` with `VITE_SESSION_SERVICE_URL=http://localhost:8000`. Full local flow: create session in web UI → see provisioning → conversation loads → send task → see streaming response. Add instructions to `cowork-web-app/README.md` for local development setup
+- **Documentation**: Update CLAUDE.md, README.md, and design docs in `cowork-infra/docs/` for any changed behavior, new endpoints, new config options, or architectural changes introduced in this step
 
 ---
 
@@ -533,6 +641,7 @@ Add Terraform modules for sandbox ECS resources.
 - **Self-review**: Review for overly permissive IAM policies, missing tags on resources, hardcoded values that should be variables, ensure all resources are prefixed with `cowork-{env}-`
 - **Logical bug review**: Verify security group rules are not overly permissive (sandbox ingress only from Session Service SG, not 0.0.0.0/0). Verify S3 bucket policy scopes sandbox task role to `{workspaceId}/*` prefix (not entire bucket). Verify log group retention is set (not infinite). Verify ECS task definition CPU/memory values are valid Fargate combinations. Verify IAM execution role has ECR pull permissions for the correct registry
 - **No localstack-init.sh changes needed** — Terraform resources are for AWS environments. Local development uses the existing LocalStack setup
+- **Documentation**: Update CLAUDE.md, README.md, and design docs in `cowork-infra/docs/` for any changed behavior, new endpoints, new config options, or architectural changes introduced in this step
 
 ---
 
@@ -571,6 +680,7 @@ Add Dockerfile for agent-runtime and CI pipeline for sandbox builds.
 - **Self-review**: Review Dockerfile for unnecessary layers, missing non-root user, missing health check interval, ensure .dockerignore excludes tests/docs/dev files, verify CI pipeline triggers on correct branches
 - **Logical bug review**: Verify Dockerfile doesn't copy `.env` or secrets into the image. Verify health check endpoint matches the one HttpTransport exposes (`/health`, not `/healthz`). Verify entrypoint uses exec form (not shell form — PID 1 issue for SIGTERM handling). Verify non-root user has write access to `/workspace` directory inside container
 - **Local run**: `make docker-build && docker run -p 8080:8080 -e SANDBOX_LOCAL_MODE=true -e SESSION_ID=test -e SESSION_SERVICE_URL=http://host.docker.internal:8000 -e WORKSPACE_SERVICE_URL=http://host.docker.internal:8002 -e AWS_ENDPOINT_URL=http://host.docker.internal:4566 cowork-sandbox:latest` — verify container starts, `/health` returns 200, `/rpc` accepts JSON-RPC. Add this to agent-runtime README. Can also test with `SANDBOX_LAUNCHER_TYPE=local` in session-service pointing `AGENT_RUNTIME_PATH` to the Docker image (future enhancement)
+- **Documentation**: Update CLAUDE.md, README.md, and design docs in `cowork-infra/docs/` for any changed behavior, new endpoints, new config options, or architectural changes introduced in this step
 
 ---
 
@@ -622,6 +732,7 @@ Pre-provision idle sandbox containers so sessions start in <3s instead of 15–4
 - **Self-review**: Review for race conditions in concurrent acquire (conditional update correctness), ensure pool replenishment doesn't exceed max, verify cleanup of stale pool entries (container crashed before claim)
 - **Logical bug review**: Verify conditional update on `POOL_IDLE → POOL_CLAIMED` transition uses correct condition expression (status must equal `POOL_IDLE`, not just exist). Verify pool replenishment doesn't launch tasks when pool is at max (check count before launching). Verify stale detection uses `createdAt` not `lastActivityAt` (pool containers have no user activity). Verify pool drain stops the right containers (LIFO — drain newest first to keep warmed containers)
 - **Local run**: Update `scripts/localstack-init.sh` with `dev-warm-pool` DynamoDB table creation. Test warm pool flow locally with `SANDBOX_LOCAL_MODE=true` — pool "containers" are just DynamoDB entries. Verify acquire/release/replenish operations against LocalStack
+- **Documentation**: Update CLAUDE.md, README.md, and design docs in `cowork-infra/docs/` for any changed behavior, new endpoints, new config options, or architectural changes introduced in this step
 
 ---
 
@@ -663,6 +774,7 @@ Gracefully handle sandbox shutdown while SSE connections and in-flight requests 
 - **Self-review**: Review for edge cases (shutdown during file upload, shutdown during LLM streaming), ensure no goroutine/task leaks on shutdown, verify grace period is configurable
 - **Logical bug review**: Verify drain sequence order is correct: stop accepting → flush in-flight → send shutdown event → close connections (not close connections → then try to send event). Verify 503 from sandbox during shutdown includes a distinguishable error code (not generic 503). Verify web app doesn't try to auto-reconnect SSE after receiving `sandbox_shutting_down` event (infinite reconnect loop). Verify workspace sync on shutdown doesn't race with final artifact upload
 - **Local run**: Start agent-runtime in HTTP mode, connect SSE client, send SIGTERM — verify shutdown event arrives before connection closes. Verify in-flight `/rpc` request completes before shutdown
+- **Documentation**: Update CLAUDE.md, README.md, and design docs in `cowork-infra/docs/` for any changed behavior, new endpoints, new config options, or architectural changes introduced in this step
 
 ---
 
@@ -705,6 +817,7 @@ Allow users to resume work from a terminated sandbox by restoring the workspace 
 - **Self-review**: Review for missing error handling on large workspace snapshots (timeout, partial copy), ensure snapshot cleanup doesn't delete active snapshots, verify restore works when original workspace has been deleted
 - **Logical bug review**: Verify snapshot S3 copy handles large files (multipart copy for >5GB). Verify snapshot listing is sorted by creation time (newest first). Verify restore creates a new session linked to same workspace (not a new workspace). Verify conversation history is fetched from workspace-service using the OLD session ID (not new one). Verify snapshot auto-delete TTL doesn't delete snapshots for active sessions
 - **Local run**: Test snapshot/restore flow against LocalStack: create workspace → upload files → create snapshot → list snapshots → restore → verify files present in new workspace. All via `curl` against local services
+- **Documentation**: Update CLAUDE.md, README.md, and design docs in `cowork-infra/docs/` for any changed behavior, new endpoints, new config options, or architectural changes introduced in this step
 
 ---
 
@@ -761,6 +874,7 @@ Replace simple auth with OIDC for production multi-tenant use.
 - **Self-review**: Review for missing token refresh edge cases (refresh fails during active session), ensure JWKS cache invalidation works when keys rotate, verify no sensitive data in JWT is logged, check that 401 responses don't leak internal details
 - **Logical bug review**: Verify JWT validation checks `exp` claim BEFORE signature verification (fail fast on expired tokens). Verify JWKS cache doesn't serve stale keys indefinitely (TTL must be enforced). Verify `userId`/`tenantId` extraction handles missing claims gracefully (reject, don't default to empty string). Verify OIDC middleware doesn't apply to health/ready endpoints. Verify SSE connection token validation happens at connection time (not per-event)
 - **Local run**: For local dev, OIDC is disabled by default (`AUTH_MODE=none`). Add `AUTH_MODE=simple` for API key auth (existing), `AUTH_MODE=oidc` for production OIDC. Document in `.env.example` and README
+- **Documentation**: Update CLAUDE.md, README.md, and design docs in `cowork-infra/docs/` for any changed behavior, new endpoints, new config options, or architectural changes introduced in this step
 
 ---
 
@@ -815,6 +929,7 @@ Move idle timeout and provisioning timeout checks from in-process background tas
 - **Self-review**: Review for Lambda timeout configuration (must be long enough to process all idle sessions), ensure Lambda has correct IAM permissions for DynamoDB + ECS, verify error handling doesn't cause Lambda to retry on partial failures (use dead letter queue). Verify `make build-lambda` doesn't accidentally include test files or dev dependencies
 - **Logical bug review**: Verify Lambda processes all sessions in a single invocation (paginate DynamoDB scan, don't stop at first page). Verify Lambda doesn't terminate sessions that were just created (race between creation and lifecycle check — check `createdAt` grace period). Verify feature flag transition doesn't create a gap (both Lambda and in-process running for a brief overlap is better than neither running). Verify the extracted core function doesn't hold references to async event loops or FastAPI app state (must be callable from sync Lambda context)
 - **Local run**: Invoke the Lambda handler locally: `python -c "from lambda_handler.lifecycle import handler; handler({}, None)"` with `AWS_ENDPOINT_URL=http://localhost:4566`. Verify it queries LocalStack DynamoDB and processes sessions. No actual Lambda deployment needed for local testing
+- **Documentation**: Update CLAUDE.md, README.md, and design docs in `cowork-infra/docs/` for any changed behavior, new endpoints, new config options, or architectural changes introduced in this step
 
 ---
 
@@ -855,6 +970,7 @@ Scale warm pool size based on usage patterns instead of fixed target.
 - **Self-review**: Review for missing bounds checks (pool size never goes negative, never exceeds max), ensure scaling decisions are logged for debugging, verify dashboard queries match published metric dimensions
 - **Logical bug review**: Verify scaling down doesn't drain containers that are in the process of being claimed (race condition). Verify hit rate calculation handles zero-request periods correctly (0/0 is not 0% — it's no data, don't scale down). Verify time-based schedule uses the correct timezone. Verify min pool size of 0 actually stops all containers (not leaves 1 running)
 - **Local run**: Scaling logic is testable locally — mock CloudWatch metrics, verify scaling decisions. No actual CloudWatch or EventBridge needed for local testing
+- **Documentation**: Update CLAUDE.md, README.md, and design docs in `cowork-infra/docs/` for any changed behavior, new endpoints, new config options, or architectural changes introduced in this step
 
 ---
 
@@ -897,6 +1013,7 @@ Improve the file browser from basic list to a full workspace explorer.
 - **Self-review**: Review for missing loading/error states in all file operations, ensure large file handling (don't load 10MB file into Monaco), verify drag-and-drop respects upload size limits from policy
 - **Logical bug review**: Verify tree view handles symlinks and circular references (if present in workspace). Verify inline editor doesn't lose unsaved changes on SSE event (agent modifies same file). Verify multi-file download zip generation handles special characters in filenames. Verify file change indicators correctly match artifact `file_diff` paths to tree view paths (relative vs absolute)
 - **Local run**: `make dev` with all backend services running locally. Upload files, browse tree, edit inline, download — all against LocalStack
+- **Documentation**: Update CLAUDE.md, README.md, and design docs in `cowork-infra/docs/` for any changed behavior, new endpoints, new config options, or architectural changes introduced in this step
 
 ---
 
@@ -936,6 +1053,7 @@ Scan uploaded files for malware before they enter the sandbox workspace.
 - **Self-review**: Review for missing edge cases (scan timeout, Lambda cold start delay, file uploaded faster than scan completes), ensure scan doesn't block small file uploads excessively, verify Lambda has access to latest ClamAV definitions
 - **Logical bug review**: Verify scan status check doesn't have TOCTOU race (file tagged clean, then replaced before sandbox reads it). Verify `202 Accepted` polling endpoint returns final status (not stuck in `pending` forever — add scan timeout). Verify infected file is deleted from S3 (not just tagged — sandbox must not be able to read it). Verify scan applies to all upload paths (direct workspace upload, workspace sync from agent)
 - **Local run**: For local dev, virus scanning is disabled by default (`VIRUS_SCAN_ENABLED=false`). When enabled locally, use ClamAV Docker container instead of Lambda. Document in README
+- **Documentation**: Update CLAUDE.md, README.md, and design docs in `cowork-infra/docs/` for any changed behavior, new endpoints, new config options, or architectural changes introduced in this step
 
 ---
 
@@ -984,6 +1102,7 @@ Support GPU instances for ML workloads (model training, data processing).
 - **Self-review**: Review for missing fallback when GPU instances are unavailable (queue? reject?), ensure GPU container image includes CUDA drivers, verify cost tracking metrics are published correctly
 - **Logical bug review**: Verify `resourceProfile` is validated against allowed values (not arbitrary string). Verify GPU concurrent limit check is separate from standard limit (user can have 3 standard + 1 GPU, not 3 total). Verify GPU task definition uses correct capacity provider (not default Fargate — needs GPU instances). Verify session response includes `resourceProfile` so web app can show GPU indicator
 - **Local run**: GPU is not available locally. For local dev, `resourceProfile=gpu` creates a standard session with a flag — test the selection logic, not the GPU hardware. Document in README
+- **Documentation**: Update CLAUDE.md, README.md, and design docs in `cowork-infra/docs/` for any changed behavior, new endpoints, new config options, or architectural changes introduced in this step
 
 ---
 
@@ -1028,6 +1147,7 @@ Allow multiple sessions to share a workspace — enabling iterative work across 
 - **Self-review**: Review for missing edge cases (session reads file while another session is writing), ensure advisory locks have TTL to prevent deadlocks, verify access control can't be bypassed via direct workspace-service calls, check that conflict resolution UI handles all conflict types
 - **Logical bug review**: Verify workspace access control is checked on every file operation (not just workspace creation). Verify advisory lock TTL is shorter than session idle timeout (lock shouldn't outlive session). Verify conflict detection compares S3 ETag (not timestamp — clock skew). Verify workspace deletion is blocked when active sessions exist (don't delete workspace under a running session). Verify shared workspace file sync handles concurrent modifications (last-write-wins must be consistent, not data-corrupting)
 - **Local run**: Test shared workspace flow locally with two agent-runtime instances on different ports, both pointing at same workspace. Upload file from one, verify visible from other. Document multi-instance local testing in README
+- **Documentation**: Update CLAUDE.md, README.md, and design docs in `cowork-infra/docs/` for any changed behavior, new endpoints, new config options, or architectural changes introduced in this step
 
 ---
 
@@ -1036,7 +1156,9 @@ Allow multiple sessions to share a workspace — enabling iterative work across 
 ```
 Phase 3a (MVP):
   Step 1 (Contracts) ──────────────────────────────────────────┐
-  Step 2 (HttpTransport) ──→ Step 7 (Sandbox Mode) ──┐        │
+  Step 2 (HttpTransport) ──→ Step 2b (Desktop Event Replay)    │
+                           ──→ Step 7 (Sandbox Mode) ──→ Step 7b (Skills for Web) │
+                                                       ──┐     │
   Step 3 (Registration) ──→ Step 5 (ECS) ──→ Step 6 (Proxy) ──┤
   Step 4 (Cloud Workspace) ─────────────────────────────────────┤
   Step 8 (Idle Timeout) ───────────────────────────────────────┤

@@ -72,7 +72,7 @@ flowchart LR
 
 ```
 agent-host/
-  server/          — JSON-RPC 2.0 server (parse, serialize, dispatch, handlers)
+  server/          — Transport layer (Transport protocol, StdioTransport, HttpTransport), JSON-RPC 2.0 (parse, serialize, dispatch, handlers), EventBuffer (SSE replay)
   session/         — Session/Workspace HTTP clients, checkpoint manager, SessionManager
   loop/            — LoopRuntime (infrastructure) + LoopStrategy protocol (orchestration), agent-internal tools, error recovery
   llm/             — LLM Gateway streaming client (openai SDK), response models, error classifier
@@ -122,9 +122,20 @@ flowchart TD
 
 ## 3. Session Lifecycle
 
-### 3.1 JSON-RPC Server
+### 3.1 JSON-RPC Server / Transport Layer
 
-The `session/` module hosts a JSON-RPC 2.0 server over stdio or local socket. The Desktop App is the sole client.
+The `server/` module provides a `Transport` protocol with two implementations:
+
+- **StdioTransport** — JSON-RPC 2.0 over stdin/stdout (desktop mode, default). The Desktop App is the sole client.
+- **HttpTransport** — Starlette/uvicorn ASGI server (web/sandbox mode, `--transport http`). Exposes:
+  - `POST /rpc` — JSON-RPC 2.0 dispatch (same `MethodDispatcher` as stdio)
+  - `GET /events` — SSE event stream with replay via `?since={id}` (backed by `EventBuffer`, bounded ring buffer with 10K capacity)
+  - `GET /health` / `GET /ready` — liveness/readiness probes
+  - `POST /upload` — multipart file upload to workspace directory
+  - `GET /files/{path}` — file download from workspace
+  - `GET /files` — workspace file listing (or zip archive with `?archive=true`)
+
+Both transports use the same `MethodDispatcher` and `EventEmitter`, ensuring identical JSON-RPC behavior.
 
 | Method | Direction | Purpose |
 |--------|-----------|---------|
