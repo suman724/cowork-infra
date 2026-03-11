@@ -43,6 +43,7 @@ This keeps the user experience local-first while preserving enterprise-grade gov
 | Path | Protocol |
 |------|----------|
 | Desktop App ↔ Local Agent Host | JSON-RPC 2.0 over stdio or local socket |
+| Browser ↔ Sandbox Agent Host (via Session Service proxy) | JSON-RPC 2.0 over HTTP + SSE (HttpTransport) |
 | Local Agent Host ↔ Backend services | HTTPS REST |
 | Local Agent Host ↔ LLM Gateway | HTTP streaming |
 
@@ -123,7 +124,7 @@ A workspace is a **backend namespace** for a session's history and artifacts. It
 |-----------------|-------------|-------|
 | `local` | Live on client machine — never uploaded | One workspace per project directory, reused across all sessions |
 | `general` | May exist, scoped to this session | Single-use — fresh workspace created for each general chat |
-| `cloud` | In a cloud sandbox | TBD (Phase 3+) |
+| `cloud` | In S3-backed cloud workspace | Always new — one workspace per sandbox session. Supports file CRUD via `/files` endpoints. |
 
 `workspaceScope` is about **where source files live and workspace reuse**. It is distinct from `executionEnvironment` on the session, which is about **where the agent runs**.
 
@@ -140,11 +141,19 @@ A session is the **governance container** for one continuous working period — 
 | `executionEnvironment` | Meaning |
 |-----------------------|---------|
 | `desktop` | Agent runs locally via Local Agent Host |
-| `cloud_sandbox` | Agent runs in a backend sandbox (Phase 3+) |
+| `cloud_sandbox` | Agent runs in a backend ECS Fargate sandbox container |
 
 **State machine:**
 
+Desktop sessions:
 `SESSION_CREATED` → `SESSION_RUNNING` ↔ `WAITING_FOR_LLM` / `WAITING_FOR_TOOL` / `WAITING_FOR_APPROVAL` / `SESSION_PAUSED` → `SESSION_COMPLETED` / `SESSION_FAILED` / `SESSION_CANCELLED`
+
+Sandbox sessions (`cloud_sandbox`):
+`SANDBOX_PROVISIONING` → `SANDBOX_READY` → `SESSION_RUNNING` ↔ (same as desktop) → `SANDBOX_TERMINATED`
+
+- `SANDBOX_PROVISIONING`: ECS task is starting. Set at session creation for `cloud_sandbox` sessions.
+- `SANDBOX_READY`: Container registered via `POST /sessions/{id}/register`. Policy bundle fetched at this point.
+- `SANDBOX_TERMINATED`: Container shut down (idle timeout, max duration, or explicit). Terminal state.
 
 ### Task
 
@@ -294,8 +303,8 @@ Capabilities are issued in the policy bundle and enforced by **Local Policy Enfo
 ### Tool Architecture
 
 - **Phase 1 — built-in tools:** File, shell, and network tools run directly inside the Local Tool Runtime, always available.
+- **Phase 1 — skills:** The SkillLoader discovers skill definitions from multiple sources and registers them as tools. Skills are loaded at session startup with the following priority order (higher priority wins on name collision): **policy bundle > workspace > user > built-in**. Workspace-level skills are discovered from `{workspace}/.cowork/skills/` — this allows project-specific skills to be checked into a repository.
 - **Phase 2+ — MCP extension:** Local Tool Runtime acts as an MCP client. It discovers and connects to remote MCP servers over streamable HTTP, translating their tool manifests to the internal `ToolRequest`/`ToolResult` contract. MCP servers are never invoked directly by the agent loop — capability checks and approval gates always happen in the routing layer first.
-- **Skills are deferred** to Phase 4, once recurring tool sequences are well understood from usage patterns.
 
 ---
 
@@ -305,7 +314,9 @@ Capabilities are issued in the policy bundle and enforced by **Local Policy Enfo
 
 **Transport:** JSON-RPC 2.0 over stdio or local socket
 
-**Methods:** `CreateSession`, `StartTask`, `CancelTask`, `ResumeSession`, `GetSessionState`, `GetPatchPreview`, `ApproveAction`, `Shutdown`
+**Methods:** `CreateSession`, `StartTask`, `CancelTask`, `ResumeSession`, `GetSessionState`, `GetPatchPreview`, `ApproveAction`, `GetEvents`, `Shutdown`
+
+> `GetEvents` is used by HttpTransport (web/sandbox mode) for SSE event replay. Not used in StdioTransport (desktop mode).
 
 ```json
 // CreateSession  —  Desktop App → Local Agent Host
@@ -541,6 +552,9 @@ All backend services run on **AWS ECS** (Elastic Container Service) with Fargate
 
 Each service is a **FastAPI application** packaged as a Docker container. One ECS service per backend service — they scale independently.
 
+**Sandbox Tasks:**
+Cloud sandbox sessions run as **on-demand Fargate tasks** (not ECS services). The Session Service calls `ecs:RunTask` to launch one task per sandbox session and `ecs:StopTask` to tear it down. The `sandbox` Terraform module (`iac/modules/sandbox/`) provisions the task definition, security group, and IAM roles for these tasks.
+
 **Networking:**
 - Services sit behind an **Application Load Balancer (ALB)** with path-based routing (`/sessions/*`, `/workspaces/*`, `/approvals/*`, etc.)
 - Inter-service calls (e.g., Session Service → Policy Service) go through the ALB or via **ECS Service Connect** for service-to-service discovery
@@ -734,6 +748,8 @@ cowork-platform/
 
 cowork-infra/
   iac/            ← Terraform / CDK (ECS clusters, ALB, DynamoDB tables, S3 buckets, IAM)
+    modules/
+      sandbox/    ← Sandbox task definition, security group, IAM roles
   ci/             ← CI/CD templates (Docker build, ECS deploy, schema codegen)
   docs/           ← Architecture design docs, ADRs, runbooks, threat models
 ```
@@ -762,6 +778,27 @@ cowork-infra/
 ## 13. Web Extension
 
 The same design works for web by running the agent runtime in a backend sandbox instead of the desktop. Only the runtime location changes — state machine, event names, tool schemas, policy model, and workspace model are all identical.
+
+**Sandbox session lifecycle:**
+1. Browser → `POST /sessions` with `executionEnvironment: "cloud_sandbox"` → Session Service creates session in `SANDBOX_PROVISIONING`, launches ECS task, creates `cloud`-scoped workspace
+2. ECS container starts, agent runtime detects sandbox mode (`SESSION_ID` env var set + `--transport http`), reads ECS task metadata (container IP, task ARN) via the ECS metadata endpoint, calls `POST /sessions/{id}/register` with `sandboxEndpoint`, `taskArn`, and `REGISTRATION_TOKEN` → Session Service validates token and ARN, returns policy bundle + workspace ID, transitions to `SANDBOX_READY`
+3. Agent runtime syncs workspace files down from Workspace Service via individual file CRUD (`GET /workspaces/{id}/files/{path}`) into the local working directory
+4. Browser → Session Service proxy endpoints (`/sessions/{id}/rpc`, `/sessions/{id}/events`) → forwarded to sandbox `HttpTransport`
+5. Sandbox agent runtime uses `HttpTransport` (HTTP + SSE) instead of `StdioTransport` (stdio)
+6. On SIGTERM (idle timeout, max duration, or explicit termination) → agent uploads modified workspace files to Workspace Service (`POST /workspaces/{id}/files`) → calls `POST /sessions/{id}/shutdown` → exits cleanly → `SANDBOX_TERMINATED` (terminal state)
+
+**Sandbox environment variables:**
+
+| Variable | Purpose |
+|----------|---------|
+| `SESSION_ID` | Triggers sandbox self-registration mode when set |
+| `REGISTRATION_TOKEN` | One-time token for `POST /sessions/{id}/register` authentication |
+| `SANDBOX_LOCAL_MODE` | When `true`, skips ECS metadata lookup (for local dev/test) |
+| `SKILLS_DIR` | Optional override for the skills discovery directory |
+
+**Transport modes:**
+- **StdioTransport** (desktop): JSON-RPC over stdin/stdout. Desktop App manages the process lifecycle.
+- **HttpTransport** (web/sandbox): `POST /rpc` for JSON-RPC requests, `GET /events?since={id}` for SSE event stream. EventBuffer provides replay for reconnections (10K event capacity, monotonic IDs).
 
 | Desktop | Web |
 |---------|-----|

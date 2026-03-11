@@ -377,6 +377,12 @@ module "session_service" {
     DYNAMODB_TABLE_PREFIX  = "${local.env}-"
     POLICY_SERVICE_URL     = "http://${aws_lb.main.dns_name}"
     WORKSPACE_SERVICE_URL  = "http://${aws_lb.main.dns_name}"
+    # Sandbox ECS configuration
+    SANDBOX_LAUNCHER_TYPE  = "ecs"
+    ECS_CLUSTER            = aws_ecs_cluster.main.name
+    ECS_TASK_DEFINITION    = module.sandbox.task_definition_family
+    ECS_SUBNETS            = jsonencode(aws_subnet.private[*].id)
+    ECS_SECURITY_GROUPS    = jsonencode([module.sandbox.security_group_id])
   }
 
   task_policy_statements = [
@@ -393,6 +399,29 @@ module "session_service" {
         "${module.sessions_table.table_arn}/index/*",
         module.tasks_table.table_arn,
         "${module.tasks_table.table_arn}/index/*",
+      ]
+    },
+    # ECS RunTask/StopTask for sandbox provisioning and termination
+    {
+      Effect = "Allow"
+      Action = [
+        "ecs:RunTask",
+        "ecs:StopTask",
+        "ecs:DescribeTasks",
+      ]
+      Resource = [
+        module.sandbox.task_definition_arn,
+        # RunTask returns task ARNs scoped to the cluster
+        "arn:aws:ecs:${var.aws_region}:*:task/${aws_ecs_cluster.main.name}/*",
+      ]
+    },
+    # IAM PassRole — required for RunTask to assign execution/task roles
+    {
+      Effect = "Allow"
+      Action = ["iam:PassRole"]
+      Resource = [
+        module.sandbox.execution_role_arn,
+        module.sandbox.task_role_arn,
       ]
     },
   ]
@@ -588,6 +617,44 @@ module "workspace_service" {
   listener_rule_priority = 300
   path_patterns          = ["/workspaces", "/workspaces/*", "/artifacts", "/artifacts/*"]
 
+  aws_region         = var.aws_region
+  log_retention_days = var.log_retention_days
+}
+
+# =========================================================================== #
+# Sandbox — Agent Runtime ECS Tasks (on-demand, per-session)
+# =========================================================================== #
+
+module "sandbox" {
+  source = "../../modules/sandbox"
+
+  name_prefix     = local.prefix
+  environment     = local.env
+  container_image = var.sandbox_image
+  cpu             = var.sandbox_cpu
+  memory          = var.sandbox_memory
+
+  environment_variables = {
+    ENV                   = local.env
+    LOG_LEVEL             = var.log_level
+    SESSION_SERVICE_URL   = "http://${aws_lb.main.dns_name}"
+    WORKSPACE_SERVICE_URL = "http://${aws_lb.main.dns_name}"
+    LLM_GATEWAY_ENDPOINT  = var.llm_gateway_endpoint
+  }
+
+  # Secrets from AWS Secrets Manager
+  secrets = {
+    LLM_GATEWAY_AUTH_TOKEN = var.llm_gateway_auth_token_arn
+  }
+
+  # Networking — sandbox ingress only from Session Service SG
+  vpc_id                = aws_vpc.main.id
+  session_service_sg_id = aws_security_group.ecs_tasks.id
+
+  # Storage
+  artifacts_bucket_arn = aws_s3_bucket.artifacts.arn
+
+  # Observability
   aws_region         = var.aws_region
   log_retention_days = var.log_retention_days
 }

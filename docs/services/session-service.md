@@ -88,7 +88,77 @@ Called by the Local Agent Host at startup to establish a new session.
 
 **Workspace resolution logic:**
 - If `workspaceHint.localPaths` is provided → resolve or create a `local`-scoped workspace matching that path
-- If no `workspaceHint` → create a new `general`-scoped workspace for this session only
+- If no `workspaceHint` (desktop) → create a new `general`-scoped workspace for this session only
+- If `executionEnvironment == "cloud_sandbox"` → create a new `cloud`-scoped workspace (S3-backed, supports file CRUD)
+
+**Sandbox session creation:**
+When `executionEnvironment` is `cloud_sandbox`, the session creation flow differs:
+1. Compatibility check is skipped (no desktop app involved)
+2. Initial status is `SANDBOX_PROVISIONING` (not `SESSION_CREATED`)
+3. Policy bundle fetch is **deferred** to the registration step (`POST /sessions/{id}/register`)
+4. Session response includes `status: "SANDBOX_PROVISIONING"` but no `policyBundle`
+5. `networkAccess` field is stored on the session record if provided
+6. **Sandbox provisioning:** After persisting the session record, the Session Service calls `SandboxService.provision_sandbox()` which:
+   - Checks the concurrent sandbox session limit for this user (rejects with 409 if over limit)
+   - Calls the configured `SandboxLauncher.launch()` to start the container/process
+   - Stores `expectedTaskArn` on the session record for registration validation
+   - On launch failure, transitions the session to `SESSION_FAILED`
+
+**Sandbox Launcher:**
+
+The `SandboxLauncher` is a pluggable abstraction with two implementations:
+
+| Type | Config value | Implementation | Use case |
+|------|-------------|----------------|----------|
+| ECS | `SANDBOX_LAUNCHER_TYPE=ecs` | `EcsSandboxLauncher` — calls ECS `RunTask`/`StopTask`/`DescribeTasks` | Production (ECS Fargate) |
+| Local | `SANDBOX_LAUNCHER_TYPE=local` | `LocalSandboxLauncher` — spawns agent-runtime as subprocess on a random free port | Local development |
+
+Configuration:
+- `SANDBOX_MAX_CONCURRENT_SESSIONS` — max active sandbox sessions per user (default: 5)
+- `ECS_CLUSTER`, `ECS_TASK_DEFINITION`, `ECS_SUBNETS`, `ECS_SECURITY_GROUPS` — ECS launcher settings (provided by the Terraform `sandbox` module in `cowork-infra/iac/modules/sandbox/`, which provisions the task definition ARN, security group ID, and IAM roles for sandbox tasks)
+- `AGENT_RUNTIME_PATH` — path to agent-runtime repo (local launcher only)
+- `SESSION_SERVICE_URL` — passed to sandbox as env var for self-registration
+
+**Proxy Layer:**
+
+`ProxyService` forwards browser traffic to sandbox containers through Session Service. The browser never connects directly to sandboxes.
+
+Five proxy endpoints:
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/sessions/{sessionId}/rpc` | Forward JSON-RPC to sandbox `/rpc` |
+| `GET` | `/sessions/{sessionId}/events` | SSE proxy (streaming, `Last-Event-ID` pass-through) |
+| `POST` | `/sessions/{sessionId}/upload` | Forward multipart file upload |
+| `GET` | `/sessions/{sessionId}/files/{path}` | File download from sandbox workspace |
+| `GET` | `/sessions/{sessionId}/files` | File listing or workspace archive download |
+
+Key behaviors:
+- **Endpoint caching:** `sandboxEndpoint` cached per session with configurable TTL (default 30s). Invalidated on sandbox termination or connection errors.
+- **Ownership validation:** Every proxy request verifies `user_id` matches session owner. Returns 403 if not.
+- **State validation:** Only sessions in proxyable states (`SANDBOX_READY`, `SESSION_RUNNING`, `WAITING_FOR_*`, `SESSION_PAUSED`) are forwarded. Returns 409 otherwise.
+- **Activity tracking:** `lastActivityAt` updated on `POST /rpc` and `POST /upload` only (not SSE keepalives). Batched — writes DynamoDB at most once per 60s per session.
+- **Error mapping:** Sandbox unreachable → 503, session not found → 404, inactive → 409, wrong owner → 403.
+- **Connection pool:** Separate `httpx.AsyncClient` for sandbox connections (not shared with Policy/Workspace clients).
+
+Config: `PROXY_ENDPOINT_CACHE_TTL_SECONDS` (30), `PROXY_ACTIVITY_BATCH_SECONDS` (60), `PROXY_TIMEOUT_SECONDS` (30), `PROXY_SSE_TIMEOUT_SECONDS` (14400).
+
+**Sandbox Lifecycle Manager:**
+
+`SandboxLifecycleManager` runs as a background `asyncio.Task` started in the FastAPI lifespan. It periodically scans all active sandbox sessions and enforces three time-based rules:
+
+| Check | Condition | Action |
+|-------|-----------|--------|
+| Provisioning timeout | `SANDBOX_PROVISIONING` session older than `SANDBOX_PROVISION_TIMEOUT_SECONDS` (180) | Transition to `SESSION_FAILED` |
+| Max duration | Active sandbox session older than `SANDBOX_MAX_DURATION_SECONDS` (14400) | Terminate via `SandboxService` |
+| Idle timeout | No `lastActivityAt` update within `SANDBOX_IDLE_TIMEOUT_SECONDS` (1800) AND no running tasks | Terminate via `SandboxService` |
+
+Design:
+- **Multi-instance safe:** Uses DynamoDB conditional updates (`ConditionExpression`) to prevent double-termination when multiple Session Service instances check concurrently.
+- **Per-session error isolation:** Errors processing one session are caught and logged; other sessions are still checked.
+- **Running task protection:** Idle timeout is never applied to sessions with at least one `running` task — busy sandboxes are never idle-terminated.
+- **Best-effort termination:** If stopping the sandbox container fails, the status is still updated to prevent retries.
+- **Check interval:** `SANDBOX_LIFECYCLE_CHECK_INTERVAL_SECONDS` (default 300 / 5 minutes).
 
 ---
 
@@ -206,6 +276,33 @@ Returns a single task by ID.
 
 ---
 
+### POST /sessions/{sessionId}/register — Sandbox Self-Registration
+
+Called by the sandbox container after startup. Validates the task ARN matches what was stored at launch time, stores the sandbox endpoint, transitions status to `SANDBOX_READY`, and returns the policy bundle.
+
+**Request:**
+```json
+{
+  "sandboxEndpoint": "http://10.0.1.42:8080",
+  "taskArn": "arn:aws:ecs:us-east-1:123456789:task/cowork-dev/abc123"
+}
+```
+
+**Response (200):**
+```json
+{
+  "sessionId": "sess_789",
+  "workspaceId": "ws_456",
+  "workspaceServiceUrl": "http://workspace-service:8002",
+  "llmGatewayEndpoint": "",
+  "policyBundle": { ... }
+}
+```
+
+**Errors:**
+- 404 — session not found
+- 409 — session not in `SANDBOX_PROVISIONING` state, or task ARN mismatch
+
 ### GET /sessions/{sessionId} — Get Session Metadata
 
 **Response:**
@@ -271,9 +368,14 @@ sequenceDiagram
 | `tenantId` | string | Tenant |
 | `userId` | string | User |
 | `executionEnvironment` | enum | `desktop` or `cloud_sandbox` |
-| `status` | enum | `SESSION_CREATED`, `SESSION_RUNNING`, `SESSION_PAUSED`, `SESSION_COMPLETED`, `SESSION_FAILED`, `SESSION_CANCELLED` |
+| `status` | enum | `SESSION_CREATED`, `SESSION_RUNNING`, `SESSION_PAUSED`, `SESSION_COMPLETED`, `SESSION_FAILED`, `SESSION_CANCELLED`, `SANDBOX_PROVISIONING`, `SANDBOX_READY`, `SANDBOX_TERMINATED` |
 | `createdAt` | datetime | Session creation time |
 | `expiresAt` | datetime | Policy bundle expiry — session must not continue past this |
+| `sandboxEndpoint` | string? | Internal IP:port of sandbox container (cloud_sandbox only, set at registration) |
+| `taskArn` | string? | ECS task ARN (cloud_sandbox only) |
+| `expectedTaskArn` | string? | Expected task ARN for registration validation (cloud_sandbox only) |
+| `networkAccess` | enum? | `enabled` or `disabled` — outbound internet for sandbox (cloud_sandbox only) |
+| `lastActivityAt` | datetime? | Last user interaction time for idle timeout (cloud_sandbox only) |
 
 ---
 
@@ -324,8 +426,11 @@ sequenceDiagram
 | Unit tests | `InMemorySessionRepository` — no infrastructure needed |
 | Service tests | DynamoDB Local: `docker run -p 8000:8000 amazon/dynamodb-local` |
 | Integration tests | LocalStack: `docker run -p 4566:4566 localstack/localstack` |
+| E2E sandbox tests | `make test-web-sandbox` — requires all services running + `SANDBOX_LAUNCHER_TYPE=local` |
 
 Set `AWS_ENDPOINT_URL=http://localhost:8000` (DynamoDB Local) or `http://localhost:4566` (LocalStack) to point the service at a local emulator. The same repository code runs in all environments.
+
+**E2E Web Sandbox Test** (`scripts/test-web-sandbox.py`): Tests the full sandbox lifecycle end-to-end — session creation, sandbox provisioning via `LocalSandboxLauncher`, proxy RPC/SSE/file operations, idle timeout, and provisioning timeout. Requires session-service, policy-service, workspace-service, and LocalStack running locally.
 
 ---
 
