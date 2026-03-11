@@ -1474,7 +1474,62 @@ All events carry the full ID chain: `workspaceId`, `sessionId`, `taskId`, `stepI
 
 ---
 
-## 13. Open Questions
+## 13. Container Deployment
+
+For cloud sandbox sessions (`executionEnvironment: "cloud_sandbox"`), the agent runtime runs as a Docker container in ECS Fargate. The Dockerfile lives in `cowork-agent-runtime/Dockerfile`.
+
+### Docker image
+
+Multi-stage build on `python:3.12-slim`:
+
+1. **Base stage**: Sets `/app` workdir, creates non-root `appuser`
+2. **Builder stage**: Installs `cowork-platform` (git dependency), copies source, runs `pip install`
+3. **Runtime stage**: Copies `site-packages` from builder, installs `curl` for health checks, creates `/workspace` directory owned by `appuser`
+
+The runtime stage runs as `appuser` (non-root) for security.
+
+### Entrypoint
+
+```
+CMD ["python", "-m", "agent_host.main", "--transport", "http"]
+```
+
+Uses exec form (JSON array) so the Python process receives signals directly as PID 1 — required for graceful shutdown on ECS SIGTERM.
+
+### Networking
+
+- **Port 8080** exposed for `HttpTransport` endpoints (`/rpc`, `/events`, `/health`, `/ready`, `/upload`, `/files`)
+- `/health` endpoint returns 200 immediately — used as the ECS health check
+- `/ready` endpoint returns 200 when `SessionManager` is initialized — used for readiness probes
+
+### Workspace directory
+
+`/workspace` is created at build time and owned by `appuser`. The sandbox startup process (`sandbox/workspace_sync.py`) syncs files from the Workspace Service into this directory. On SIGTERM, modified files are uploaded back before the container exits.
+
+### Environment variables
+
+Passed at runtime via ECS task definition environment or secrets:
+
+| Variable | Source | Purpose |
+|----------|--------|---------|
+| `SESSION_ID` | ECS task definition (env) | Triggers sandbox self-registration mode |
+| `REGISTRATION_TOKEN` | ECS task definition (env) | One-time token for `POST /sessions/{id}/register` |
+| `SESSION_SERVICE_URL` | ECS task definition (env) | Session Service endpoint |
+| `WORKSPACE_SERVICE_URL` | ECS task definition (env) | Workspace Service endpoint |
+| `LLM_GATEWAY_ENDPOINT` | ECS task definition (env) | LLM Gateway URL |
+| `LLM_GATEWAY_AUTH_TOKEN` | ECS Secrets Manager integration | LLM Gateway auth token (sensitive) |
+| `LOG_LEVEL` | ECS task definition (env) | Logging level (default: `info`) |
+
+### ECS integration
+
+- The Session Service launches sandbox containers via `ecs:RunTask`, passing `SESSION_ID` and `REGISTRATION_TOKEN` as environment overrides
+- The ECS task definition is provisioned by the `sandbox` Terraform module (`cowork-infra/iac/modules/sandbox/`), which defines the task definition, security group, and IAM roles
+- The container reads its IP and task ARN from the [ECS task metadata endpoint](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/task-metadata-endpoint-v4.html) during self-registration (see `sandbox/startup.py`)
+- For local development, set `SANDBOX_LOCAL_MODE=true` to skip ECS metadata lookup and use `localhost`
+
+---
+
+## 14. Open Questions
 
 | Question | Context | Recommendation |
 |----------|---------|----------------|

@@ -553,7 +553,7 @@ All backend services run on **AWS ECS** (Elastic Container Service) with Fargate
 Each service is a **FastAPI application** packaged as a Docker container. One ECS service per backend service — they scale independently.
 
 **Sandbox Tasks:**
-Cloud sandbox sessions run as **on-demand Fargate tasks** (not ECS services). The Session Service calls `ecs:RunTask` to launch one task per sandbox session and `ecs:StopTask` to tear it down. The `sandbox` Terraform module (`iac/modules/sandbox/`) provisions the task definition, security group, and IAM roles for these tasks.
+Cloud sandbox sessions run as **on-demand Fargate tasks** (not ECS services). The Session Service calls `ecs:RunTask` to launch one task per sandbox session and `ecs:StopTask` to tear it down. The `sandbox` Terraform module (`iac/modules/sandbox/`) provisions the task definition, security group, and IAM roles for these tasks. The agent runtime Docker image is built from `cowork-agent-runtime/Dockerfile` — a multi-stage build on `python:3.12-slim` that runs as a non-root user, exposes port 8080 for `HttpTransport`, and uses `/workspace` for file sync. See [components/local-agent-host.md, Section 13](components/local-agent-host.md#13-container-deployment) for full container deployment details.
 
 **Networking:**
 - Services sit behind an **Application Load Balancer (ALB)** with path-based routing (`/sessions/*`, `/workspaces/*`, `/approvals/*`, etc.)
