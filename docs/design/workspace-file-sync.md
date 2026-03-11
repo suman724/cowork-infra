@@ -285,7 +285,7 @@ The sandbox's `POST /upload` endpoint in `HttpTransport` becomes internal-only (
 | 2 | Unified Upload Endpoint | `cowork-session-service` | ✅ Done | `feature/web-execution-design` | FileUploadService, shared status constants, validate_file_path, 16 unit tests |
 | 3 | Web App Upload Integration | `cowork-web-app` | ✅ Done | `feature/web-execution-design` | Upload button + drag-and-drop, sync status display, error mapping, 19 unit tests |
 | 4 | Integration Tests | `cowork-session-service` | ✅ Done | `feature/web-execution-design` | 12 E2E scenarios: unified upload, preseed sync, terminated rejection, S3 persistence, sync failure; shared helpers extracted |
-| 5 | Design Doc Sync | `cowork-infra` | ⏳ Pending | `feature/workspace-file-sync` | Update session-service, agent-runtime, workspace-service docs |
+| 5 | Design Doc Sync | `cowork-infra` | ✅ Done | `feature/web-execution-design` | Comprehensive audit of 11 docs, 25 Mermaid diagrams verified/updated, 310 insertions across session-service, web-execution, architecture, desktop-app, local-agent-host, workspace-service, policy-service, domain-model, local-tool-runtime |
 
 ---
 
