@@ -88,7 +88,16 @@ Called by the Local Agent Host at startup to establish a new session.
 
 **Workspace resolution logic:**
 - If `workspaceHint.localPaths` is provided → resolve or create a `local`-scoped workspace matching that path
-- If no `workspaceHint` → create a new `general`-scoped workspace for this session only
+- If no `workspaceHint` (desktop) → create a new `general`-scoped workspace for this session only
+- If `executionEnvironment == "cloud_sandbox"` → create a new `cloud`-scoped workspace (S3-backed, supports file CRUD)
+
+**Sandbox session creation:**
+When `executionEnvironment` is `cloud_sandbox`, the session creation flow differs:
+1. Compatibility check is skipped (no desktop app involved)
+2. Initial status is `SANDBOX_PROVISIONING` (not `SESSION_CREATED`)
+3. Policy bundle fetch is **deferred** to the registration step (`POST /sessions/{id}/register`)
+4. Session response includes `status: "SANDBOX_PROVISIONING"` but no `policyBundle`
+5. `networkAccess` field is stored on the session record if provided
 
 ---
 

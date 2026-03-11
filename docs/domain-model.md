@@ -40,7 +40,7 @@ A backend namespace that scopes a session's history and artifacts for a given pr
 |-------|-------------|--------------|-----------|
 | `local` | Live on the client machine. No project files uploaded to backend. | Reused across many sessions — one workspace per project. | Desktop project sessions |
 | `general` | May exist, scoped to this session only. | Single-use — a new workspace is created for each general chat session. Nothing carries over to the next chat. | Desktop general chat |
-| `cloud` | Live in a cloud sandbox in the backend. | TBD (Phase 3+). | Web sessions |
+| `cloud` | Live in S3-backed cloud workspace (`{workspaceId}/workspace-files/`). Supports file CRUD. | Always new — one workspace per sandbox session. | Web/sandbox sessions |
 
 The distinction between `local` and `general` is **reuse policy**, not the presence of files. A `general` workspace can hold files and context, but it is not shared across general chat sessions.
 
@@ -54,7 +54,7 @@ The distinction between `local` and `general` is **reuse policy**, not the prese
 **Lifecycle:**
 - `local` workspaces: created once per project, reused across all future sessions on that project — long-lived, accumulates history and artifacts over time
 - `general` workspaces: created fresh for each general chat session — single-use, contains only the history and artifacts from that one session
-- `cloud` workspaces: lifecycle TBD (Phase 3+)
+- `cloud` workspaces: created fresh for each sandbox session — single-use, S3-backed with file upload/download/list/delete support. Workspace files stored under `{workspaceId}/workspace-files/` prefix. Deleted when sandbox is terminated.
 - A user can explicitly delete a workspace; all artifacts and session history are permanently removed
 - Auto-purge after 90 days of inactivity (implementation deferred)
 
@@ -78,13 +78,18 @@ The governance container for one continuous working period. From the user's pers
 | `status` | enum | Current state machine state (see below) |
 | `createdAt` | datetime | Session creation time |
 | `expiresAt` | datetime | Policy bundle expiry |
+| `sandboxEndpoint` | string (optional) | Internal endpoint of sandbox container — `cloud_sandbox` only |
+| `taskArn` | string (optional) | ECS task ARN reported by container during registration — `cloud_sandbox` only |
+| `expectedTaskArn` | string (optional) | Expected ECS task ARN stored at session creation for validation — `cloud_sandbox` only |
+| `networkAccess` | enum (optional) | `enabled` or `disabled` — sandbox network access policy — `cloud_sandbox` only |
+| `lastActivityAt` | datetime (optional) | Last interaction time, used for idle timeout — `cloud_sandbox` only |
 
 **executionEnvironment values:**
 
 | Value | Meaning |
 |-------|---------|
 | `desktop` | Agent runs locally via Desktop App and Local Agent Host |
-| `cloud_sandbox` | Agent runs in a backend sandbox (Phase 3+) |
+| `cloud_sandbox` | Agent runs in a backend ECS Fargate sandbox container |
 
 > `executionEnvironment` answers "where is the agent running?"
 > `workspaceScope` answers "where do the source files live?"
@@ -92,6 +97,7 @@ The governance container for one continuous working period. From the user's pers
 
 **Session state machine:**
 
+Desktop sessions:
 ```
 SESSION_CREATED
   └── SESSION_RUNNING
@@ -103,6 +109,15 @@ SESSION_CREATED
               └── SESSION_FAILED
               └── SESSION_CANCELLED
 ```
+
+Sandbox sessions (`cloud_sandbox`):
+```
+SANDBOX_PROVISIONING → SANDBOX_READY → SESSION_RUNNING → (same as desktop)
+                     → SESSION_FAILED (provision timeout or launch failure)
+SANDBOX_READY → SANDBOX_TERMINATED (idle timeout, max duration, explicit)
+```
+
+Terminal states: `SESSION_CANCELLED`, `SANDBOX_TERMINATED`. Resumable: `SESSION_COMPLETED`, `SESSION_FAILED` → `SESSION_RUNNING`.
 
 **What a session holds:**
 - Policy bundle (capabilities, approval rules, LLM policy) — received over authenticated HTTPS, validated by expiry and session id match

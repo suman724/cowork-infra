@@ -43,6 +43,7 @@ This keeps the user experience local-first while preserving enterprise-grade gov
 | Path | Protocol |
 |------|----------|
 | Desktop App ↔ Local Agent Host | JSON-RPC 2.0 over stdio or local socket |
+| Browser ↔ Sandbox Agent Host (via Session Service proxy) | JSON-RPC 2.0 over HTTP + SSE (HttpTransport) |
 | Local Agent Host ↔ Backend services | HTTPS REST |
 | Local Agent Host ↔ LLM Gateway | HTTP streaming |
 
@@ -123,7 +124,7 @@ A workspace is a **backend namespace** for a session's history and artifacts. It
 |-----------------|-------------|-------|
 | `local` | Live on client machine — never uploaded | One workspace per project directory, reused across all sessions |
 | `general` | May exist, scoped to this session | Single-use — fresh workspace created for each general chat |
-| `cloud` | In a cloud sandbox | TBD (Phase 3+) |
+| `cloud` | In S3-backed cloud workspace | Always new — one workspace per sandbox session. Supports file CRUD via `/files` endpoints. |
 
 `workspaceScope` is about **where source files live and workspace reuse**. It is distinct from `executionEnvironment` on the session, which is about **where the agent runs**.
 
@@ -140,11 +141,19 @@ A session is the **governance container** for one continuous working period — 
 | `executionEnvironment` | Meaning |
 |-----------------------|---------|
 | `desktop` | Agent runs locally via Local Agent Host |
-| `cloud_sandbox` | Agent runs in a backend sandbox (Phase 3+) |
+| `cloud_sandbox` | Agent runs in a backend ECS Fargate sandbox container |
 
 **State machine:**
 
+Desktop sessions:
 `SESSION_CREATED` → `SESSION_RUNNING` ↔ `WAITING_FOR_LLM` / `WAITING_FOR_TOOL` / `WAITING_FOR_APPROVAL` / `SESSION_PAUSED` → `SESSION_COMPLETED` / `SESSION_FAILED` / `SESSION_CANCELLED`
+
+Sandbox sessions (`cloud_sandbox`):
+`SANDBOX_PROVISIONING` → `SANDBOX_READY` → `SESSION_RUNNING` ↔ (same as desktop) → `SANDBOX_TERMINATED`
+
+- `SANDBOX_PROVISIONING`: ECS task is starting. Set at session creation for `cloud_sandbox` sessions.
+- `SANDBOX_READY`: Container registered via `POST /sessions/{id}/register`. Policy bundle fetched at this point.
+- `SANDBOX_TERMINATED`: Container shut down (idle timeout, max duration, or explicit). Terminal state.
 
 ### Task
 
@@ -305,7 +314,9 @@ Capabilities are issued in the policy bundle and enforced by **Local Policy Enfo
 
 **Transport:** JSON-RPC 2.0 over stdio or local socket
 
-**Methods:** `CreateSession`, `StartTask`, `CancelTask`, `ResumeSession`, `GetSessionState`, `GetPatchPreview`, `ApproveAction`, `Shutdown`
+**Methods:** `CreateSession`, `StartTask`, `CancelTask`, `ResumeSession`, `GetSessionState`, `GetPatchPreview`, `ApproveAction`, `GetEvents`, `Shutdown`
+
+> `GetEvents` is used by HttpTransport (web/sandbox mode) for SSE event replay. Not used in StdioTransport (desktop mode).
 
 ```json
 // CreateSession  —  Desktop App → Local Agent Host
@@ -762,6 +773,18 @@ cowork-infra/
 ## 13. Web Extension
 
 The same design works for web by running the agent runtime in a backend sandbox instead of the desktop. Only the runtime location changes — state machine, event names, tool schemas, policy model, and workspace model are all identical.
+
+**Sandbox session lifecycle:**
+1. Browser → `POST /sessions` with `executionEnvironment: "cloud_sandbox"` → Session Service creates session in `SANDBOX_PROVISIONING`, launches ECS task, creates `cloud`-scoped workspace
+2. ECS container starts, reads task metadata, calls `POST /sessions/{id}/register` with `sandboxEndpoint` and `taskArn` → Session Service validates ARN, fetches policy bundle, transitions to `SANDBOX_READY`
+3. Browser → Session Service proxy endpoints (`/sessions/{id}/rpc`, `/sessions/{id}/events`) → forwarded to sandbox `HttpTransport`
+4. Sandbox agent runtime uses `HttpTransport` (HTTP + SSE) instead of `StdioTransport` (stdio)
+5. Sandbox syncs workspace files via Workspace Service (`POST /workspaces/{id}/files`, `GET /workspaces/{id}/files/{path}`)
+6. On idle timeout, max duration, or explicit termination → `SANDBOX_TERMINATED` (terminal state)
+
+**Transport modes:**
+- **StdioTransport** (desktop): JSON-RPC over stdin/stdout. Desktop App manages the process lifecycle.
+- **HttpTransport** (web/sandbox): `POST /rpc` for JSON-RPC requests, `GET /events?since={id}` for SSE event stream. EventBuffer provides replay for reconnections (10K event capacity, monotonic IDs).
 
 | Desktop | Web |
 |---------|-----|
