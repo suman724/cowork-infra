@@ -98,6 +98,26 @@ When `executionEnvironment` is `cloud_sandbox`, the session creation flow differ
 3. Policy bundle fetch is **deferred** to the registration step (`POST /sessions/{id}/register`)
 4. Session response includes `status: "SANDBOX_PROVISIONING"` but no `policyBundle`
 5. `networkAccess` field is stored on the session record if provided
+6. **Sandbox provisioning:** After persisting the session record, the Session Service calls `SandboxService.provision_sandbox()` which:
+   - Checks the concurrent sandbox session limit for this user (rejects with 409 if over limit)
+   - Calls the configured `SandboxLauncher.launch()` to start the container/process
+   - Stores `expectedTaskArn` on the session record for registration validation
+   - On launch failure, transitions the session to `SESSION_FAILED`
+
+**Sandbox Launcher:**
+
+The `SandboxLauncher` is a pluggable abstraction with two implementations:
+
+| Type | Config value | Implementation | Use case |
+|------|-------------|----------------|----------|
+| ECS | `SANDBOX_LAUNCHER_TYPE=ecs` | `EcsSandboxLauncher` — calls ECS `RunTask`/`StopTask`/`DescribeTasks` | Production (ECS Fargate) |
+| Local | `SANDBOX_LAUNCHER_TYPE=local` | `LocalSandboxLauncher` — spawns agent-runtime as subprocess on a random free port | Local development |
+
+Configuration:
+- `SANDBOX_MAX_CONCURRENT_SESSIONS` — max active sandbox sessions per user (default: 5)
+- `ECS_CLUSTER`, `ECS_TASK_DEFINITION`, `ECS_SUBNETS`, `ECS_SECURITY_GROUPS` — ECS launcher settings
+- `AGENT_RUNTIME_PATH` — path to agent-runtime repo (local launcher only)
+- `SESSION_SERVICE_URL` — passed to sandbox as env var for self-registration
 
 ---
 

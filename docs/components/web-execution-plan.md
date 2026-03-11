@@ -14,7 +14,7 @@
 | 2b | Desktop App Event Replay | `cowork-desktop-app` | ⏳ Pending | — | Event replay on view navigation; not blocking web MVP but required |
 | 3 | Sandbox Self-Registration | `cowork-session-service` | ✅ Done | `feature/web-execution-design` | Registration endpoint, sandbox session states, conditional write, URL validation |
 | 4 | Cloud Workspace Support | `cowork-workspace-service` | ✅ Done | `feature/web-execution-design` | s3WorkspacePrefix, file CRUD, path traversal prevention |
-| 5 | Sandbox Launcher & ECS | `cowork-session-service` | ⏳ Pending | — | EcsSandboxLauncher + LocalSandboxLauncher |
+| 5 | Sandbox Launcher & ECS | `cowork-session-service` | ✅ Done | `feature/web-execution-design` | EcsSandboxLauncher + LocalSandboxLauncher |
 | 6 | Proxy Layer | `cowork-session-service` | ⏳ Pending | — | Browser → Session Service → Sandbox forwarding |
 | 7 | Agent Runtime Sandbox Mode | `cowork-agent-runtime` | ⏳ Pending | — | Self-registration, workspace sync, sandbox startup |
 | 7b | Skills Adaptation for Web | `cowork-agent-runtime` | ⏳ Pending | — | Workspace-based skills, SKILLS_DIR env var |
@@ -304,7 +304,7 @@ Implement `cloud` workspace scope — S3-backed workspace that sandboxes sync fi
 
 ---
 
-## Step 5 — Sandbox Launcher and ECS Integration (session-service)
+## Step 5 — Sandbox Launcher and ECS Integration (session-service) ✅ Done
 
 **Repo:** `cowork-session-service`
 
