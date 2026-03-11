@@ -143,6 +143,23 @@ Key behaviors:
 
 Config: `PROXY_ENDPOINT_CACHE_TTL_SECONDS` (30), `PROXY_ACTIVITY_BATCH_SECONDS` (60), `PROXY_TIMEOUT_SECONDS` (30), `PROXY_SSE_TIMEOUT_SECONDS` (14400).
 
+**Sandbox Lifecycle Manager:**
+
+`SandboxLifecycleManager` runs as a background `asyncio.Task` started in the FastAPI lifespan. It periodically scans all active sandbox sessions and enforces three time-based rules:
+
+| Check | Condition | Action |
+|-------|-----------|--------|
+| Provisioning timeout | `SANDBOX_PROVISIONING` session older than `SANDBOX_PROVISION_TIMEOUT_SECONDS` (180) | Transition to `SESSION_FAILED` |
+| Max duration | Active sandbox session older than `SANDBOX_MAX_DURATION_SECONDS` (14400) | Terminate via `SandboxService` |
+| Idle timeout | No `lastActivityAt` update within `SANDBOX_IDLE_TIMEOUT_SECONDS` (1800) AND no running tasks | Terminate via `SandboxService` |
+
+Design:
+- **Multi-instance safe:** Uses DynamoDB conditional updates (`ConditionExpression`) to prevent double-termination when multiple Session Service instances check concurrently.
+- **Per-session error isolation:** Errors processing one session are caught and logged; other sessions are still checked.
+- **Running task protection:** Idle timeout is never applied to sessions with at least one `running` task — busy sandboxes are never idle-terminated.
+- **Best-effort termination:** If stopping the sandbox container fails, the status is still updated to prevent retries.
+- **Check interval:** `SANDBOX_LIFECYCLE_CHECK_INTERVAL_SECONDS` (default 300 / 5 minutes).
+
 ---
 
 ### POST /sessions/{sessionId}/resume — Resume Session

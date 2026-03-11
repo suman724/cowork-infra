@@ -18,7 +18,7 @@
 | 6 | Proxy Layer | `cowork-session-service` | ✅ Done | `feature/web-execution-design` | ProxyService + 5 proxy endpoints |
 | 7 | Agent Runtime Sandbox Mode | `cowork-agent-runtime` | ✅ Done | `feature/web-execution-design` | Self-registration, workspace sync, sandbox startup |
 | 7b | Skills Adaptation for Web | `cowork-agent-runtime` | ✅ Done | `feature/web-execution-design` | Workspace-based skills, SKILLS_DIR env var |
-| 8 | Idle/Provisioning Timeout | `cowork-session-service` | ⏳ Pending | — | Timeout enforcement, background cleanup |
+| 8 | Idle/Provisioning Timeout | `cowork-session-service` | ✅ Done | `feature/web-execution-design` | SandboxLifecycleManager, conditional updates, idle/provisioning/max-duration |
 | 9 | End-to-End Integration Test | Multiple | ⏳ Pending | — | Full flow: create → provision → register → task → shutdown |
 | 10 | Web App Foundation | `cowork-web-app` (new) | ⏳ Pending | — | React SPA, session create, SSE events |
 | 11 | Terraform Infrastructure | `cowork-infra` | ⏳ Pending | — | ECS task def, ALB, security groups |
