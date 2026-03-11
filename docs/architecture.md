@@ -552,6 +552,9 @@ All backend services run on **AWS ECS** (Elastic Container Service) with Fargate
 
 Each service is a **FastAPI application** packaged as a Docker container. One ECS service per backend service — they scale independently.
 
+**Sandbox Tasks:**
+Cloud sandbox sessions run as **on-demand Fargate tasks** (not ECS services). The Session Service calls `ecs:RunTask` to launch one task per sandbox session and `ecs:StopTask` to tear it down. The `sandbox` Terraform module (`iac/modules/sandbox/`) provisions the task definition, security group, and IAM roles for these tasks.
+
 **Networking:**
 - Services sit behind an **Application Load Balancer (ALB)** with path-based routing (`/sessions/*`, `/workspaces/*`, `/approvals/*`, etc.)
 - Inter-service calls (e.g., Session Service → Policy Service) go through the ALB or via **ECS Service Connect** for service-to-service discovery
@@ -745,6 +748,8 @@ cowork-platform/
 
 cowork-infra/
   iac/            ← Terraform / CDK (ECS clusters, ALB, DynamoDB tables, S3 buckets, IAM)
+    modules/
+      sandbox/    ← Sandbox task definition, security group, IAM roles
   ci/             ← CI/CD templates (Docker build, ECS deploy, schema codegen)
   docs/           ← Architecture design docs, ADRs, runbooks, threat models
 ```

@@ -115,7 +115,7 @@ The `SandboxLauncher` is a pluggable abstraction with two implementations:
 
 Configuration:
 - `SANDBOX_MAX_CONCURRENT_SESSIONS` — max active sandbox sessions per user (default: 5)
-- `ECS_CLUSTER`, `ECS_TASK_DEFINITION`, `ECS_SUBNETS`, `ECS_SECURITY_GROUPS` — ECS launcher settings
+- `ECS_CLUSTER`, `ECS_TASK_DEFINITION`, `ECS_SUBNETS`, `ECS_SECURITY_GROUPS` — ECS launcher settings (provided by the Terraform `sandbox` module in `cowork-infra/iac/modules/sandbox/`, which provisions the task definition ARN, security group ID, and IAM roles for sandbox tasks)
 - `AGENT_RUNTIME_PATH` — path to agent-runtime repo (local launcher only)
 - `SESSION_SERVICE_URL` — passed to sandbox as env var for self-registration
 

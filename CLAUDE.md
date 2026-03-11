@@ -16,7 +16,7 @@ docs/   ← Architecture design docs, ADRs, runbooks, threat models
 
 ## Infrastructure Conventions
 
-- **Compute:** AWS ECS Fargate. One ECS service per backend service. Each is a FastAPI Docker container.
+- **Compute:** AWS ECS Fargate. One ECS service per backend service (always-running). On-demand Fargate tasks for cloud sandbox containers (one task per sandbox session, launched by Session Service via `RunTask`).
 - **Networking:** ALB with path-based routing (`/sessions/*`, `/workspaces/*`, `/approvals/*`, etc.). Inter-service calls via ALB or ECS Service Connect.
 - **Environments:** `dev`, `staging`, `prod` — each a separate ECS cluster with its own ALB, DynamoDB tables, and S3 buckets.
 - **Environment variable:** Passed as container env var, prefixes all resource names.
@@ -86,6 +86,7 @@ cowork-infra/
       s3-bucket/              # Generic S3 bucket module
       alb/                    # ALB + listener rules module
       iam/                    # Service-specific IAM roles
+      sandbox/                # Sandbox task definition, security group, IAM roles
     environments/
       dev/
         main.tf
