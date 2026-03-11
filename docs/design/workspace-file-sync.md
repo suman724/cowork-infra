@@ -282,7 +282,7 @@ The sandbox's `POST /upload` endpoint in `HttpTransport` becomes internal-only (
 | Step | Name | Repo | Status | Branch | Notes |
 |------|------|------|--------|--------|-------|
 | 1 | workspace.sync RPC | `cowork-agent-runtime` | ✅ Done | `feature/web-execution-design` | New RPC method, targeted sync functions, startup gate, sync lock |
-| 2 | Unified Upload Endpoint | `cowork-session-service` | ⏳ Pending | `feature/workspace-file-sync` | Two-phase upload: S3 persist + conditional sandbox sync |
+| 2 | Unified Upload Endpoint | `cowork-session-service` | ✅ Done | `feature/web-execution-design` | FileUploadService, shared status constants, validate_file_path, 16 unit tests |
 | 3 | Web App Upload Integration | `cowork-web-app` | ⏳ Pending | `feature/workspace-file-sync` | Upload UI uses Session Service, shows sync status |
 | 4 | Integration Tests | `cowork-session-service` | ⏳ Pending | `feature/workspace-file-sync` | E2E: preseed, live sync, terminal session rejection |
 | 5 | Design Doc Sync | `cowork-infra` | ⏳ Pending | `feature/workspace-file-sync` | Update session-service, agent-runtime, workspace-service docs |
