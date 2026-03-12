@@ -826,7 +826,7 @@ Add `import-linter` to `cowork-agent-runtime` dev dependencies and wire into `ma
 | 7 | Move LLM Client | `cowork-agent-sdk`, `cowork-agent-runtime` | ✅ Done | `feature/agent-sdk-extraction` | 1 source + 1 test file moved, EventEmitter→Any, 611 runtime tests pass |
 | 8 | Move Loop Strategy Components | `cowork-agent-sdk`, `cowork-agent-runtime` | ✅ Done | `feature/agent-sdk-extraction` | 4 source + 2 test files moved, 589 runtime tests pass |
 | 9 | Move ReactLoop | `cowork-agent-sdk`, `cowork-agent-runtime` | ✅ Done | `feature/agent-sdk-extraction` | LoopRuntime→LoopContext, new conformance + mock tests, 590 runtime tests pass |
-| 10 | Move Remaining SDK Modules | `cowork-agent-sdk`, `cowork-agent-runtime` | Not Started | `feature/agent-sdk-extraction` | |
+| 10 | Move Remaining SDK Modules | `cowork-agent-sdk`, `cowork-agent-runtime` | ✅ Done | `feature/agent-sdk-extraction` | 4 source files moved (skills, checkpoint, tracking), 590 runtime tests pass |
 | 11 | Reorganize agent_host Transport/Events | `cowork-agent-runtime` | Not Started | `feature/agent-sdk-extraction` | Internal agent_host only |
 | 12 | Clean Up & Enforce Boundaries | `cowork-agent-sdk`, `cowork-agent-runtime` | Not Started | `feature/agent-sdk-extraction` | Full end-to-end verification |
 | 13 | Update Documentation | `cowork-agent-sdk`, `cowork-agent-runtime`, `cowork-infra` | Not Started | `feature/agent-sdk-extraction` | |
