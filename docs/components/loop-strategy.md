@@ -922,7 +922,7 @@ Replace `AgentLoop(...)` construction in `_run_agent()` with `LoopRuntime(...)` 
 
 **Files:**
 - Modified: `src/agent_host/loop/sub_agent.py` (simplified or removed)
-- Modified: `src/agent_host/skills/skill_executor.py` (simplified or removed)
+- Removed: `src/agent_host/skills/skill_executor.py` (dead code, deleted during SDK extraction)
 - Modified: `src/agent_host/loop/agent_tools.py` (delegates to harness for SpawnAgent/skills)
 - Modified: corresponding test files
 
