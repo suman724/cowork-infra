@@ -828,7 +828,7 @@ Add `import-linter` to `cowork-agent-runtime` dev dependencies and wire into `ma
 | 9 | Move ReactLoop | `cowork-agent-sdk`, `cowork-agent-runtime` | ✅ Done | `feature/agent-sdk-extraction` | LoopRuntime→LoopContext, new conformance + mock tests, 590 runtime tests pass |
 | 10 | Move Remaining SDK Modules | `cowork-agent-sdk`, `cowork-agent-runtime` | ✅ Done | `feature/agent-sdk-extraction` | 4 source files moved (skills, checkpoint, tracking), 590 runtime tests pass |
 | 11 | Reorganize agent_host Transport/Events | `cowork-agent-runtime` | ✅ Done | `feature/agent-sdk-extraction` | server/ → transport/ + events/event_buffer, 590 runtime tests pass |
-| 12 | Clean Up & Enforce Boundaries | `cowork-agent-sdk`, `cowork-agent-runtime` | Not Started | `feature/agent-sdk-extraction` | Full end-to-end verification |
+| 12 | Clean Up & Enforce Boundaries | `cowork-agent-sdk`, `cowork-agent-runtime` | ✅ Done | `feature/agent-sdk-extraction` | Dead dirs removed, SDK __init__.py exports, no stale imports, 590+302 tests pass |
 | 13 | Update Documentation | `cowork-agent-sdk`, `cowork-agent-runtime`, `cowork-infra` | Not Started | `feature/agent-sdk-extraction` | |
 
 ---
