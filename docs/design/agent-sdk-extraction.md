@@ -823,7 +823,7 @@ Add `import-linter` to `cowork-agent-runtime` dev dependencies and wire into `ma
 | 4 | Move Policy Module | `cowork-agent-sdk`, `cowork-agent-runtime` | ✅ Done | `feature/agent-sdk-extraction` | 5 source + 4 test files moved, 760 runtime tests pass |
 | 5 | Move Thread Module | `cowork-agent-sdk`, `cowork-agent-runtime` | ✅ Done | `feature/agent-sdk-extraction` | 2 source + 3 test files moved, O(n²)→O(n) compaction fix, 724 runtime tests pass |
 | 6 | Move Memory Module | `cowork-agent-sdk`, `cowork-agent-runtime` | ✅ Done | `feature/agent-sdk-extraction` | 6 source + 6 test files moved, 622 runtime tests pass |
-| 7 | Move LLM Client | `cowork-agent-sdk`, `cowork-agent-runtime` | Not Started | `feature/agent-sdk-extraction` | |
+| 7 | Move LLM Client | `cowork-agent-sdk`, `cowork-agent-runtime` | ✅ Done | `feature/agent-sdk-extraction` | 1 source + 1 test file moved, EventEmitter→Any, 611 runtime tests pass |
 | 8 | Move Loop Strategy Components | `cowork-agent-sdk`, `cowork-agent-runtime` | Not Started | `feature/agent-sdk-extraction` | |
 | 9 | Move ReactLoop | `cowork-agent-sdk`, `cowork-agent-runtime` | Not Started | `feature/agent-sdk-extraction` | Key step — LoopContext dependency |
 | 10 | Move Remaining SDK Modules | `cowork-agent-sdk`, `cowork-agent-runtime` | Not Started | `feature/agent-sdk-extraction` | |
