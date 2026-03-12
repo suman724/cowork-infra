@@ -663,6 +663,7 @@ Separate agent-runtime download — Desktop App downloads and manages `cowork-ag
 | Repo | Contains | Language | Bounded Context(s) |
 |------|----------|----------|---------------------|
 | `cowork-desktop-app` | Desktop App (Electron UI, component downloader) | TypeScript | AgentExecution (UI) |
+| `cowork-agent-sdk` | Reusable agent building blocks (loop strategies, memory, policy, LLM client, etc.) | Python | AgentExecution |
 | `cowork-agent-runtime` | Local Agent Host, Local Tool Runtime | Python | AgentExecution, ToolExecution |
 | `cowork-session-service` | Session Service (FastAPI) | Python | SessionCoordination |
 | `cowork-policy-service` | Policy Service (FastAPI) | Python | PolicyGuardrails |
@@ -675,6 +676,8 @@ Separate agent-runtime download — Desktop App downloads and manages `cowork-ag
 | `cowork-infra` | IaC, CI/CD, secrets management, architecture docs | — | Operations |
 
 ### Why these boundaries
+
+**`cowork-agent-sdk` is separate from `cowork-agent-runtime`** to enforce a clean boundary between reusable agent primitives (loop strategies, memory, policy, LLM client, compaction, skills, checkpointing) and the cowork application layer (session lifecycle, transport, event emission, sandbox orchestration). Physical repo separation makes bad dependencies impossible at import time.
 
 **`cowork-desktop-app` and `cowork-agent-runtime` are separate** so that agent loop improvements can ship without a new desktop app release. The Desktop App downloads and manages `cowork-agent-runtime` as an independently versioned component — see [Agent-runtime download model](#agent-runtime-download-model) below.
 
@@ -727,9 +730,23 @@ cowork-desktop-app/
     renderer/       ← React UI (views: conversation, approval, patch, settings, home)
     shared/         ← IPC channel definitions and shared types
 
+cowork-agent-sdk/
+  src/
+    agent_sdk/      ← Reusable agent building blocks
+      loop/         ← LoopContext protocol, LoopStrategy protocol, ReactLoop, error recovery
+      thread/       ← MessageThread, context compaction, token counting
+      memory/       ← WorkingMemory, MemoryManager, persistent memory, plan, task tracker
+      policy/       ← PolicyEnforcer (pure, no I/O)
+      llm/          ← LLM Gateway streaming client
+      budget/       ← TokenBudget tracking
+      approval/     ← ApprovalGate mechanism
+      skills/       ← SkillLoader, SkillDefinition
+      checkpoint/   ← CheckpointManager (crash recovery)
+      tracking/     ← FileChangeTracker (patch preview)
+
 cowork-agent-runtime/
   src/
-    agent_host/     ← Local Agent Host (agent loop, session client, LLM client, JSON-RPC server)
+    agent_host/     ← Local Agent Host (cowork application layer — session lifecycle, transport, events)
     tool_runtime/   ← Local Tool Runtime (built-in tools, MCP client, platform adapters)
   scripts/          ← Helper scripts (test-chat.py, test-web-sandbox.py)
   pyproject.toml    ← Python project config
@@ -766,6 +783,8 @@ cowork-infra/
 
 **Allowed:**
 - `cowork-desktop-app` → `cowork-platform` (TypeScript npm package — JSON-RPC types, error codes)
+- `cowork-agent-sdk` → `cowork-platform` (Python pip package — Pydantic models, helpers)
+- `cowork-agent-runtime` → `cowork-agent-sdk` (Python pip package — agent building blocks)
 - `cowork-agent-runtime` → `cowork-platform` (Python pip package — Pydantic models, helpers)
 - `cowork-session-service` → `cowork-platform` (Python pip package)
 - `cowork-policy-service` → `cowork-platform` (Python pip package)
@@ -775,8 +794,11 @@ cowork-infra/
 - `cowork-backend-tools` → `cowork-platform` (Python pip package)
 - `cowork-infra` → all repos (deployment only)
 
+**Dependency chain:** `cowork-platform` ← `cowork-agent-sdk` ← `cowork-agent-runtime`. The SDK depends on platform contracts; the runtime depends on both.
+
 **Prohibited:**
 - `cowork-desktop-app` must not import `cowork-agent-runtime` directly — communication is via JSON-RPC over stdio/socket only
+- `cowork-agent-sdk` must not import `agent_host` or `tool_runtime` — it is a leaf dependency that only depends on `cowork-platform` and stdlib
 - Components inside `cowork-agent-runtime` communicate via the tool routing interface — no direct imports across `agent_host/` and `tool_runtime/` package boundaries
 - Backend repos must not import each other — HTTP APIs only
 - `cowork-platform/contracts` must not import any service or application repo

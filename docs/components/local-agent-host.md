@@ -1,6 +1,6 @@
 # Local Agent Host — Component Design
 
-**Repo:** `cowork-agent-runtime` (`agent_host/` package)
+**Repo:** `cowork-agent-runtime` (`agent_host/` package) + `cowork-agent-sdk` (`agent_sdk/` package)
 **Bounded Context:** AgentExecution
 **Phase:** 1 (MVP)
 **Covers:** Local Agent Host, Local Policy Enforcer, Local State Store
@@ -70,53 +70,82 @@ flowchart LR
 
 ### Package layout
 
+The agent host is split across two packages: `agent_sdk/` (reusable building blocks, in `cowork-agent-sdk` repo) and `agent_host/` (cowork application layer, in `cowork-agent-runtime` repo).
+
 ```
-agent-host/
-  server/          — Transport layer (Transport protocol, StdioTransport, HttpTransport), JSON-RPC 2.0 (parse, serialize, dispatch, handlers), EventBuffer (SSE replay)
-  session/         — Session/Workspace HTTP clients, checkpoint manager, SessionManager
-  loop/            — LoopRuntime (infrastructure) + LoopStrategy protocol (orchestration), agent-internal tools, error recovery
+agent_sdk/  (external dependency — pip-installed from cowork-agent-sdk repo)
+  loop/            — LoopContext protocol, LoopStrategy protocol, ReactLoop, error recovery, verification
+  thread/          — MessageThread, context compaction (DropOldest, Hybrid), token counting
+  memory/          — WorkingMemory, MemoryManager, persistent memory, plan, task tracker
+  policy/          — PolicyEnforcer (pure, no I/O): capability validation, path/command/domain matchers
   llm/             — LLM Gateway streaming client (openai SDK), response models, error classifier
-  thread/          — Message thread management, context compaction, token counting
-  memory/          — Working memory (task tracker, plan, notes) + persistent memory (project instructions, auto-memory)
-  skills/          — Skill definitions, loader (built-in/user/workspace/policy)
+  budget/          — TokenBudget tracking (pre-check + record_usage)
+  approval/        — ApprovalGate mechanism (asyncio Futures)
+  skills/          — SkillLoader, SkillDefinition (discovery & loading)
+  checkpoint/      — CheckpointManager (crash recovery persistence)
+  tracking/        — FileChangeTracker (file mutation tracking for patch preview)
+
+agent_host/  (cowork application layer)
+  transport/       — Transport protocol, StdioTransport, HttpTransport, JSON-RPC 2.0, MethodDispatcher
+  server/          — JSON-RPC method handlers (thin delegation to SessionManager)
+  session/         — Session/Workspace HTTP clients (tenacity retry), SessionManager
+  loop/            — LoopRuntime (implements LoopContext), tool executor, agent-internal tools, sub-agents
+  approval/        — ApprovalClient (HTTP client to Approval Service)
+  events/          — EventEmitter, EventBuffer (SSE replay ring buffer)
   sandbox/         — Sandbox startup (self-registration, workspace file sync)
-  policy/          — Local Policy Enforcer (capability checks, path/command enforcement, risk assessment)
-  budget/          — Token budget tracking (pre-check + record_usage)
-  approval/        — Approval gate (asyncio Futures for user approval flow)
-  events/          — Telemetry and audit event emission (fire-and-forget)
 ```
+
+**Dependency chain:** `cowork-platform` ← `cowork-agent-sdk` ← `cowork-agent-runtime`. The SDK contains portable primitives; `agent_host/` wires them with real infrastructure (HTTP clients, transport, event emission).
 
 ### Module dependencies
 
 ```mermaid
 flowchart TD
-  server["server/<br/><small>transport layer<br/>JSON-RPC dispatch</small>"]
-  session["session/<br/><small>session clients<br/>checkpoint</small>"]
-  loop["loop/<br/><small>agent loop<br/>step execution</small>"]
-  llm["llm/<br/><small>LLM client<br/>streaming</small>"]
-  policy["policy/<br/><small>policy enforcer<br/>capability checks</small>"]
-  thread["thread/<br/><small>message thread<br/>token counting</small>"]
-  memory["memory/<br/><small>working + persistent<br/>memory</small>"]
-  approval["approval/<br/><small>approval flow<br/>user decision</small>"]
-  budget["budget/<br/><small>token budget<br/>tracking</small>"]
-  events["events/<br/><small>audit + telemetry<br/>fire-and-forget</small>"]
+  subgraph SDK["agent_sdk (external dependency)"]
+    llm["llm/<br/><small>LLM client<br/>streaming</small>"]
+    policy["policy/<br/><small>policy enforcer<br/>capability checks</small>"]
+    thread["thread/<br/><small>message thread<br/>token counting</small>"]
+    memory["memory/<br/><small>working + persistent<br/>memory</small>"]
+    budget["budget/<br/><small>token budget<br/>tracking</small>"]
+    sdk_approval["approval/<br/><small>approval gate<br/>mechanism</small>"]
+    skills["skills/<br/><small>skill loader<br/>definitions</small>"]
+    checkpoint["checkpoint/<br/><small>crash recovery<br/>persistence</small>"]
+    tracking["tracking/<br/><small>file change<br/>tracking</small>"]
+    react["loop/<br/><small>LoopContext protocol<br/>ReactLoop strategy</small>"]
+  end
 
-  server --> loop
+  subgraph Host["agent_host (cowork application layer)"]
+    transport["transport/<br/><small>Transport protocol<br/>JSON-RPC dispatch</small>"]
+    server["server/<br/><small>JSON-RPC handlers</small>"]
+    session["session/<br/><small>session clients<br/>SessionManager</small>"]
+    loop["loop/<br/><small>LoopRuntime<br/>tool executor</small>"]
+    approval_client["approval/<br/><small>ApprovalClient<br/>HTTP client</small>"]
+    events["events/<br/><small>EventEmitter<br/>EventBuffer</small>"]
+    sandbox["sandbox/<br/><small>self-registration<br/>workspace sync</small>"]
+  end
+
+  transport --> server
+  server --> session
+  session --> loop
+  loop --> react
   loop --> llm
   loop --> policy
-  loop --> approval
-  loop --> session
   loop --> thread
   loop --> memory
   loop --> budget
+  loop --> approval_client
   loop --> events
-  server --> events
+  loop --> checkpoint
+  loop --> tracking
+  loop --> skills
+  transport --> events
   loop -. "ToolRouter interface" .-> TR["Local Tool Runtime<br/><small>(separate package)</small>"]
 ```
 
 **Dependency rules:**
-- `server/` is the process entry point — it provides the transport layer (Stdio or Http) and delegates task execution to `loop/`
-- `loop/` orchestrates all other modules but never imports external packages directly
+- `transport/` is the process entry point — it provides the transport layer (Stdio or Http) and delegates to `server/` for JSON-RPC method handling
+- `loop/` orchestrates all SDK modules via `LoopRuntime` (which implements `LoopContext` from `agent_sdk`)
+- `agent_sdk` modules are pure building blocks — no imports from `agent_host` or `tool_runtime`
 - Tool dispatch goes through a `ToolRouter` interface — `loop/` never imports from `tool_runtime/` directly
 - `policy/` is a pure function module — no I/O, no state, only the policy bundle passed in at init
 - `events/` is fire-and-forget — callers do not wait for event delivery
@@ -127,7 +156,7 @@ flowchart TD
 
 ### 3.1 JSON-RPC Server / Transport Layer
 
-The `server/` module provides a `Transport` protocol with two implementations:
+The `transport/` module provides a `Transport` protocol with two implementations:
 
 - **StdioTransport** — JSON-RPC 2.0 over stdin/stdout (desktop mode, default). The Desktop App is the sole client.
 - **HttpTransport** — Starlette/uvicorn ASGI server (web/sandbox mode, `--transport http`). Exposes:

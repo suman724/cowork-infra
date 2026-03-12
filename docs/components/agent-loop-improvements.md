@@ -694,8 +694,8 @@ compaction_llm_summary: bool = True  # enable LLM summarization phase
 
 | File | Change |
 |------|--------|
-| `src/agent_host/thread/compactor.py` | Add `HybridCompactor` class |
-| `src/agent_host/loop/react_loop.py` | Make `_build_messages` async, call `precompute_summary` |
+| `src/agent_sdk/thread/compactor.py` | Add `HybridCompactor` class |
+| `src/agent_sdk/loop/react_loop.py` | Make `_build_messages` async, call `precompute_summary` |
 | `src/agent_host/session/session_manager.py` | Instantiate `HybridCompactor` based on config |
 | `src/agent_host/config.py` | Add `compaction_strategy`, `compaction_llm_summary` config |
 | Tests | Observation masking accuracy, summarization flow, fallback to drop-oldest |
