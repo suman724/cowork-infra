@@ -11,7 +11,7 @@
 |------|------|------|--------|--------|-------|
 | 1 | Platform Contracts | `cowork-platform` | ✅ Done | `feature/web-execution-design` | Schemas, codegen, SDK helpers |
 | 2 | Transport Protocol & HttpTransport | `cowork-agent-runtime` | ✅ Done | `feature/web-execution-design` | Transport protocol, HttpTransport, EventBuffer, GetEvents RPC |
-| 2b | Desktop App Event Replay | `cowork-desktop-app` | ⏳ Pending | — | Event replay on view navigation; not blocking web MVP but required |
+| 2b | Desktop App Event Replay | `cowork-desktop-app` | ✅ Done | `feature/event-replay` | Event replay on view navigation; GetEvents IPC, lastSeenEventId tracking, gap fallback |
 | 3 | Sandbox Self-Registration | `cowork-session-service` | ✅ Done | `feature/web-execution-design` | Registration endpoint, sandbox session states, conditional write, URL validation |
 | 4 | Cloud Workspace Support | `cowork-workspace-service` | ✅ Done | `feature/web-execution-design` | s3WorkspacePrefix, file CRUD, path traversal prevention |
 | 5 | Sandbox Launcher & ECS | `cowork-session-service` | ✅ Done | `feature/web-execution-design` | EcsSandboxLauncher + LocalSandboxLauncher |
