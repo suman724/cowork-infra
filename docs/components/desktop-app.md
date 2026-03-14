@@ -435,6 +435,21 @@ ipcClient.on("error",                 handler)  — agent-level error
 
 The conversation view registers handlers to update the message list in real time. The approval view registers for `approval_requested` to show the modal.
 
+### 5.3.1 Event Replay
+
+All `SessionEvent` notifications include an `eventId` field (monotonic integer assigned by the agent-runtime's `EventBuffer`). The Desktop App tracks the highest seen `eventId` in session state (`lastSeenEventId`).
+
+When the user navigates away from the conversation view (e.g., to settings or history) and returns, the `useEventReplay` hook fires:
+
+1. **Call `GetEvents`** — `{ method: "GetEvents", params: { sinceId: lastSeenEventId } }` via JSON-RPC
+2. **Dispatch missed events** — Each event is dispatched through the same `dispatchSessionEvent()` function with `isReplay: true`, which:
+   - Skips `approval_requested` events (if an approval is genuinely pending, the live stream delivers it)
+   - Deduplicates by checking `event.eventId <= currentLastSeenId` (handles race with live events)
+   - Updates `lastSeenEventId` as events are processed
+3. **Gap fallback** — If `gapDetected: true` (ring buffer overflow, events evicted), the app falls back to loading full session history from Workspace Service via `getSessionHistory()`, replacing the messages store entirely
+
+`lastSeenEventId` resets to 0 on session change and store reset, ensuring no stale replay across sessions.
+
 ### 5.4 Error Code to UI Message Mapping
 
 | Error Code | User-Facing Message |
@@ -472,6 +487,9 @@ AppState {
       maxSteps: number
     } | null
   } | null
+
+  // Event replay tracking (reset on session change)
+  lastSeenEventId: number  // 0 = fresh session
 
   // Conversation thread (accumulated from events during active session)
   messages: ConversationMessage[]
