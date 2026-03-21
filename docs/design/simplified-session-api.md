@@ -52,30 +52,57 @@ This split exists because the cloud cannot reach the user's desktop machine — 
 
 ### Component Diagram
 
-```mermaid
-flowchart TB
-    subgraph Web
-        WebUI["Web App (React)"]
-        WebUI -->|"HTTP<br/>POST /sessions (with prompt)<br/>POST /sessions/{id}/messages<br/>GET /sessions/{id}/stream"| SS
-    end
+#### Web
 
-    subgraph Desktop
-        Renderer["Desktop App (renderer)"]
-        Main["Desktop App (main process)"]
-        Renderer -->|"IPC<br/>session:create (with prompt)<br/>session:send-message<br/>session:events"| Main
-        Main -->|"JSON-RPC stdio"| LocalAgent["Agent Runtime (local)"]
-        Main -->|"HTTP"| SS
-    end
+```mermaid
+flowchart LR
+    WebUI["Web App<br/>(React)"] -->|"HTTP<br/>POST /sessions<br/>POST /messages<br/>GET /stream"| SS
 
     subgraph Cloud["AWS"]
         SS["Session Service"]
-        SS -->|"SQS (with task)"| SQS["SQS Queue"]
-        SQS -->|"poll"| CloudAgent["Agent Runtime (ECS)"]
+        SQS["SQS Queue"]
+        DB["DynamoDB"]
+        WS["Workspace Service"]
+        PS["Policy Service"]
+        CloudAgent["Agent Runtime<br/>(ECS)"]
+
+        SS -->|"SQS (with task)"| SQS
+        SQS -->|"poll"| CloudAgent
         SS -->|"POST /rpc<br/>GET /events"| CloudAgent
-        SS --- DB["DynamoDB"]
-        SS --- WS["Workspace Service"]
+        SS --- DB
+        SS --- WS
+        SS --- PS
+        CloudAgent -->|"upload history,<br/>sync workspace"| WS
     end
 ```
+
+#### Desktop
+
+```mermaid
+flowchart LR
+    subgraph Electron["Desktop App"]
+        Renderer["Renderer<br/>(React)"]
+        Main["Main Process"]
+        Renderer -->|"IPC<br/>session:create<br/>session:send-message<br/>session:events"| Main
+    end
+
+    LocalAgent["Agent Runtime<br/>(local, stdio)"]
+
+    subgraph Cloud["AWS"]
+        SS["Session Service"]
+        WS["Workspace Service"]
+        PS["Policy Service"]
+        SS --- WS
+        SS --- PS
+    end
+
+    Main -->|"JSON-RPC<br/>stdio"| LocalAgent
+    Main -->|"HTTP<br/>session CRUD,<br/>task records"| SS
+    LocalAgent -->|"HTTP<br/>upload history,<br/>sync workspace"| WS
+    LocalAgent -->|"HTTP<br/>task reporting"| SS
+```
+
+Note: On desktop, both the main process and the agent-runtime communicate with cloud services. The main process handles session lifecycle; the agent-runtime handles task reporting, history upload, and workspace sync.
 
 ### Shared Contract
 
