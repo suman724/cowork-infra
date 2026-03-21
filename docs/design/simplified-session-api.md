@@ -229,8 +229,10 @@ Cancel the running task, or cancel the session if no task is running.
 ```
 
 **Internal flow:**
-1. If a task is running: proxy `CancelTask` RPC to agent runtime
-2. If no task running: cancel the session
+1. Validate session is active and caller owns it
+2. Proxy `GetSessionState` RPC to agent runtime — check if a task is running
+3. If task running → proxy `CancelTask` RPC → return `{ cancelled: "task", taskId }`
+4. If no task running → cancel session in DynamoDB → return `{ cancelled: "session" }`
 
 ### POST /sessions/{id}/approve
 
