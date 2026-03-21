@@ -351,23 +351,21 @@ Resolve a pending approval decision.
 ```json
 {
     "approvalId": "apr_123",
-    "decision": "approve",
-    "modifications": {}
+    "decision": "approve"
 }
 ```
 
 | Field | Type | Required | Description |
 |---|---|---|---|
 | `approvalId` | string | Yes | ID of the pending approval (from `approval_needed` event) |
-| `decision` | `"approve"` or `"deny"` | Yes | User's decision |
-| `modifications` | object | No | Optional modifications to the tool call (e.g., edited command) |
+| `decision` | `"approve"` or `"denied"` | Yes | User's decision |
 
 **Response (200):**
 ```json
 {
     "approvalId": "apr_123",
     "decision": "approve",
-    "status": "resolved"
+    "status": "delivered"
 }
 ```
 
@@ -375,18 +373,17 @@ Resolve a pending approval decision.
 |---|---|---|
 | `approvalId` | string | The approval that was resolved |
 | `decision` | string | The decision that was applied |
-| `status` | string | `"resolved"` |
+| `status` | string | `"delivered"` if a pending approval was found, `"not_found"` if no pending approval with this ID |
 
 **Errors:**
 - `404` — session not found
 - `403` — not session owner
-- `409` — no pending approval with this ID
 - `502` — agent runtime unreachable
 
 **Internal flow:**
 1. Validate session is active and caller owns it
-2. Proxy `ApproveAction` JSON-RPC to agent runtime with `{ approvalId, decision, modifications }`
-3. Return `{ approvalId, decision, status: "resolved" }`
+2. Proxy `ApproveAction` JSON-RPC to agent runtime with `{ approvalId, decision }`
+3. Return `{ approvalId, decision, status }` — agent-runtime returns `"delivered"` or `"not_found"`
 
 ### GET /sessions/{id}/stream
 
