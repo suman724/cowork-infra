@@ -358,7 +358,7 @@ Resolve a pending approval decision.
 
 | Field | Type | Required | Description |
 |---|---|---|---|
-| `approvalId` | string | Yes | ID of the pending approval (from `approval_needed` event) |
+| `approvalId` | string | Yes | ID of the pending approval (from `approval_requested` event) |
 | `decision` | `"approve"` or `"denied"` | Yes | User's decision |
 
 **Response (200):**
