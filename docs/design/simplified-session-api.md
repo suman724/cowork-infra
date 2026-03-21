@@ -191,10 +191,11 @@ Creates a session. If `prompt` is provided, also creates a task record and inclu
 | `featureFlags` | object | Feature toggles |
 
 **Internal flow (with prompt):**
-1. Create session record in DynamoDB (`SANDBOX_PROVISIONING`)
-2. Generate `taskId`, create task record in DynamoDB
-3. Publish to SQS — message includes session config AND task info
-4. Return `{ sessionId, taskId, status }`
+1. Resolve or create workspace via Workspace Service
+2. Create session record in DynamoDB (`SANDBOX_PROVISIONING`)
+3. Generate `taskId`, create task record in DynamoDB
+4. Publish to SQS — message includes session config AND task info
+5. Return `{ sessionId, workspaceId, taskId, status }`
 
 **Internal flow (without prompt):**
 Unchanged from today — creates session, publishes to SQS, returns.
@@ -334,7 +335,7 @@ Cancel the running task, or cancel the session if no task is running.
 **Errors:**
 - `404` — session not found
 - `403` — not session owner
-- `409` — session already in terminal state
+- `409` — session not active (still provisioning, or already cancelled)
 - `502` — agent runtime unreachable
 
 **Internal flow:**
@@ -387,7 +388,7 @@ Resolve a pending approval decision.
 
 ### GET /sessions/{id}/stream
 
-Simplified SSE event stream. Maps internal agent events to frontend-friendly types.
+Simplified SSE event stream. Filters internal agent events to frontend-relevant types only.
 
 **Query params:**
 - `since={eventId}` — replay events after this ID (for reconnect)
@@ -509,17 +510,17 @@ sequenceDiagram
 
     Note over SS: Sandbox registered (SESSION_RUNNING).<br/>Start proxying agent SSE.
 
-    SS-->>Web: SSE: { type: "message_chunk", content: "I'll fix..." }
-    SS-->>Web: SSE: { type: "tool_started", toolName: "WriteFile" }
+    SS-->>Web: SSE: { type: "text_chunk", content: "I'll fix..." }
+    SS-->>Web: SSE: { type: "tool_requested", toolName: "WriteFile" }
     SS-->>Web: SSE: { type: "tool_completed", output: "Done" }
-    SS-->>Web: SSE: { type: "task_done", status: "completed" }
+    SS-->>Web: SSE: { type: "task_completed", taskId: "task_789" }
 
     Note over Web: User sends follow-up message
     Web->>SS: POST /sessions/{id}/messages { prompt: "Add tests" }
     SS-->>Web: 200 { taskId: "task_2" }
 
-    SS-->>Web: SSE: { type: "message_chunk", content: "Adding tests..." }
-    SS-->>Web: SSE: { type: "task_done", status: "completed" }
+    SS-->>Web: SSE: { type: "text_chunk", content: "Adding tests..." }
+    SS-->>Web: SSE: { type: "task_completed", taskId: "task_2" }
 ```
 
 ## Desktop Session Lifecycle
@@ -541,9 +542,9 @@ sequenceDiagram
     Main-->>UI: { sessionId, taskId }
 
     Agent-->>Main: stdio: text_chunk
-    Main-->>UI: IPC push: { type: "message_chunk", content: "I'll fix..." }
+    Main-->>UI: IPC push: { type: "text_chunk", content: "I'll fix..." }
     Agent-->>Main: stdio: task_completed
-    Main-->>UI: IPC push: { type: "task_done", status: "completed" }
+    Main-->>UI: IPC push: { type: "task_completed", taskId: "..." }
 
     UI->>Main: IPC: session:send-message { prompt: "Add tests" }
     Main->>Main: Generate taskId
@@ -561,11 +562,11 @@ sequenceDiagram
     participant Agent as Agent Runtime
 
     Agent-->>BFF: approval_requested
-    BFF-->>App: { type: "approval_needed", approvalId: "apr_1", toolName: "RunCommand" }
+    BFF-->>App: { type: "approval_requested", approvalId: "apr_1", toolName: "RunCommand" }
 
     App->>BFF: approve { approvalId: "apr_1", decision: "approve" }
     BFF->>Agent: ApproveAction RPC
-    BFF-->>App: { status: "resolved" }
+    BFF-->>App: { status: "delivered" }
 
     Agent-->>BFF: tool_completed
     BFF-->>App: { type: "tool_completed", output: "..." }
@@ -648,7 +649,7 @@ Desktop gains value in **Stage 3** when IPC handlers are refactored to the simpl
 
 - Add optional `prompt`/`taskOptions` to `POST /sessions` — creates task record, includes in SQS
 - Add `/messages`, `/cancel`, `/approve` endpoints (orchestrate task + RPC)
-- Add `/stream` endpoint (event mapping + proxy retry during provisioning)
+- Add `/stream` endpoint (event filtering + proxy retry during provisioning)
 - Agent runtime: parse `task` from SQS message, auto-start after registration
 - Platform: update schemas
 
@@ -662,7 +663,7 @@ Desktop gains value in **Stage 3** when IPC handlers are refactored to the simpl
 ### Stage 3: Desktop App
 
 - Refactor IPC handlers to match shared contract
-- Event mapping in main process (stdio notifications → simplified types)
+- Event filtering in main process (stdio notifications → allowed types only)
 - Extract shared `SessionClient` TypeScript interface
 
 ### Stage 4: Cleanup
@@ -674,13 +675,13 @@ Desktop gains value in **Stage 3** when IPC handlers are refactored to the simpl
 
 ## Repos Affected
 
-| Repo | Changes | Phase |
+| Repo | Changes | Stage |
 |---|---|---|
-| `cowork-session-service` | `POST /sessions` with prompt, `/messages`, `/cancel`, `/approve`, `/stream`, event mapper | 1 |
+| `cowork-session-service` | `POST /sessions` with prompt, `/messages`, `/cancel`, `/approve`, `/stream`, event filter | 1 |
 | `cowork-agent-runtime` | SQS consumer parses `task` field, auto-start task after registration | 1 |
-| `cowork-platform` | Simplified event types, updated session creation schema, `/messages` schema | 1 |
+| `cowork-platform` | Frontend event allow-list, updated session creation schema, `/messages` schema | 1 |
 | `cowork-web-app` | New API client, remove JSON-RPC/polling, use `/stream` | 2 |
-| `cowork-desktop-app` | Refactor IPC handlers, event mapping, shared SessionClient | 3 |
+| `cowork-desktop-app` | Refactor IPC handlers, event filtering, shared SessionClient | 3 |
 
 ---
 
