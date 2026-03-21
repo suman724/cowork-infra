@@ -480,46 +480,163 @@ Session Service needs to detect session status changes and push them to the SSE 
 
 ---
 
-## Desktop App Integration
+## Desktop vs Web: Where the Simplified API Lives
 
-The Desktop App can use these same endpoints. The main process calls Session Service (running on localhost) instead of managing JSON-RPC + Session Service separately.
+The simplified API is a **shared contract**, not a shared service. Web and desktop implement the same logical operations, but the implementation lives in different places because of a fundamental constraint: **the cloud cannot reach the user's desktop machine.**
 
-### Current Desktop wiring
+### The constraint
 
+On web, Session Service runs in AWS and the agent runtime runs in ECS — both in the cloud. Session Service can proxy requests to the sandbox.
+
+On desktop, Session Service runs in AWS but the agent runtime runs on the user's machine. Session Service cannot reach it — the user is behind NAT/firewall. The agent-runtime's stdio pipe is only accessible from the Desktop App's main process.
+
+### Component diagrams
+
+#### Web Architecture
+
+```mermaid
+flowchart TB
+    subgraph Browser
+        WebUI["Web App<br/>(React SPA)"]
+    end
+
+    subgraph AWS["AWS Cloud"]
+        SS["Session Service<br/><b>Hosts simplified API</b><br/>POST /messages<br/>POST /cancel<br/>POST /approve<br/>GET /stream"]
+        SQS["SQS Queue"]
+        DB["DynamoDB"]
+        WS["Workspace Service"]
+        PS["Policy Service"]
+
+        subgraph ECS["ECS Service"]
+            Agent["Agent Runtime<br/>(HTTP transport)<br/>POST /rpc<br/>GET /events"]
+        end
+    end
+
+    WebUI -->|"POST /sessions/{id}/messages<br/>POST /sessions/{id}/approve<br/>GET /sessions/{id}/stream"| SS
+    SS -->|"POST /rpc (JSON-RPC)<br/>GET /events (SSE proxy)"| Agent
+    SS --> DB
+    SS --> SQS
+    SS --> WS
+    SS --> PS
+    Agent --> WS
 ```
-Desktop (renderer)
-  → IPC → Desktop (main)
-    → JSON-RPC stdio → Agent Runtime (CreateSession, StartTask, etc.)
-    → HTTP → Session Service (create task record, workspace history)
-    → HTTP → Workspace Service (artifacts)
+
+**Web: Session Service is the BFF.** It hosts the simplified endpoints, orchestrates task creation + RPC dispatch, maps events, and proxies everything to the agent runtime.
+
+#### Desktop Architecture
+
+```mermaid
+flowchart TB
+    subgraph Electron["Desktop App (Electron)"]
+        Renderer["Renderer Process<br/>(React UI)"]
+        Main["Main Process<br/><b>Hosts simplified API</b><br/>IPC: send-message<br/>IPC: cancel<br/>IPC: approve<br/>IPC: stream-events"]
+    end
+
+    subgraph Local["User's Machine"]
+        Agent["Agent Runtime<br/>(stdio transport)<br/>JSON-RPC over stdin/stdout"]
+    end
+
+    subgraph AWS["AWS Cloud"]
+        SS["Session Service<br/>Session CRUD<br/>Task records<br/>History"]
+        WS["Workspace Service"]
+        PS["Policy Service"]
+    end
+
+    Renderer -->|"IPC: session:send-message<br/>IPC: session:cancel<br/>IPC: session:approve<br/>IPC: session:events"| Main
+    Main -->|"JSON-RPC stdio<br/>StartTask, CancelTask,<br/>ApproveAction"| Agent
+    Main -->|"HTTP<br/>POST /sessions, POST /tasks,<br/>GET /history"| SS
+    SS --> WS
+    SS --> PS
+    Agent -->|"stdio notifications"| Main
 ```
 
-The main process coordinates two communication paths for every action.
+**Desktop: The main process is the BFF.** It hosts the same logical operations as IPC handlers, orchestrates agent-runtime (stdio) + Session Service (HTTP), and pushes events to the renderer.
 
-### Proposed Desktop wiring
+#### Side-by-side comparison
 
+```mermaid
+flowchart LR
+    subgraph Web["Web App"]
+        WebUI["React UI"]
+    end
+
+    subgraph Desktop["Desktop App"]
+        DesktopUI["React UI<br/>(identical components)"]
+    end
+
+    subgraph WebBFF["Web BFF = Session Service"]
+        WebAPI["POST /messages<br/>POST /cancel<br/>POST /approve<br/>GET /stream"]
+    end
+
+    subgraph DesktopBFF["Desktop BFF = Main Process"]
+        DesktopAPI["IPC: send-message<br/>IPC: cancel<br/>IPC: approve<br/>IPC: stream-events"]
+    end
+
+    WebUI -->|HTTP| WebAPI
+    DesktopUI -->|IPC| DesktopAPI
+
+    WebAPI -->|"Same contract,<br/>different transport"| DesktopAPI
 ```
-Desktop (renderer)
-  → IPC → Desktop (main)
-    → HTTP → Session Service (localhost)
-      → JSON-RPC stdio → Agent Runtime (internal)
+
+### The shared contract
+
+Both BFFs implement the same operations with the same request/response shapes:
+
+| Operation | Web (HTTP) | Desktop (IPC) | Request | Response |
+|---|---|---|---|---|
+| Send message | `POST /sessions/{id}/messages` | `session:send-message` | `{ prompt, options? }` | `{ taskId, status }` |
+| Cancel | `POST /sessions/{id}/cancel` | `session:cancel` | (none) | `{ cancelled, taskId? }` |
+| Approve | `POST /sessions/{id}/approve` | `session:approve` | `{ approvalId, decision }` | `{ status }` |
+| Event stream | `GET /sessions/{id}/stream` (SSE) | `session:events` (IPC push) | — | Simplified events |
+
+The React UI components can be shared between web and desktop — they call an abstract `SessionClient` interface. The web implementation uses `fetch()`, the desktop implementation uses `ipcRenderer.invoke()`. Same types, same events, same error shapes.
+
+### What each BFF does internally
+
+| Step | Web BFF (Session Service) | Desktop BFF (Main Process) |
+|---|---|---|
+| **Send message** | Generate taskId → create task in DynamoDB → proxy `StartTask` RPC to sandbox HTTP endpoint | Generate taskId → send `StartTask` JSON-RPC via stdio → create task via Session Service HTTP |
+| **Cancel** | Proxy `CancelTask` RPC to sandbox | Send `CancelTask` JSON-RPC via stdio |
+| **Approve** | Proxy `ApproveAction` RPC to sandbox | Send `ApproveAction` JSON-RPC via stdio |
+| **Events** | Proxy agent-runtime SSE → map to simplified events → push to client SSE | Receive stdio JSON-RPC notifications → map to simplified events → push to renderer via IPC |
+| **Session CRUD** | Direct DynamoDB access | HTTP to Session Service (cloud) |
+| **File upload** | S3 persist + sandbox sync | Direct filesystem (agent-runtime reads locally) |
+
+### What changes for Desktop
+
+The Desktop App's **main process IPC handlers** are refactored to match the simplified contract. Today they expose agent-runtime internals:
+
+**Current IPC channels:**
+```typescript
+// Current: protocol-aware, multi-step
+ipcMain.handle('agent:create-session', ...)   // JSON-RPC to agent-runtime
+ipcMain.handle('agent:start-task', ...)       // JSON-RPC + HTTP to Session Service
+ipcMain.handle('agent:cancel-task', ...)      // JSON-RPC to agent-runtime
+ipcMain.handle('agent:approve', ...)          // JSON-RPC to agent-runtime
+ipcMain.handle('agent:get-events', ...)       // JSON-RPC to agent-runtime
 ```
 
-The main process makes a single HTTP call. Session Service handles the coordination.
+**Proposed IPC channels:**
+```typescript
+// Proposed: action-oriented, single-step
+ipcMain.handle('session:create', ...)         // Orchestrates everything
+ipcMain.handle('session:send-message', ...)   // Generate taskId + StartTask + create task record
+ipcMain.handle('session:cancel', ...)         // CancelTask or cancel session
+ipcMain.handle('session:approve', ...)        // ApproveAction
+// Events: pushed via ipcMain → renderer (no pull-based GetEvents)
+```
 
-### Desktop-specific considerations
+The renderer never sees JSON-RPC, task IDs, or agent-runtime protocol details. The main process hides all of it — same as Session Service does for web.
 
-1. **Latency**: Adding an HTTP hop (main → Session Service → agent-runtime) adds ~1-2ms vs direct stdio. Acceptable for all operations.
+### Why not run Session Service locally?
 
-2. **Session Service must support stdio dispatch**: For desktop sessions (`executionEnvironment: "desktop"`), Session Service needs to forward RPC calls to the local agent-runtime process. Two options:
+Running a local Session Service instance for desktop would unify the architecture, but:
 
-   **Option A: Session Service spawns agent-runtime** — Session Service manages the agent-runtime subprocess (stdio) and proxies RPC to it. This unifies the architecture — Session Service is the single entry point for all clients.
+1. **Deployment complexity**: Ship and maintain a Python FastAPI service alongside the Electron app. Manage Python runtime, dependencies, process lifecycle on macOS and Windows.
+2. **DynamoDB dependency**: Session Service needs DynamoDB. Locally, this means either DynamoDB Local (Java, 500MB+) or an embedded alternative. Heavy for a desktop app.
+3. **Unnecessary for desktop**: The Desktop App main process already does exactly what a local Session Service would do — orchestrate agent-runtime + backend services. Adding a service layer in between doesn't simplify anything, it adds a process.
 
-   **Option B: Session Service proxies to agent-runtime HTTP** — Agent-runtime runs in HTTP mode even for desktop. Session Service proxies like it does for sandbox. Desktop App starts agent-runtime with `--transport http` on a random port.
-
-   **Recommendation:** Option B — Desktop agent-runtime runs in HTTP mode on localhost. Session Service proxies. Same proxy code for desktop and web. No stdio management in Session Service. The only difference is: desktop agent-runtime is started by the Desktop App (not via SQS), and its endpoint is registered on the session record (same as sandbox self-registration).
-
-3. **Event stream**: Desktop App connects to `GET /sessions/{id}/stream` via SSE (same as web). This replaces the current JSON-RPC notification mechanism for events. The Desktop App no longer needs the `GetEvents` RPC method — SSE reconnect with `?since=` handles replay.
+The main process IS the local BFF. No additional service needed.
 
 ---
 
@@ -578,36 +695,37 @@ sequenceDiagram
 
 ```mermaid
 sequenceDiagram
-    participant Desktop as Desktop App
-    participant SS as Session Service (localhost)
-    participant Agent as Agent Runtime (localhost HTTP)
-    participant DB as DynamoDB
-    participant WS as Workspace Service
+    participant Renderer as Desktop (renderer)
+    participant Main as Desktop (main process)
+    participant Agent as Agent Runtime (stdio)
+    participant SS as Session Service (cloud)
 
-    Note over Desktop: 1. App starts, launches agent-runtime
-    Desktop->>Agent: Start process (--transport http --port 9123)
+    Note over Main: 1. App starts, spawns agent-runtime
+    Main->>Agent: Spawn process (stdio)
 
-    Note over Desktop: 2. Create session
-    Desktop->>SS: POST /sessions { executionEnvironment: "desktop", ... }
-    SS->>DB: Create session record
-    SS-->>Desktop: 201 { sessionId, policyBundle }
+    Note over Renderer: 2. User creates session
+    Renderer->>Main: IPC: session:create
+    Main->>Agent: JSON-RPC: CreateSession
+    Agent-->>Main: { sessionId, policyBundle }
+    Main->>SS: POST /sessions (create record)
+    Main-->>Renderer: { sessionId }
 
-    Note over Desktop: 3. Register agent endpoint
-    Agent->>SS: POST /sessions/{id}/register { endpoint: "http://localhost:9123" }
-    SS->>DB: Store endpoint
+    Note over Main: 3. Start event forwarding
+    Main->>Main: Listen for stdio notifications
+    Main-->>Renderer: IPC push: events (mapped to simplified types)
 
-    Note over Desktop: 4. Connect event stream
-    Desktop->>SS: GET /sessions/{id}/stream (SSE)
-    SS->>Agent: GET /events (proxy)
+    Note over Renderer: 4. User sends message
+    Renderer->>Main: IPC: session:send-message { prompt }
+    Main->>Main: Generate taskId
+    Main->>Agent: JSON-RPC: StartTask { taskId, prompt }
+    Main->>SS: POST /sessions/{id}/tasks { taskId, prompt }
+    Agent-->>Main: { taskId, status: "running" }
+    Main-->>Renderer: { taskId, status: "running" }
 
-    Note over Desktop: 5. User sends message
-    Desktop->>SS: POST /sessions/{id}/messages { prompt }
-    SS->>DB: Create task record
-    SS->>Agent: POST /rpc { StartTask }
-    SS-->>Desktop: 200 { taskId }
-
-    Agent-->>SS: SSE events
-    SS-->>Desktop: SSE: { type: "message_chunk", ... }
+    Agent-->>Main: stdio notification: text_chunk
+    Main-->>Renderer: IPC push: { type: "message_chunk", content: "..." }
+    Agent-->>Main: stdio notification: task_completed
+    Main-->>Renderer: IPC push: { type: "task_done", status: "completed" }
 ```
 
 ### Approval flow
@@ -753,17 +871,17 @@ The existing `GET /sessions/{id}/events` endpoint continues to serve raw, unfilt
 
 ### Phase 3: Migrate Desktop App
 
-1. Desktop agent-runtime starts in HTTP mode (not stdio)
-2. Desktop App registers agent endpoint with Session Service
-3. Desktop App main process calls Session Service REST (same as web)
-4. Remove `JsonRpcClient` (stdio) from Desktop App main process
-5. Event delivery via SSE (replace JSON-RPC notifications)
+1. Refactor Desktop App IPC handlers to match simplified contract (`session:send-message`, `session:cancel`, `session:approve`)
+2. Main process generates task IDs and orchestrates agent-runtime + Session Service internally
+3. Event mapping: main process converts stdio JSON-RPC notifications to simplified event types
+4. Remove protocol-aware IPC channels (`agent:start-task`, etc.) from renderer
+5. Extract shared `SessionClient` TypeScript interface used by both web and desktop React components
 
 ### Phase 4: Cleanup
 
-1. Mark `/rpc` and `/events` endpoints as internal-only
-2. Remove `GetEvents` RPC method from agent-runtime (SSE replay replaces it)
-3. Remove `X-User-Id` header — auth from OIDC token (Step 14)
+1. Mark `/rpc` and `/events` endpoints as internal-only in docs
+2. Remove `X-User-Id` header — auth from OIDC token (Step 14)
+3. Desktop renderer and web app share React components via shared `SessionClient` interface
 
 ---
 
@@ -771,11 +889,11 @@ The existing `GET /sessions/{id}/events` endpoint continues to serve raw, unfilt
 
 | Repo | Changes | Phase |
 |---|---|---|
-| `cowork-session-service` | New endpoints, event mapper, status injection, orchestration | 1 |
-| `cowork-platform` | Simplified event type enum, `/messages` request/response schemas | 1 |
-| `cowork-web-app` | Update API client, remove JSON-RPC, use `/stream` | 2 |
-| `cowork-desktop-app` | Switch to HTTP agent-runtime, use Session Service REST, use SSE | 3 |
-| `cowork-agent-runtime` | No changes in Phase 1-2. Phase 3: desktop runs in HTTP mode by default | 3 |
+| `cowork-session-service` | New endpoints (`/messages`, `/cancel`, `/approve`, `/stream`), event mapper, status injection | 1 |
+| `cowork-platform` | Simplified event type enum, `/messages` request/response schemas, shared `SessionClient` interface types | 1 |
+| `cowork-web-app` | Update API client to use new endpoints, remove JSON-RPC, use `/stream` | 2 |
+| `cowork-desktop-app` | Refactor IPC handlers to simplified contract, event mapping in main process, shared React components | 3 |
+| `cowork-agent-runtime` | No changes — stdio and HTTP transports unchanged | —
 
 ---
 
