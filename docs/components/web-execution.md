@@ -19,18 +19,19 @@ This document describes the sandbox lifecycle, transport layer, provisioning flo
 
 ### What this feature does
 
-- Runs `cowork-agent-runtime` in an ECS Fargate task (one container per session)
+- Runs `cowork-agent-runtime` as an ECS Fargate Service that polls an SQS queue for session requests (one session per task, task terminates after session)
 - Provides a web UI (`cowork-web-app`) with the same conversation, approval, and patch preview experience as the desktop app
 - Proxies all browser traffic through the Session Service — the browser never connects directly to sandbox containers
 - Streams events from the sandbox to the browser via SSE (Server-Sent Events)
 - Persists session history to the Workspace Service so users can navigate away and reconnect without losing context
 - Supports file upload into the sandbox workspace and configurable network access
+- Auto-scales on utilization — idle tasks are always available for instant session pickup
 
 ### What this feature does NOT do
 
 - Replace the desktop app — desktop remains the primary experience for local file access
 - Provide persistent storage between sessions — each sandbox is ephemeral
-- Run multiple sessions in the same container — one session = one ECS task
+- Run multiple sessions in the same container — one session per task, task terminates after session
 - Allow direct network access to sandbox containers from the browser
 
 ### Key constraints
@@ -79,7 +80,7 @@ flowchart LR
 | Agent runtime location | User's machine (child process) | ECS Fargate task (cloud) |
 | Transport to frontend | JSON-RPC 2.0 over stdio | SSE (events) + HTTP POST (commands) via Session Service proxy |
 | File access | Direct filesystem | S3-backed workspace synced to container local disk |
-| Session creation | Instant (spawn process) | Async (provision ECS task, wait for healthy) |
+| Session creation | Instant (spawn process) | ~50ms (SQS publish), idle worker picks up instantly in steady state |
 | Reconnect after disconnect | Checkpoint file on disk | In-memory thread in sandbox + Workspace Service history |
 | Network access | Unrestricted (user's machine) | Configurable — toggle on/off per session |
 | Lifetime | Tied to desktop app process | Idle timeout + max duration limits |
@@ -90,50 +91,53 @@ flowchart LR
 
 ### 3.1 Provisioning Flow
 
-Session creation triggers ECS task provisioning. Because ECS provisioning takes time (typically 15–45 seconds), the flow is asynchronous — the browser polls until the sandbox is ready.
+Session creation publishes a message to an SQS queue. An idle worker task (running as part of an ECS Service) picks up the message and self-registers with the Session Service. See [sqs-sandbox-dispatch.md](../design/sqs-sandbox-dispatch.md) for the full design, rationale, and migration plan.
 
 ```mermaid
 sequenceDiagram
   participant Browser as Browser
   participant SS as Session Service
+  participant SQS as SQS Queue
+  participant Task as Worker Task (idle)
   participant PS as Policy Service
-  participant ECS as ECS (AWS)
-  participant Sandbox as Sandbox Container
+  participant WS as Workspace Service
 
   Browser->>SS: POST /sessions (executionEnvironment: cloud_sandbox)
   SS->>SS: Create session record (status: SANDBOX_PROVISIONING, generate registrationToken)
-  SS->>ECS: RunTask (sessionId, registrationToken, config)
-  SS->>SS: Store expectedTaskArn
-  SS-->>Browser: 201 {sessionId, workspaceId, status: "SANDBOX_PROVISIONING"}
+  SS->>SQS: SendMessage {sessionId, registrationToken, urls}
+  SS-->>Browser: 201 {sessionId, workspaceId, status: "SANDBOX_PROVISIONING"} (~50ms)
 
-  Browser->>SS: GET /sessions/{sessionId} (poll)
-  SS-->>Browser: {status: "SANDBOX_PROVISIONING"}
+  Task->>SQS: ReceiveMessage (long poll)
+  SQS-->>Task: Message {sessionId, registrationToken, urls}
+  Task->>SQS: DeleteMessage
 
-  Sandbox->>Sandbox: Start, read ECS metadata for task IP and ARN
-  Sandbox->>SS: POST /sessions/{sessionId}/register {sandboxEndpoint, taskArn, registrationToken}
-  SS->>SS: Validate token + ARN match
+  Task->>SS: POST /sessions/{sessionId}/register {sandboxEndpoint, registrationToken}
+  SS->>SS: Validate token, conditional update SANDBOX_PROVISIONING → SANDBOX_READY
   SS->>PS: GET policy bundle
   PS-->>SS: Policy bundle
-  SS->>SS: Store sandbox endpoint, update status → SANDBOX_READY
-  SS-->>Sandbox: 200 {sessionId, workspaceId, policyBundle, workspaceServiceUrl}
+  SS-->>Task: {sessionId, workspaceId, policyBundle, workspaceServiceUrl}
+
+  Task->>WS: download_workspace() (sync files from S3)
 
   Browser->>SS: GET /sessions/{sessionId} (poll)
   SS-->>Browser: {status: "SANDBOX_READY"}
   Browser->>SS: GET /sessions/{sessionId}/events (SSE stream)
-  SS->>Sandbox: Proxy SSE connection
+  SS->>Task: Proxy SSE connection
 ```
 
 **Key decisions:**
 
-1. **Async provisioning (not blocking)**: `POST /sessions` returns immediately with `status: "SANDBOX_PROVISIONING"`. The browser polls `GET /sessions/{sessionId}` until status becomes `SANDBOX_READY`. This avoids HTTP request timeouts during ECS provisioning.
+1. **SQS dispatch (not RunTask)**: `POST /sessions` publishes to SQS (~50ms) instead of calling `ecs:RunTask` (1–5s). The browser polls `GET /sessions/{sessionId}` until status becomes `SANDBOX_READY`.
 
-2. **Sandbox self-registration**: The container reads its own IP from the ECS task metadata endpoint (`$ECS_CONTAINER_METADATA_URI_V4`) and registers with the Session Service. This avoids the Session Service needing to poll ECS for task IPs.
+2. **ECS Service worker pool**: Agent runtime runs as a long-lived ECS Service with utilization-based auto-scaling (`scale_in_enabled = false`). Idle tasks poll SQS for work. No cold start in steady state — idle capacity always available.
 
-3. **Provisioning timeout**: If the sandbox does not register within 180 seconds (3 minutes) of `RunTask`, the Session Service transitions the session to `SESSION_FAILED` with reason `sandbox_provision_timeout`. The lifecycle check (Section 10.4) handles this cleanup.
+3. **Sandbox self-registration**: The worker task reads its own IP from the ECS task metadata endpoint (`$ECS_CONTAINER_METADATA_URI_V4`) and registers with the Session Service. Same flow as before, but the task arrives via SQS rather than `RunTask`.
 
-4. **RunTask failure**: If the ECS `RunTask` API call fails, the session is immediately transitioned to `SESSION_FAILED` with the ECS error. The browser sees this on the next poll.
+4. **Provisioning timeout**: If no worker task picks up and registers within 180 seconds (3 minutes), the `SandboxLifecycleManager` transitions the session to `SESSION_FAILED`.
 
-5. **Warm pool (Phase 3b optimization)**: Pre-provisioned idle containers that can be assigned to sessions instantly. Reduces provisioning time from 15–45s to <3s. Not required for initial launch.
+5. **Task terminates after session**: Each task serves one session, then exits. ECS replaces it with a fresh container. No state leakage between sessions, no cleanup code.
+
+6. **Registration token only**: Task ARN validation is removed — Session Service doesn't know which task will pick up the SQS message. The `registrationToken` (UUID, single-use via conditional update) prevents impersonation.
 
 ### 3.2 Session Status Extensions
 
@@ -148,7 +152,7 @@ The existing session status state machine is extended with sandbox-specific stat
 | `SESSION_COMPLETED` | Agent finished |
 | `SESSION_FAILED` | Unrecoverable error |
 | `SESSION_CANCELLED` | User cancelled |
-| `SANDBOX_TERMINATED` | Container shut down (idle timeout, max duration, or explicit) (new) |
+| `SANDBOX_TERMINATED` | Container shut down (idle timeout, max duration, or explicit). Resumable — transitions to `SANDBOX_PROVISIONING` via `POST /sessions/{id}/resume` |
 
 Desktop sessions skip `SANDBOX_PROVISIONING` and `SANDBOX_READY` — they transition directly from `SESSION_CREATED` to `SESSION_RUNNING` as before.
 
@@ -454,12 +458,11 @@ Platform: Linux/ARM64
 | Health check | `GET /health` every 10s, 3 retries |
 | Log driver | `awslogs` → CloudWatch |
 
-**Environment variables (injected by Session Service via ECS RunTask overrides):**
+**Environment variables (set on ECS Service task definition):**
 
 | Variable | Source |
 |----------|--------|
-| `TRANSPORT_MODE` | `http` |
-| `SESSION_ID` | From session creation |
+| `SQS_QUEUE_URL` | Terraform output (triggers SQS polling in sandbox mode) |
 | `SESSION_SERVICE_URL` | Service discovery |
 | `WORKSPACE_SERVICE_URL` | Service discovery |
 | `LLM_GATEWAY_ENDPOINT` | Service discovery |
@@ -467,20 +470,27 @@ Platform: Linux/ARM64
 | `SANDBOX_PORT` | `8080` |
 | `WORKSPACE_DIR` | `/workspace` |
 
+Session-specific variables (`SESSION_ID`, `REGISTRATION_TOKEN`) are no longer injected via env vars — they come from the SQS message at runtime. See [sqs-sandbox-dispatch.md](../design/sqs-sandbox-dispatch.md).
+
 ### 9.2 Entrypoint Selection
 
-The `cowork-agent-runtime` image supports two transport modes via the `--transport` flag:
+The `cowork-agent-runtime` image supports two modes via the `--transport` flag:
 
 ```python
 # agent_host/main.py
 
 if args.transport == "stdio":
-    transport = StdioTransport(dispatcher)
+    transport = StdioTransport(dispatcher)      # Desktop mode
 elif args.transport == "http":
-    transport = HttpTransport(dispatcher, port=config.sandbox_port)
+    transport = HttpTransport(dispatcher, port=config.sandbox_port)  # Sandbox mode
 ```
 
-The same codebase, same Docker image, same agent loop — only the transport layer differs.
+In sandbox mode (`--transport http`), the session config source depends on the environment:
+
+- **`SQS_QUEUE_URL` set** → poll SQS for session config, serve one session, terminate (production ECS Service)
+- **`SQS_QUEUE_URL` not set** → read `SESSION_ID`, `REGISTRATION_TOKEN` from env vars (manual start / debugging)
+
+The same codebase, same Docker image, same agent loop — only the config source differs.
 
 ### 9.3 Resource Limits
 
@@ -516,17 +526,15 @@ Called by the sandbox container during startup:
 ```json
 {
   "sandboxEndpoint": "http://10.0.1.42:8080",
-  "taskArn": "arn:aws:ecs:us-east-1:123456789:task/cowork-dev/abc123",
   "registrationToken": "uuid-generated-at-session-creation"
 }
 ```
 
 **Behavior:**
 1. Validate the session exists and is in `SANDBOX_PROVISIONING` state
-2. Validate the `registrationToken` matches the token stored at session creation time
-3. Validate the `taskArn` matches the ARN stored at `RunTask` time (prevents sandbox impersonation)
-4. Store `sandboxEndpoint` on the session record
-5. Fetch policy bundle from Policy Service (deferred from session creation)
+2. Validate the `registrationToken` matches the token stored at session creation time (single-use via conditional update — prevents duplicate registration)
+3. Store `sandboxEndpoint` on the session record
+4. Fetch policy bundle from Policy Service (deferred from session creation)
 6. Update session status to `SANDBOX_READY`
 7. Return session config, workspace info, and policy bundle
 
@@ -547,7 +555,6 @@ New fields on the session DynamoDB record for web sessions:
 | Field | Type | Description |
 |-------|------|-------------|
 | `sandboxEndpoint` | string | Internal IP:port of the sandbox container |
-| `taskArn` | string | ECS task ARN for lifecycle management |
 | `networkAccess` | string | `enabled` or `disabled` |
 | `lastActivityAt` | datetime | Last user interaction (for idle timeout) |
 
@@ -668,38 +675,41 @@ await fetch(`/sessions/${sessionId}/rpc`, {
 sequenceDiagram
   participant B as Browser
   participant SS as Session Service
-  participant ECS as ECS
-  participant S as Sandbox
+  participant SQS as SQS Queue
+  participant T as Worker Task
   participant PS as Policy Service
   participant WS as Workspace Service
 
   B->>SS: POST /sessions (cloud_sandbox)
   SS->>SS: Create session (SANDBOX_PROVISIONING, generate registrationToken)
-  SS->>ECS: RunTask (registrationToken, sessionId)
-  SS->>SS: Store expectedTaskArn
-  SS-->>B: 201 {sessionId, workspaceId, status: SANDBOX_PROVISIONING}
+  SS->>SQS: SendMessage {sessionId, registrationToken, urls}
+  SS-->>B: 201 {sessionId, workspaceId, status: SANDBOX_PROVISIONING} (~50ms)
 
-  S->>SS: POST /register {endpoint, taskArn, registrationToken}
+  T->>SQS: ReceiveMessage (long poll)
+  SQS-->>T: Message
+  T->>SQS: DeleteMessage
+  T->>SS: POST /register {endpoint, registrationToken}
   SS->>PS: GET policy bundle
   PS-->>SS: Policy bundle
-  SS-->>S: {sessionId, workspaceId, policyBundle, workspaceServiceUrl}
-  S->>WS: download_workspace() (sync files from S3)
+  SS-->>T: {sessionId, workspaceId, policyBundle, workspaceServiceUrl}
+  T->>WS: download_workspace() (sync files from S3)
 
   B->>SS: GET /sessions/{id} → status: SANDBOX_READY
   B->>SS: POST /upload?path=X (multipart)
   SS->>WS: Persist to S3
-  SS->>S: workspace.sync RPC (best-effort)
+  SS->>T: workspace.sync RPC (best-effort)
 
   B->>SS: GET /events (SSE)
-  SS->>S: Proxy SSE
+  SS->>T: Proxy SSE
 
   B->>SS: POST /rpc {start_task}
-  SS->>S: Forward RPC
-  S->>S: Agent loop runs
-  S-->>SS: SSE events
+  SS->>T: Forward RPC
+  T->>T: Agent loop runs
+  T-->>SS: SSE events
   SS-->>B: SSE events
 
-  S->>WS: Sync history to S3
+  T->>WS: Sync history to S3
+  T->>T: Session ends → process exits
 ```
 
 ### Reconnect After Navigation
@@ -727,9 +737,9 @@ sequenceDiagram
 | Sandbox escape | ECS Fargate — no host access, read-only root filesystem (workspace dir is writable volume) |
 | Data exfiltration | Network access toggle, egress restricted by security group, no access to other sessions |
 | Session hijacking | OIDC token validation on every request, session ownership enforcement |
-| Sandbox impersonation | Registration endpoint validates ECS task ARN matches a task launched by Session Service |
+| Sandbox impersonation | Registration endpoint validates single-use registrationToken (UUID, conditional update prevents reuse) |
 | Resource abuse | Per-user concurrent session limits, idle timeout, max duration, CPU/memory caps |
-| File upload attacks | File size limits, type validation, virus scanning (Phase 2) |
+| File upload attacks | File size limits, type validation |
 | Cross-session access | Each sandbox runs in its own ECS task with unique IAM credentials scoped to its workspace |
 
 ---
@@ -763,7 +773,9 @@ The sandbox container exposes `GET /health` (liveness) and `GET /ready` (readine
 
 ### Phase 3a — MVP
 
-- Single ECS task per session (no warm pool)
+- SQS sandbox dispatch — Session Service publishes to SQS, agent runtime polls as ECS Service worker (see [sqs-sandbox-dispatch.md](../design/sqs-sandbox-dispatch.md))
+- Utilization-based auto-scaling (scale-out only, no scale-in)
+- Task terminates after each session — fresh container, no state leakage
 - SSE + HTTP POST transport via Session Service proxy
 - File upload and download
 - Reconnect via sandbox in-memory replay
@@ -774,25 +786,19 @@ The sandbox container exposes `GET /health` (liveness) and `GET /ready` (readine
 
 ### Phase 3b — Optimization
 
-- Warm pool for instant provisioning (<3s)
 - Connection draining on sandbox shutdown
-- Workspace snapshot/restore (resume from terminated sessions)
+- Session resume for web (load session history into MessageThread, incremental history sync, reconnection UX)
+- Version-aware task drain for zero-interruption deployments
 
 ### Phase 3c — Scale
 
 - OIDC authentication (Auth0, Okta, Cognito)
 - EventBridge lifecycle manager (replace in-process background tasks)
-- Auto-scaling warm pool based on usage patterns
+- EventBridge Scheduler for timeout enforcement (replace polling-based lifecycle manager)
 
 ### Phase 3d — Polish
 
 - Enhanced file management (inline editor, tree view, Monaco)
-- Virus scanning for uploads
-
-### Phase 3e — Advanced
-
-- GPU-enabled sandbox option for ML workloads
-- Shared workspace across sessions (team collaboration)
 
 ---
 

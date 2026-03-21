@@ -116,18 +116,10 @@ When `executionEnvironment` is `cloud_sandbox`, the session creation flow differ
 5. `networkAccess` field is stored on the session record if provided
 6. **Sandbox provisioning:** After persisting the session record, the Session Service calls `SandboxService.provision_sandbox()` which:
    - Checks the concurrent sandbox session limit for this user (rejects with 409 if over limit)
-   - Calls the configured `SandboxLauncher.launch()` to start the container/process
-   - Stores `expectedTaskArn` on the session record for registration validation
-   - On launch failure, transitions the session to `SESSION_FAILED`
+   - Publishes a message to the SQS queue (`{env}-sandbox-requests`) with `sessionId`, `registrationToken`, and service URLs
+   - On publish failure, transitions the session to `SESSION_FAILED`
 
-**Sandbox Launcher:**
-
-The `SandboxLauncher` is a pluggable abstraction with two implementations:
-
-| Type | Config value | Implementation | Use case |
-|------|-------------|----------------|----------|
-| ECS | `SANDBOX_LAUNCHER_TYPE=ecs` | `EcsSandboxLauncher` — calls ECS `RunTask`/`StopTask`/`DescribeTasks` | Production (ECS Fargate) |
-| Local | `SANDBOX_LAUNCHER_TYPE=local` | `LocalSandboxLauncher` — spawns agent-runtime as subprocess on a random free port | Local development |
+**SQS Dispatch:** Session Service publishes to SQS instead of calling `ecs:RunTask`. Agent runtime runs as an ECS Service worker pool that polls the queue. Idle worker tasks pick up messages and self-register. See [sqs-sandbox-dispatch.md](../design/sqs-sandbox-dispatch.md) for the full design.
 
 Configuration:
 - `SANDBOX_MAX_CONCURRENT_SESSIONS` — max active sandbox sessions per user (default: 5)
@@ -195,17 +187,15 @@ Design:
 
 ### POST /sessions/{sessionId}/resume — Resume Session
 
-Called by the Local Agent Host after a desktop restart when a checkpoint exists in the Local State Store.
+Automatically dispatches based on `executionEnvironment`:
 
-**Request:**
-```json
-{
-  "sessionId": "sess_789",
-  "checkpointCursor": "step_004"
-}
-```
+**Desktop sessions:** Called by the Local Agent Host after a desktop restart. Re-validates policy, extends expiry, returns refreshed bundle. Transitions to `SESSION_RUNNING`.
 
-**Response:**
+**Sandbox sessions:** Called by the web app when a user wants to resume a terminated/completed/failed session. Generates a fresh `registrationToken`, transitions to `SANDBOX_PROVISIONING`, publishes to SQS for a new worker task to pick up. The worker loads prior session history from Workspace Service.
+
+**Request:** `POST /sessions/{sessionId}/resume` (no body required)
+
+**Response (desktop):**
 ```json
 {
   "sessionId": "sess_789",
@@ -214,6 +204,19 @@ Called by the Local Agent Host after a desktop restart when a checkpoint exists 
   "policyBundle": { ... }
 }
 ```
+
+**Response (sandbox):**
+```json
+{
+  "sessionId": "sess_789",
+  "workspaceId": "ws_456",
+  "status": "SANDBOX_PROVISIONING"
+}
+```
+
+**Errors:**
+- 404 — session not found
+- 409 — session is still active (SANDBOX_PROVISIONING, SANDBOX_READY, SESSION_RUNNING, etc.) or expired
 
 ---
 
@@ -309,13 +312,12 @@ Returns a single task by ID.
 
 ### POST /sessions/{sessionId}/register — Sandbox Self-Registration
 
-Called by the sandbox container after startup. Validates the registration token and task ARN match what was stored at launch time, stores the sandbox endpoint, fetches the policy bundle from the Policy Service, transitions status to `SANDBOX_READY`, and returns the policy bundle and service URLs.
+Called by the sandbox worker task after picking up a session from SQS. Validates the registration token matches what was stored at session creation (single-use via conditional update), stores the sandbox endpoint, fetches the policy bundle from the Policy Service, transitions status to `SANDBOX_READY`, and returns the policy bundle and service URLs.
 
 **Request:**
 ```json
 {
   "sandboxEndpoint": "http://10.0.1.42:8080",
-  "taskArn": "arn:aws:ecs:us-east-1:123456789:task/cowork-dev/abc123",
   "registrationToken": "uuid-generated-at-session-creation"
 }
 ```
@@ -335,7 +337,7 @@ Called by the sandbox container after startup. Validates the registration token 
 
 **Errors:**
 - 404 — session not found
-- 409 — session not in `SANDBOX_PROVISIONING` state, task ARN mismatch, or registration token mismatch
+- 409 — session not in `SANDBOX_PROVISIONING` state or registration token mismatch
 
 ### GET /sessions/{sessionId} — Get Session Metadata
 
@@ -389,8 +391,7 @@ sequenceDiagram
   SessionService->>WorkspaceService: Create cloud workspace
   WorkspaceService-->>SessionService: workspaceId
   SessionService->>SessionService: Generate registrationToken, status → SANDBOX_PROVISIONING
-  SessionService->>ECS: RunTask (sessionId, registrationToken)
-  SessionService->>SessionService: Store expectedTaskArn
+  SessionService->>SQS: SendMessage {sessionId, registrationToken, urls}
   SessionService-->>Browser: sessionId, workspaceId, status: SANDBOX_PROVISIONING
 
   Sandbox->>SessionService: POST /sessions/{id}/register (endpoint, taskArn, registrationToken)
@@ -434,8 +435,6 @@ sequenceDiagram
 | `expiresAt` | datetime | Policy bundle expiry — session must not continue past this |
 | `updatedAt` | datetime | Last update time |
 | `sandboxEndpoint` | string? | Internal IP:port of sandbox container (cloud_sandbox only, set at registration) |
-| `taskArn` | string? | ECS task ARN (cloud_sandbox only) |
-| `expectedTaskArn` | string? | Expected task ARN for registration validation (cloud_sandbox only) |
 | `registrationToken` | string? | One-time UUID token for sandbox self-registration validation (cloud_sandbox only, generated at session creation) |
 | `networkAccess` | enum? | `enabled` or `disabled` — outbound internet for sandbox (cloud_sandbox only) |
 | `lastActivityAt` | datetime? | Last user interaction time for idle timeout (cloud_sandbox only) |
@@ -464,7 +463,7 @@ sequenceDiagram
 
 ### Stored attributes
 
-`sessionId`, `tenantId`, `userId`, `workspaceId`, `executionEnvironment`, `status`, `name`, `autoNamed`, `createdAt`, `expiresAt`, `updatedAt`, `ttl`, `desktopAppVersion`, `agentHostVersion`, `supportedCapabilities`, `sandboxEndpoint`, `taskArn`, `expectedTaskArn`, `registrationToken`, `networkAccess`, `lastActivityAt`
+`sessionId`, `tenantId`, `userId`, `workspaceId`, `executionEnvironment`, `status`, `name`, `autoNamed`, `createdAt`, `expiresAt`, `updatedAt`, `ttl`, `desktopAppVersion`, `agentHostVersion`, `supportedCapabilities`, `sandboxEndpoint`, `registrationToken`, `networkAccess`, `lastActivityAt`
 
 ---
 
@@ -496,7 +495,7 @@ sequenceDiagram
 
 Set `AWS_ENDPOINT_URL=http://localhost:8000` (DynamoDB Local) or `http://localhost:4566` (LocalStack) to point the service at a local emulator. The same repository code runs in all environments.
 
-**E2E Web Sandbox Test** (`scripts/test-web-sandbox.py`): Tests the full sandbox lifecycle end-to-end — session creation, sandbox provisioning via `LocalSandboxLauncher`, proxy RPC/SSE/file operations, idle timeout, and provisioning timeout. Requires session-service, policy-service, workspace-service, and LocalStack running locally.
+**E2E Web Sandbox Test** (`scripts/test-web-sandbox.py`): Tests the full sandbox lifecycle end-to-end — session creation, SQS dispatch, worker task registration, proxy RPC/SSE/file operations, idle timeout, and provisioning timeout. Requires session-service, policy-service, workspace-service, agent-runtime (in sandbox mode with SQS), and LocalStack running locally.
 
 ---
 

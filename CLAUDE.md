@@ -16,7 +16,7 @@ docs/   ← Architecture design docs, ADRs, runbooks, threat models
 
 ## Infrastructure Conventions
 
-- **Compute:** AWS ECS Fargate. One ECS service per backend service (always-running). On-demand Fargate tasks for cloud sandbox containers (one task per sandbox session, launched by Session Service via `RunTask`).
+- **Compute:** AWS ECS Fargate. One ECS service per backend service (always-running). Cloud sandbox containers run as an ECS Service worker pool — Session Service publishes to SQS, idle worker tasks pick up sessions (see `docs/design/sqs-sandbox-dispatch.md`).
 - **Networking:** ALB with path-based routing (`/sessions/*`, `/workspaces/*`, `/approvals/*`, etc.). Inter-service calls via ALB or ECS Service Connect.
 - **Environments:** `dev`, `staging`, `prod` — each a separate ECS cluster with its own ALB, DynamoDB tables, and S3 buckets.
 - **Environment variable:** Passed as container env var, prefixes all resource names.

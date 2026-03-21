@@ -377,12 +377,9 @@ module "session_service" {
     DYNAMODB_TABLE_PREFIX  = "${local.env}-"
     POLICY_SERVICE_URL     = "http://${aws_lb.main.dns_name}"
     WORKSPACE_SERVICE_URL  = "http://${aws_lb.main.dns_name}"
-    # Sandbox ECS configuration
-    SANDBOX_LAUNCHER_TYPE  = "ecs"
-    ECS_CLUSTER            = aws_ecs_cluster.main.name
-    ECS_TASK_DEFINITION    = module.sandbox.task_definition_family
-    ECS_SUBNETS            = jsonencode(aws_subnet.private[*].id)
-    ECS_SECURITY_GROUPS    = jsonencode([module.sandbox.security_group_id])
+    # Sandbox dispatch (SQS)
+    SQS_QUEUE_URL         = module.sandbox.sqs_queue_url
+    SESSION_SERVICE_URL   = "http://${aws_lb.main.dns_name}"
   }
 
   task_policy_statements = [
@@ -401,28 +398,11 @@ module "session_service" {
         "${module.tasks_table.table_arn}/index/*",
       ]
     },
-    # ECS RunTask/StopTask for sandbox provisioning and termination
+    # SQS: publish session requests to sandbox queue
     {
-      Effect = "Allow"
-      Action = [
-        "ecs:RunTask",
-        "ecs:StopTask",
-        "ecs:DescribeTasks",
-      ]
-      Resource = [
-        module.sandbox.task_definition_arn,
-        # RunTask returns task ARNs scoped to the cluster
-        "arn:aws:ecs:${var.aws_region}:*:task/${aws_ecs_cluster.main.name}/*",
-      ]
-    },
-    # IAM PassRole — required for RunTask to assign execution/task roles
-    {
-      Effect = "Allow"
-      Action = ["iam:PassRole"]
-      Resource = [
-        module.sandbox.execution_role_arn,
-        module.sandbox.task_role_arn,
-      ]
+      Effect   = "Allow"
+      Action   = ["sqs:SendMessage"]
+      Resource = module.sandbox.sqs_queue_arn
     },
   ]
 
@@ -647,9 +627,19 @@ module "sandbox" {
     LLM_GATEWAY_AUTH_TOKEN = var.llm_gateway_auth_token_arn
   }
 
-  # Networking — sandbox ingress only from Session Service SG
+  # ECS cluster
+  ecs_cluster_id   = aws_ecs_cluster.main.id
+  ecs_cluster_name = aws_ecs_cluster.main.name
+
+  # Networking
   vpc_id                = aws_vpc.main.id
+  private_subnet_ids    = aws_subnet.private[*].id
   session_service_sg_id = aws_security_group.ecs_tasks.id
+
+  # Auto-scaling
+  min_capacity       = var.sandbox_min_capacity
+  max_capacity       = var.sandbox_max_capacity
+  utilization_target = var.sandbox_utilization_target
 
   # Storage
   artifacts_bucket_arn = aws_s3_bucket.artifacts.arn
