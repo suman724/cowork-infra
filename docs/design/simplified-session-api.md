@@ -96,13 +96,13 @@ flowchart LR
         SS --- PS
     end
 
-    Main -->|"JSON-RPC<br/>stdio"| LocalAgent
-    Main -->|"HTTP<br/>session CRUD,<br/>task records"| SS
-    LocalAgent -->|"HTTP<br/>upload history,<br/>sync workspace"| WS
-    LocalAgent -->|"HTTP<br/>task reporting"| SS
+    Main -->|"JSON-RPC stdio<br/>(all agent operations)"| LocalAgent
+    Main -->|"HTTP<br/>(list workspaces,<br/>fetch history)"| SS
+    LocalAgent -->|"HTTP<br/>session/task CRUD,<br/>history upload"| SS
+    LocalAgent -->|"HTTP<br/>workspace sync"| WS
 ```
 
-Note: On desktop, both the main process and the agent-runtime communicate with cloud services. The main process handles session lifecycle; the agent-runtime handles task reporting, history upload, and workspace sync.
+Note: The main process is a thin forwarder — it sends stdio RPCs and filters events. The agent-runtime handles all session/task lifecycle communication with cloud services internally. The main process only calls Session Service directly for UI-specific queries (list workspaces, fetch history) that the agent-runtime doesn't handle.
 
 ### Shared Contract
 
@@ -475,13 +475,18 @@ Both implementations reference this file. Event names and payload shapes are unc
 
 ## How Each BFF Works Internally
 
+**Key difference:** On web, Session Service orchestrates everything (DynamoDB writes + RPC proxy). On desktop, the agent-runtime handles backend communication internally — `CreateSession` RPC creates the session record, `start_task()` creates the task record. The desktop main process is a thin forwarder.
+
 | Step | Web BFF (Session Service) | Desktop BFF (Main Process) |
 |---|---|---|
-| **Create + first message** | Create session record + task record in DynamoDB → publish to SQS with task → return `{ sessionId, taskId }` | `CreateSession` JSON-RPC via stdio → create session + task records via Session Service HTTP → `StartTask` JSON-RPC via stdio → return `{ sessionId, taskId }` |
-| **Subsequent messages** | `GetSessionState` RPC to check no task running → generate taskId → create task record in DynamoDB → proxy `StartTask` RPC to sandbox → return `{ taskId }` | Check agent state via stdio → generate taskId → `StartTask` JSON-RPC via stdio → create task record via Session Service HTTP → return `{ taskId }` |
-| **Cancel** | `GetSessionState` RPC → if task running: proxy `CancelTask` RPC; if not: cancel session in DynamoDB | Check agent state via stdio → if task running: `CancelTask` JSON-RPC; if not: cancel session via Session Service HTTP |
-| **Approve** | Proxy `ApproveAction` RPC to sandbox | `ApproveAction` JSON-RPC via stdio |
+| **Create + first message** | Resolve workspace → create session + task records in DynamoDB → publish to SQS with task → return `{ sessionId, taskId }` | `CreateSession` stdio RPC (agent-runtime creates session internally) → `StartTask` stdio RPC (agent-runtime creates task internally) → return `{ sessionId, taskId }` |
+| **Subsequent messages** | `GetSessionState` RPC → generate taskId → create task record in DynamoDB → proxy `StartTask` RPC → return `{ taskId }` | `GetSessionState` stdio RPC → `StartTask` stdio RPC (agent-runtime creates task internally) → return `{ taskId }` |
+| **Cancel** | `GetSessionState` RPC → if task: proxy `CancelTask` RPC; if not: cancel session in DynamoDB | `GetSessionState` stdio RPC → if task: `CancelTask` stdio RPC; if not: cancel via Session Service HTTP |
+| **Approve** | Proxy `ApproveAction` RPC to sandbox | `ApproveAction` stdio RPC |
 | **Events** | Proxy agent SSE → filter to allowed types → push to client SSE | Receive stdio notifications → filter to allowed types → push to renderer via IPC |
+| **List workspaces, history** | Direct DynamoDB / Workspace Service | HTTP to Session Service / Workspace Service |
+
+The desktop main process only calls Session Service HTTP for operations the agent-runtime doesn't handle: listing workspaces, fetching session history for UI display, session resume, and session cancel (when no task is running).
 
 ---
 
@@ -536,9 +541,11 @@ sequenceDiagram
 
     UI->>Main: IPC: session:create { prompt: "Fix the bug" }
     Main->>Agent: JSON-RPC: CreateSession
-    Main->>Main: Generate taskId
-    Main->>Agent: JSON-RPC: StartTask { taskId, prompt }
-    Main->>SS: POST /sessions + POST /tasks (background)
+    Agent->>SS: POST /sessions (internal)
+    Agent-->>Main: { sessionId, workspaceId, policyBundle }
+    Main->>Agent: JSON-RPC: StartTask { prompt }
+    Agent->>SS: POST /tasks (internal)
+    Agent-->>Main: { taskId, status: "running" }
     Main-->>UI: { sessionId, taskId }
 
     Agent-->>Main: stdio: text_chunk
@@ -547,11 +554,13 @@ sequenceDiagram
     Main-->>UI: IPC push: { type: "task_completed", taskId: "..." }
 
     UI->>Main: IPC: session:send-message { prompt: "Add tests" }
-    Main->>Main: Generate taskId
-    Main->>Agent: JSON-RPC: StartTask { taskId, prompt }
-    Main->>SS: POST /tasks (background)
+    Main->>Agent: JSON-RPC: StartTask { prompt }
+    Agent->>SS: POST /tasks (internal)
+    Agent-->>Main: { taskId, status: "running" }
     Main-->>UI: { taskId }
 ```
+
+Note: The main process does not call Session Service directly for session/task creation — the agent-runtime handles that internally via its `SessionClient` and `WorkspaceClient`. The main process only forwards stdio RPCs and filters events.
 
 ## Approval Flow
 
@@ -628,7 +637,7 @@ The frontend sees: open SSE connection → brief wait → events start flowing. 
 
 ## Desktop App Impact
 
-These changes are web-focused. Desktop is unaffected in Phases 1-2:
+These changes are web-focused. Desktop is unaffected in Stages 1-2:
 
 | Change | Desktop impact |
 |---|---|
@@ -662,9 +671,10 @@ Desktop gains value in **Stage 3** when IPC handlers are refactored to the simpl
 
 ### Stage 3: Desktop App
 
-- Refactor IPC handlers to match shared contract
+- Refactor IPC handlers to match simplified contract (`session:create`, `session:send-message`, `session:cancel`, `session:approve`)
+- Main process becomes a thin stdio forwarder — no task ID generation, no direct Session Service calls for session/task CRUD (agent-runtime handles that internally)
 - Event filtering in main process (stdio notifications → allowed types only)
-- Extract shared `SessionClient` TypeScript interface
+- Extract shared `SessionClient` TypeScript interface for React component reuse
 
 ### Stage 4: Cleanup
 
