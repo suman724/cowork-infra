@@ -101,12 +101,32 @@ Creates a session. If `prompt` is provided, also creates a task record and inclu
     "tenantId": "t1",
     "userId": "u1",
     "executionEnvironment": "cloud_sandbox",
-    "clientInfo": {},
+    "workspaceHint": null,
+    "clientInfo": {
+        "desktopAppVersion": "1.0.0",
+        "localAgentHostVersion": "1.0.0"
+    },
     "supportedCapabilities": ["File.Read", "File.Write", "Shell.Exec"],
+    "networkAccess": "enabled",
     "prompt": "Fix the authentication bug in login.py",
-    "taskOptions": { "maxSteps": 50 }
+    "taskOptions": {
+        "maxSteps": 50,
+        "planOnly": false
+    }
 }
 ```
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `tenantId` | string | Yes | Tenant identifier |
+| `userId` | string | Yes | User identifier |
+| `executionEnvironment` | `"desktop"` or `"cloud_sandbox"` | Yes | Where the agent runs |
+| `workspaceHint` | object or null | No | `{ workspaceId }` to reuse, `{ localPaths }` for desktop, `null` for new |
+| `clientInfo` | object | No | Client version info for compatibility check |
+| `supportedCapabilities` | string[] | No | Requested capabilities (e.g., `File.Read`, `Shell.Exec`) |
+| `networkAccess` | `"enabled"` or `"disabled"` | No | Sandbox network access (cloud_sandbox only) |
+| `prompt` | string | **No (new, optional)** | First task prompt. If provided, task is created and bundled with SQS dispatch |
+| `taskOptions` | object | No | `{ maxSteps, planOnly }`. Only used when `prompt` is provided |
 
 **Request (without prompt — session only):**
 ```json
@@ -114,7 +134,6 @@ Creates a session. If `prompt` is provided, also creates a task record and inclu
     "tenantId": "t1",
     "userId": "u1",
     "executionEnvironment": "cloud_sandbox",
-    "clientInfo": {},
     "supportedCapabilities": ["File.Read", "File.Write", "Shell.Exec"]
 }
 ```
@@ -124,12 +143,25 @@ Creates a session. If `prompt` is provided, also creates a task record and inclu
 {
     "sessionId": "sess_123",
     "workspaceId": "ws_456",
+    "compatibilityStatus": "compatible",
     "status": "SANDBOX_PROVISIONING",
-    "taskId": "task_789"
+    "taskId": "task_789",
+    "featureFlags": {
+        "approvalUiEnabled": false,
+        "mcpEnabled": false
+    }
 }
 ```
 
-`taskId` is present only when `prompt` was provided.
+| Field | Type | Description |
+|---|---|---|
+| `sessionId` | string | Created session ID |
+| `workspaceId` | string | Resolved or created workspace ID |
+| `compatibilityStatus` | string | `"compatible"` or `"incompatible"` |
+| `status` | string | `"SANDBOX_PROVISIONING"` (cloud_sandbox only) |
+| `taskId` | string or null | Present only when `prompt` was provided |
+| `policyBundle` | object | Present for desktop sessions (fetched at creation) |
+| `featureFlags` | object | Feature toggles |
 
 **Internal flow (with prompt):**
 1. Create session record in DynamoDB (`SANDBOX_PROVISIONING`)
@@ -199,23 +231,48 @@ Send a subsequent message (after the first task completes). One call replaces `P
 
 **Request:**
 ```json
-{ "prompt": "Now add unit tests for the fix", "options": { "maxSteps": 50 } }
+{
+    "prompt": "Now add unit tests for the fix",
+    "taskOptions": {
+        "maxSteps": 50,
+        "planOnly": false
+    }
+}
 ```
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `prompt` | string | Yes | User message / task prompt |
+| `taskOptions` | object | No | `{ maxSteps, planOnly }` |
+| `taskOptions.maxSteps` | integer | No | Max agent loop steps (1-200, default 50) |
+| `taskOptions.planOnly` | boolean | No | If true, agent creates a plan without executing |
 
 **Response (200):**
 ```json
-{ "taskId": "task_abc", "status": "running" }
+{
+    "taskId": "task_abc",
+    "status": "running"
+}
 ```
 
-**Errors:** 404 (not found), 403 (not owner), 409 (not active or task already running), 502 (agent unreachable)
+| Field | Type | Description |
+|---|---|---|
+| `taskId` | string | Generated task ID |
+| `status` | string | `"running"` |
+
+**Errors:**
+- `404` — session not found
+- `403` — not session owner
+- `409` — session not active, or a task is already running
+- `502` — agent runtime unreachable
 
 **Internal flow:**
 1. Validate session is active and caller owns it
 2. Proxy `GetSessionState` RPC to agent runtime — check if a task is running
 3. If task running → return 409 immediately (no DynamoDB write)
 4. Generate `taskId`, create task record in DynamoDB
-5. Proxy `StartTask` JSON-RPC to agent runtime
-6. Return `{ taskId, status }`
+5. Proxy `StartTask` JSON-RPC to agent runtime with `{ taskId, prompt, taskOptions }`
+6. Return `{ taskId, status: "running" }`
 
 The state check (step 2) queries the agent-runtime directly — it's the source of truth for whether a task is running. This avoids writing a task record and then rolling it back if the agent rejects the start. The round-trip to the sandbox (~5-10ms on the same VPC) is cheaper than a DynamoDB write + rollback.
 
@@ -223,56 +280,146 @@ The state check (step 2) queries the agent-runtime directly — it's the source 
 
 Cancel the running task, or cancel the session if no task is running.
 
-**Response (200):**
+**Request:** No body required.
+
+**Response (200) — task cancelled:**
 ```json
-{ "cancelled": "task", "taskId": "task_abc" }
+{
+    "cancelled": "task",
+    "taskId": "task_abc"
+}
 ```
 
+**Response (200) — session cancelled:**
+```json
+{
+    "cancelled": "session",
+    "sessionId": "sess_123"
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `cancelled` | `"task"` or `"session"` | What was cancelled |
+| `taskId` | string | Present when a task was cancelled |
+| `sessionId` | string | Present when the session was cancelled |
+
+**Errors:**
+- `404` — session not found
+- `403` — not session owner
+- `409` — session already in terminal state
+- `502` — agent runtime unreachable
+
 **Internal flow:**
-1. Validate session is active and caller owns it
+1. Validate session exists and caller owns it
 2. Proxy `GetSessionState` RPC to agent runtime — check if a task is running
 3. If task running → proxy `CancelTask` RPC → return `{ cancelled: "task", taskId }`
-4. If no task running → cancel session in DynamoDB → return `{ cancelled: "session" }`
+4. If no task running → cancel session in DynamoDB → return `{ cancelled: "session", sessionId }`
 
 ### POST /sessions/{id}/approve
 
-Resolve a pending approval.
+Resolve a pending approval decision.
 
 **Request:**
 ```json
-{ "approvalId": "apr_1", "decision": "approve" }
+{
+    "approvalId": "apr_123",
+    "decision": "approve",
+    "modifications": {}
+}
 ```
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `approvalId` | string | Yes | ID of the pending approval (from `approval_needed` event) |
+| `decision` | `"approve"` or `"deny"` | Yes | User's decision |
+| `modifications` | object | No | Optional modifications to the tool call (e.g., edited command) |
 
 **Response (200):**
 ```json
-{ "approvalId": "apr_1", "status": "resolved" }
+{
+    "approvalId": "apr_123",
+    "decision": "approve",
+    "status": "resolved"
+}
 ```
+
+| Field | Type | Description |
+|---|---|---|
+| `approvalId` | string | The approval that was resolved |
+| `decision` | string | The decision that was applied |
+| `status` | string | `"resolved"` |
+
+**Errors:**
+- `404` — session not found
+- `403` — not session owner
+- `409` — no pending approval with this ID
+- `502` — agent runtime unreachable
+
+**Internal flow:**
+1. Validate session is active and caller owns it
+2. Proxy `ApproveAction` JSON-RPC to agent runtime with `{ approvalId, decision, modifications }`
+3. Return `{ approvalId, decision, status: "resolved" }`
 
 ### GET /sessions/{id}/stream
 
 Simplified SSE event stream. Maps internal agent events to frontend-friendly types.
 
-**Query params:** `since={eventId}` for reconnect replay.
+**Query params:**
+- `since={eventId}` — replay events after this ID (for reconnect)
+
+**Headers:**
+- `X-User-Id` — session ownership validation (replaced by OIDC token after Step 14)
+
+**SSE format:**
+```
+id: 42
+event: session_event
+data: {"type":"message_chunk","content":"Here's how to fix...","taskId":"task_abc"}
+
+id: 43
+event: session_event
+data: {"type":"tool_started","toolName":"WriteFile","toolCallId":"tc_1","taskId":"task_abc","arguments":{"path":"src/login.py"}}
+
+id: 44
+event: session_event
+data: {"type":"tool_completed","toolCallId":"tc_1","output":"File written","status":"success","taskId":"task_abc"}
+
+id: 45
+event: session_event
+data: {"type":"approval_needed","approvalId":"apr_1","toolName":"RunCommand","description":"rm -rf /tmp/cache","riskLevel":"high","taskId":"task_abc"}
+
+id: 46
+event: session_event
+data: {"type":"task_done","taskId":"task_abc","status":"completed"}
+```
+
+**Errors:**
+- `404` — session not found
+- `403` — not session owner
+- `502` — agent runtime unreachable (SSE closes, client reconnects with `since=`)
 
 ---
 
 ## Simplified Events
 
-`/stream` maps 18+ internal events to 7 frontend types:
+`/stream` maps 18+ internal events to 7 simplified types:
 
-| Internal event | Simplified type | Payload |
+| Internal event | Simplified type | Payload fields |
 |---|---|---|
-| `text_chunk` | `message_chunk` | `{ content, taskId }` |
-| `tool_requested` | `tool_started` | `{ toolName, toolCallId, taskId }` |
-| `tool_completed` | `tool_completed` | `{ toolCallId, output, taskId }` |
-| `approval_requested` | `approval_needed` | `{ approvalId, toolName, riskLevel }` |
-| `task_completed` | `task_done` | `{ taskId, status: "completed" }` |
-| `task_failed` | `task_done` | `{ taskId, status: "failed", error }` |
-| `step_limit_approaching` | `warning` | `{ message }` |
+| `text_chunk` | `message_chunk` | `content` (string), `taskId` (string) |
+| `tool_requested` | `tool_started` | `toolName` (string), `toolCallId` (string), `arguments` (object), `taskId` (string) |
+| `tool_completed` | `tool_completed` | `toolCallId` (string), `output` (string), `status` (string), `taskId` (string) |
+| `approval_requested` | `approval_needed` | `approvalId` (string), `toolName` (string), `description` (string), `riskLevel` (string), `taskId` (string) |
+| `approval_resolved` | `approval_resolved` | `approvalId` (string), `decision` (string), `taskId` (string) |
+| `task_completed` | `task_done` | `taskId` (string), `status`: `"completed"` |
+| `task_failed` | `task_done` | `taskId` (string), `status`: `"failed"`, `error` (string) |
+| `step_limit_approaching` | `warning` | `message` (string), `currentStep` (int), `maxSteps` (int) |
 
-Dropped: `step_started`, `step_completed`, `llm_request_started`, `llm_request_completed`, `checkpoint_saved`, `verification_started`, `verification_completed`, `context_compacted`.
+**Dropped** (internal implementation detail, not useful to UI):
+`session_created`, `session_started`, `step_started`, `step_completed`, `llm_request_started`, `llm_request_completed`, `checkpoint_saved`, `verification_started`, `verification_completed`, `context_compacted`, `llm_retry`.
 
-Raw `GET /sessions/{id}/events` remains available for debugging.
+Raw `GET /sessions/{id}/events` remains available for debugging and advanced integrations.
 
 ### Shared event mapping contract
 
