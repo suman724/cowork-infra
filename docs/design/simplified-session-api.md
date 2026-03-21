@@ -399,11 +399,11 @@ Simplified SSE event stream. Maps internal agent events to frontend-friendly typ
 ```
 id: 42
 event: session_event
-data: {"type":"message_chunk","content":"Here's how to fix...","taskId":"task_abc"}
+data: {"type":"text_chunk","content":"Here's how to fix...","taskId":"task_abc"}
 
 id: 43
 event: session_event
-data: {"type":"tool_started","toolName":"WriteFile","toolCallId":"tc_1","taskId":"task_abc","arguments":{"path":"src/login.py"}}
+data: {"type":"tool_requested","toolName":"WriteFile","toolCallId":"tc_1","taskId":"task_abc","arguments":{"path":"src/login.py"}}
 
 id: 44
 event: session_event
@@ -411,11 +411,11 @@ data: {"type":"tool_completed","toolCallId":"tc_1","output":"File written","stat
 
 id: 45
 event: session_event
-data: {"type":"approval_needed","approvalId":"apr_1","toolName":"RunCommand","description":"rm -rf /tmp/cache","riskLevel":"high","taskId":"task_abc"}
+data: {"type":"approval_requested","approvalId":"apr_1","toolName":"RunCommand","description":"rm -rf /tmp/cache","riskLevel":"high","taskId":"task_abc"}
 
 id: 46
 event: session_event
-data: {"type":"task_done","taskId":"task_abc","status":"completed"}
+data: {"type":"task_completed","taskId":"task_abc","status":"completed"}
 ```
 
 **Errors:**
@@ -427,33 +427,48 @@ data: {"type":"task_done","taskId":"task_abc","status":"completed"}
 
 ## Simplified Events
 
-`/stream` maps 18+ internal events to 7 simplified types:
+`/stream` filters internal events — passes through UI-relevant types with unchanged names and payloads, drops internal-only types. No new event names or enums.
 
-| Internal event | Simplified type | Payload fields |
-|---|---|---|
-| `text_chunk` | `message_chunk` | `content` (string), `taskId` (string) |
-| `tool_requested` | `tool_started` | `toolName` (string), `toolCallId` (string), `arguments` (object), `taskId` (string) |
-| `tool_completed` | `tool_completed` | `toolCallId` (string), `output` (string), `status` (string), `taskId` (string) |
-| `approval_requested` | `approval_needed` | `approvalId` (string), `toolName` (string), `description` (string), `riskLevel` (string), `taskId` (string) |
-| `approval_resolved` | `approval_resolved` | `approvalId` (string), `decision` (string), `taskId` (string) |
-| `task_completed` | `task_done` | `taskId` (string), `status`: `"completed"` |
-| `task_failed` | `task_done` | `taskId` (string), `status`: `"failed"`, `error` (string) |
-| `step_limit_approaching` | `warning` | `message` (string), `currentStep` (int), `maxSteps` (int) |
+**Passed through (unchanged):**
 
-**Dropped** (internal implementation detail, not useful to UI):
-`session_created`, `session_started`, `step_started`, `step_completed`, `llm_request_started`, `llm_request_completed`, `checkpoint_saved`, `verification_started`, `verification_completed`, `context_compacted`, `llm_retry`.
+| Event type | Payload fields |
+|---|---|
+| `text_chunk` | `content`, `taskId` |
+| `tool_requested` | `toolName`, `toolCallId`, `arguments`, `taskId` |
+| `tool_completed` | `toolCallId`, `output`, `status`, `taskId` |
+| `approval_requested` | `approvalId`, `toolName`, `description`, `riskLevel`, `taskId` |
+| `approval_resolved` | `approvalId`, `decision`, `taskId` |
+| `task_completed` | `taskId`, `status` |
+| `task_failed` | `taskId`, `reason`, `errorCode` |
+| `step_limit_approaching` | `currentStep`, `maxSteps` |
+| `context_compacted` | `droppedCount`, `preCount`, `postCount` |
+| `verification_started` | `taskId` |
+| `verification_completed` | `taskId` |
+| `checkpoint_saved` | `taskId` |
+
+**Dropped:**
+
+| Event type | Reason |
+|---|---|
+| `session_created` | Internal lifecycle — frontend already knows from `POST /sessions` response |
+| `session_started` | Internal lifecycle |
+| `step_started` | Too granular — one per LLM call, adds noise |
+| `step_completed` | Too granular |
+| `llm_request_started` | Internal LLM client detail |
+| `llm_request_completed` | Internal LLM client detail |
+| `llm_retry` | Internal retry logic |
 
 Raw `GET /sessions/{id}/events` remains available for debugging and advanced integrations.
 
-### Shared event mapping contract
+### Shared event filter contract
 
-The event mapping is implemented in two places — Session Service (Python, for web `/stream`) and Desktop main process (TypeScript, for IPC events). To prevent drift, the mapping table lives in `cowork-platform` as the source of truth:
+The event filter (which types to pass through vs drop) is implemented in two places — Session Service (Python, for web `/stream`) and Desktop main process (TypeScript, for IPC events). To prevent drift, the allow-list lives in `cowork-platform` as the source of truth:
 
 ```
-cowork-platform/contracts/enums/simplified-event-mapping.json
+cowork-platform/contracts/enums/frontend-event-types.json
 ```
 
-Both implementations reference this file. CI validates that the mapping is consistent. If a new internal event type is added, the mapping file determines whether it's exposed to frontends or dropped.
+Both implementations reference this file. Event names and payload shapes are unchanged — the filter only controls which types reach the frontend. If a new internal event type is added, it's dropped by default until explicitly added to the allow-list.
 
 ---
 
@@ -619,7 +634,7 @@ These changes are web-focused. Desktop is unaffected in Phases 1-2:
 | `POST /sessions` with prompt | None — desktop uses agent-runtime stdio |
 | `POST /sessions/{id}/messages` | None — Stage 3 IPC equivalent |
 | `/cancel`, `/approve` | None — Stage 3 IPC equivalent |
-| `/stream` event mapping | **Shared contract needed** — mapping logic in `cowork-platform` prevents drift between Python (Session Service) and TypeScript (desktop main process) |
+| `/stream` event filter | **Shared contract needed** — event allow-list in `cowork-platform` prevents drift between Python (Session Service) and TypeScript (desktop main process) |
 | Registration status for bundled tasks | None — desktop doesn't use SQS |
 | SQS task bundling | None — desktop doesn't use SQS |
 
