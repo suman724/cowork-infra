@@ -140,6 +140,19 @@ Creates a session. If `prompt` is provided, also creates a task record and inclu
 **Internal flow (without prompt):**
 Unchanged from today — creates session, publishes to SQS, returns.
 
+### Registration status with bundled task
+
+At registration time, Session Service knows whether the session has a bundled task (it created the task record in `POST /sessions`). The registration handler transitions to the appropriate status:
+
+```python
+if session_has_bundled_task:
+    new_status = "SESSION_RUNNING"   # Task will auto-start immediately
+else:
+    new_status = "SANDBOX_READY"     # Waiting for POST /messages
+```
+
+This avoids the agent-runtime needing to call back to update status. The status is accurate — by the time registration + workspace download completes, the task is starting. If the auto-start fails, the agent-runtime reports the failure through the normal event stream (`task_failed`).
+
 ### SQS Message Schema (extended)
 
 ```json
@@ -289,10 +302,11 @@ sequenceDiagram
 
     Agent->>SQS: ReceiveMessage
     Agent->>SS: POST /sessions/{id}/register
+    SS->>SS: Has bundled task → status = SESSION_RUNNING
     Agent->>Agent: download_workspace()
     Agent->>Agent: auto-start task from SQS message
 
-    Note over SS: Sandbox registered.<br/>Start proxying agent SSE.
+    Note over SS: Sandbox registered (SESSION_RUNNING).<br/>Start proxying agent SSE.
 
     SS-->>Web: SSE: { type: "message_chunk", content: "I'll fix..." }
     SS-->>Web: SSE: { type: "tool_started", toolName: "WriteFile" }
