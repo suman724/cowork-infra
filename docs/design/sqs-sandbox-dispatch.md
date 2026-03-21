@@ -473,7 +473,7 @@ The agent runtime runs the **exact same code** locally and in production. The on
 
 | Improvement | Step | Description |
 |-------------|------|-------------|
-| Session resume | 15 | Load `session_history` into MessageThread on resume, incremental history sync every N steps, web app reconnection UX. No new infrastructure — uses existing Workspace Service artifacts. |
+| Session resume | 15 | Wire history loading into `init_from_registration()` for resumed sandbox sessions, add SQS dispatch to resume endpoint, web app reconnection UX. History upload every N steps and history fetch already exist. |
 | EventBridge crash detection | 17 | ECS task state change events for faster crash detection than the current 5-minute polling cycle |
 | Version-aware task drain | 18 | Tasks log their revision at startup and on exit. Foundation for future multi-session-per-task model where tasks could check revision before picking up new work. |
 | Lifecycle manager → EventBridge | 19 | Replace polling-based timeout checks (provisioning, idle, max-duration) with per-session EventBridge Scheduler events. Eliminates DynamoDB scans. |

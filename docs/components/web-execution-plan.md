@@ -25,7 +25,7 @@
 | 12 | Docker and CI | `cowork-agent-runtime`, `cowork-infra` | ✅ Done | `feature/web-execution-design` | Dockerfile, .dockerignore, CI Docker build |
 | 13 | SQS Sandbox Dispatch | `cowork-session-service`, `cowork-agent-runtime`, `cowork-infra` | ⏳ Pending | — | Replace RunTask with SQS publish; agent runtime polls as ECS Service worker |
 | 14 | OIDC Authentication | `cowork-session-service`, `cowork-web-app` | ⏳ Pending | — | Browser auth flow, production multi-tenant |
-| 15 | Session Resume for Web | `cowork-agent-runtime`, `cowork-session-service`, `cowork-web-app` | ⏳ Pending | — | Load session history into MessageThread on resume, incremental history sync, reconnection UX |
+| 15 | Session Resume for Web | `cowork-agent-runtime`, `cowork-session-service`, `cowork-web-app` | ⏳ Pending | — | Wire history loading into sandbox init for resumed sessions, SQS dispatch from resume endpoint, reconnection UX |
 | 16 | Connection Draining | `cowork-session-service`, `cowork-agent-runtime` | ⏳ Pending | — | Graceful shutdown with in-flight requests |
 | 17 | EventBridge Crash Detection | `cowork-session-service`, `cowork-infra` | ⏳ Pending | — | ECS task state change events for crash detection |
 | 18 | Version-Aware Task Drain | `cowork-agent-runtime` | ⏳ Pending | — | Tasks check revision after session ends, exit if outdated — zero-interruption deploys |
@@ -839,54 +839,57 @@ Replace simple auth with OIDC for production multi-tenant use.
 **Repos:** `cowork-agent-runtime`, `cowork-session-service`, `cowork-web-app`
 **Depends on:** Step 13 (SQS Sandbox Dispatch)
 
-Enable interrupted web sessions to resume on a new worker task. The infrastructure already exists — `session_history` artifact has the full message thread, workspace files are in S3, policy is in Session Service. This step wires them together for seamless resume.
+Enable interrupted web sessions to resume on a new worker task. Most infrastructure already exists — `session_history` is uploaded every 5 steps and on task completion, `resume_session()` fetches and loads history, workspace files are in S3. The gap is narrow: `init_from_registration()` (sandbox path) doesn't load history, and the resume endpoint doesn't dispatch via SQS.
 
-### Problem
+### What already exists
 
-When a web session is interrupted (SIGTERM during deploy, crash, idle timeout), the container is destroyed. The user returns and wants to continue. Today, the session is stuck — no container to serve it. With SQS dispatch (Step 13), we can assign a new task, but that task starts with an empty `MessageThread`. It needs the conversation history to give the LLM context.
+- **Session history upload every N steps**: `_on_step_complete()` uploads `session_history` to Workspace Service every `WORKSPACE_SYNC_INTERVAL` steps (default: 5). Also uploads on task completion. Mid-task gap is at most ~5 steps.
+- **History loading on resume**: `resume_session()` fetches history from Workspace Service via `get_session_history()` and loads into `self._session_messages`.
+- **Crash recovery**: `_restore_from_checkpoint()` loads from local checkpoint first, falls back to Workspace Service.
+- **Workspace client methods**: `upload_session_history()` and `get_session_history()` both exist.
+
+### What's missing
+
+The `init_from_registration()` path (used by sandbox worker tasks) does NOT load history — it always starts with an empty `MessageThread`. When a resumed session is dispatched via SQS to a new worker task, the new task goes through `init_from_registration()` and loses all conversation context.
 
 ### Work
 
-1. **Agent Runtime — load history on resume:**
-   - At registration, Session Service returns a flag indicating whether this is a new or resumed session
-   - If resumed: fetch `session_history` artifact from Workspace Service, deserialize `messages` array into `MessageThread`
+1. **Agent Runtime — load history in `init_from_registration()` for resumed sessions:**
+   - Session Service registration response includes a flag (`isResumed: true`) when the session has prior history
+   - If resumed: call `get_session_history()` from Workspace Service, load into `self._session_messages` and `MessageThread`
    - Agent loop starts with full conversation context — LLM sees the entire prior conversation
 
-2. **Agent Runtime — incremental history sync:**
-   - Sync `session_history` to Workspace Service every N steps (same interval as workspace file sync, default 10)
-   - Currently only synced after task completion — this closes the mid-task gap so resume loses at most one step, not one full task
+2. **Session Service — resume endpoint dispatches via SQS:**
+   - `POST /sessions/{id}/resume` already re-validates policy and extends expiry
+   - Add: generate fresh `registrationToken` (old one was consumed at first registration)
+   - Add: transition session to `SANDBOX_PROVISIONING`
+   - Add: publish SQS message (same schema as session creation)
+   - Add: return `isResumed: true` in registration response when session has prior history
 
-3. **Session Service — resume publishes to SQS:**
-   - `POST /sessions/{id}/resume` already exists (re-validates policy, extends expiry, transitions status)
-   - Add: publish SQS message so a new worker task picks up the session
-   - Add: transition session back to `SANDBOX_PROVISIONING` before publishing (a new task needs to register)
-
-4. **Web App — reconnection UX:**
+3. **Web App — reconnection UX:**
    - Detect SSE disconnect (any reason: deploy, crash, network)
    - Show "Reconnecting..." indicator
    - Call `POST /sessions/{id}/resume`
    - Poll for `SANDBOX_READY`, reconnect SSE stream
-   - Conversation history loads from Workspace Service while waiting (so user sees their prior messages immediately)
+   - Conversation history loads from Workspace Service while waiting (so user sees prior messages immediately)
 
 ### Tests
 
-- Unit: `MessageThread` initialization from `session_history` artifact
-- Unit: Incremental history sync (verify history uploaded every N steps)
-- Unit: Resume endpoint publishes SQS message and transitions status
+- Unit: `init_from_registration()` with `isResumed=true` loads history into MessageThread
+- Unit: `init_from_registration()` with `isResumed=false` starts empty (existing behavior)
+- Unit: Resume endpoint generates new registrationToken, transitions to SANDBOX_PROVISIONING, publishes SQS
 - Unit: Web app reconnection flow (SSE drop → resume → reconnect)
-- Integration: Full flow — create session → start task → kill container → resume → verify conversation continues with full context
+- Integration: Full flow — create session → start task → kill agent-runtime → resume → new task picks up with history → verify conversation continues
 
 ### Definition of Done
 
 - Interrupted web sessions can be resumed via `POST /sessions/{id}/resume`
 - New worker task loads full conversation history from Workspace Service
 - LLM has complete context on resume — user can say "continue" and the agent picks up naturally
-- History synced every N steps (mid-task gap is one step, not one task)
-- Web app automatically attempts reconnection on SSE disconnect
 - Desktop sessions unaffected (no regression)
 - `make check` passes on agent-runtime, session-service, web-app
-- **Wiring check**: Verify `session_history` artifact format matches what `MessageThread` expects. Verify resume SQS message has same schema as creation. Verify web app reconnection uses `Last-Event-ID` for events that happened after resume
-- **Self-review**: Verify history deserialization handles edge cases (empty history, corrupted artifact, missing messages). Verify incremental sync doesn't overwrite a more recent snapshot (use `snapshotAfterTaskId` ordering)
+- **Wiring check**: Verify `session_history` artifact format matches what `get_session_history()` returns and what `MessageThread` expects. Verify resume SQS message has same schema as creation. Verify web app reconnection uses `Last-Event-ID` for events that happened after resume
+- **Self-review**: Verify history deserialization handles edge cases (empty history, corrupted artifact, missing messages). Verify history load doesn't duplicate messages already in the thread
 - **Logical bug review**: Verify resumed session gets a fresh `registrationToken` (old one was consumed). Verify token budget carries over from original session (don't reset to zero). Verify the web app doesn't show duplicate messages (history from Workspace Service + live events from new SSE stream)
 - **Local run**: Test full resume flow locally with LocalStack — create session, start task, kill agent-runtime process, call resume, verify new process picks up with history
 - **Documentation**: Update CLAUDE.md, README.md, and design docs for changed behavior
