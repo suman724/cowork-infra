@@ -25,7 +25,7 @@
 | 12 | Docker and CI | `cowork-agent-runtime`, `cowork-infra` | ✅ Done | `feature/web-execution-design` | Dockerfile, .dockerignore, CI Docker build |
 | 13 | SQS Sandbox Dispatch | `cowork-session-service`, `cowork-agent-runtime`, `cowork-infra` | ⏳ Pending | — | Replace RunTask with SQS publish; agent runtime polls as ECS Service worker |
 | 14 | OIDC Authentication | `cowork-session-service`, `cowork-web-app` | ⏳ Pending | — | Browser auth flow, production multi-tenant |
-| 15 | Session Resume for Web | `cowork-agent-runtime`, `cowork-session-service`, `cowork-web-app` | ⏳ Pending | — | Wire history loading into sandbox init for resumed sessions, SQS dispatch from resume endpoint, reconnection UX |
+| 15 | Session Resume for Web | `cowork-agent-runtime`, `cowork-session-service`, `cowork-web-app` | ⏳ Pending | — | Always load history in init_from_registration(), SQS dispatch from resume endpoint, reconnection UX |
 | 16 | Connection Draining | `cowork-session-service`, `cowork-agent-runtime` | ⏳ Pending | — | Graceful shutdown with in-flight requests |
 | 17 | EventBridge Crash Detection | `cowork-session-service`, `cowork-infra` | ⏳ Pending | — | ECS task state change events for crash detection |
 | 18 | Version-Aware Task Drain | `cowork-agent-runtime` | ⏳ Pending | — | Tasks check revision after session ends, exit if outdated — zero-interruption deploys |
@@ -854,17 +854,19 @@ The `init_from_registration()` path (used by sandbox worker tasks) does NOT load
 
 ### Work
 
-1. **Agent Runtime — load history in `init_from_registration()` for resumed sessions:**
-   - Session Service registration response includes a flag (`isResumed: true`) when the session has prior history
-   - If resumed: call `get_session_history()` from Workspace Service, load into `self._session_messages` and `MessageThread`
-   - Agent loop starts with full conversation context — LLM sees the entire prior conversation
+1. **Agent Runtime — load history in `init_from_registration()`:**
+   - After registration, always attempt to load history from Workspace Service via `get_session_history()`
+   - If history exists (resumed session): load into `self._session_messages` and `MessageThread`
+   - If no history (new session): no-op, start empty as today
+   - No flag needed — new sessions return empty history, resumed sessions return the full thread
+   - Same pattern as `_restore_from_checkpoint()` fallback, already proven
 
 2. **Session Service — resume endpoint dispatches via SQS:**
    - `POST /sessions/{id}/resume` already re-validates policy and extends expiry
    - Add: generate fresh `registrationToken` (old one was consumed at first registration)
    - Add: transition session to `SANDBOX_PROVISIONING`
    - Add: publish SQS message (same schema as session creation)
-   - Add: return `isResumed: true` in registration response when session has prior history
+   - No changes to registration response or SQS message schema
 
 3. **Web App — reconnection UX:**
    - Detect SSE disconnect (any reason: deploy, crash, network)
@@ -875,8 +877,9 @@ The `init_from_registration()` path (used by sandbox worker tasks) does NOT load
 
 ### Tests
 
-- Unit: `init_from_registration()` with `isResumed=true` loads history into MessageThread
-- Unit: `init_from_registration()` with `isResumed=false` starts empty (existing behavior)
+- Unit: `init_from_registration()` loads history when Workspace Service returns messages
+- Unit: `init_from_registration()` starts empty when Workspace Service returns no history
+- Unit: History load failure is non-fatal (log warning, start empty)
 - Unit: Resume endpoint generates new registrationToken, transitions to SANDBOX_PROVISIONING, publishes SQS
 - Unit: Web app reconnection flow (SSE drop → resume → reconnect)
 - Integration: Full flow — create session → start task → kill agent-runtime → resume → new task picks up with history → verify conversation continues
