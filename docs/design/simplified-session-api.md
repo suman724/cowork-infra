@@ -666,30 +666,76 @@ Desktop gains value in **Stage 3** when IPC handlers are refactored to the simpl
 
 ### Stage 1: Session Service + Agent Runtime
 
+**Work:**
 - Add optional `prompt`/`taskOptions` to `POST /sessions` — creates task record, includes in SQS
 - Add `/messages`, `/cancel`, `/approve` endpoints (orchestrate task + RPC)
 - Add `/stream` endpoint (event filtering + proxy retry during provisioning)
 - Agent runtime: parse `task` from SQS message, auto-start after registration
-- Platform: update schemas
+- Platform: update schemas, add frontend event allow-list
+
+**Definition of done:**
+- `POST /sessions` with `prompt` creates session + task record and includes task in SQS message
+- `POST /sessions` without `prompt` behaves identically to today (no regression)
+- `POST /messages` checks agent state via `GetSessionState`, creates task, proxies `StartTask`, returns `{ taskId }`
+- `POST /cancel` auto-detects task vs session cancel via `GetSessionState`
+- `POST /approve` proxies `ApproveAction` and returns agent-runtime response
+- `GET /stream` filters events to allow-list, retries proxy resolution during provisioning, closes on timeout
+- Agent runtime auto-starts bundled task after registration + workspace download
+- Registration sets `SESSION_RUNNING` when bundled task exists, `SANDBOX_READY` otherwise
+- All existing endpoints unchanged (backward compatible)
+- Unit tests for all new endpoints (Session Service)
+- Unit tests for SQS task parsing and auto-start (agent runtime)
+- E2E test: `POST /sessions` with prompt → `/stream` SSE → events arrive → `task_completed`
+- E2E test: `POST /sessions` without prompt → `/messages` → events → `task_completed`
+- `make check` passes on session-service, agent-runtime, cowork-platform
 
 ### Stage 2: Web App
 
-- Use `POST /sessions` with prompt for first message
-- Use `POST /messages` for follow-ups
-- Use `GET /stream` for events
-- Remove JSON-RPC, task ID generation, polling
+**Work:**
+- Update API client to use `POST /sessions` with prompt and `POST /messages`
+- Replace `POST /rpc` calls with new endpoints
+- Replace `GET /events` with `GET /stream`
+- Remove JSON-RPC envelope construction and task ID generation
+- Remove polling loop for sandbox readiness (SSE handles it)
+
+**Definition of done:**
+- Web app creates sessions with `POST /sessions { prompt }` — one call
+- Follow-up messages via `POST /messages` — one call, no JSON-RPC
+- Approval via `POST /approve` — no JSON-RPC
+- Cancel via `POST /cancel` — no JSON-RPC
+- Events via `GET /stream` — filtered types only
+- No `jsonrpc`, `id`, or `taskId` construction anywhere in frontend code
+- No polling for `SANDBOX_READY` — SSE stream receives events when ready
+- All Vitest tests passing
+- Manual E2E test: create session with prompt → see LLM response → send follow-up → approve tool → cancel
 
 ### Stage 3: Desktop App
 
+**Work:**
 - Refactor IPC handlers to match simplified contract (`session:create`, `session:send-message`, `session:cancel`, `session:approve`)
-- Main process becomes a thin stdio forwarder — no task ID generation, no direct Session Service calls for session/task CRUD (agent-runtime handles that internally)
+- Main process becomes a thin stdio forwarder — no task ID generation, no direct Session Service calls for session/task CRUD
 - Event filtering in main process (stdio notifications → allowed types only)
 - Extract shared `SessionClient` TypeScript interface for React component reuse
 
+**Definition of done:**
+- Renderer calls `session:create`, `session:send-message`, `session:cancel`, `session:approve` — no agent-specific IPC channels
+- Main process forwards to agent-runtime via stdio, does not construct JSON-RPC in renderer
+- Events filtered using the same allow-list from `cowork-platform`
+- Shared `SessionClient` interface used by both web and desktop React components
+- Desktop app works end-to-end: create session → send message → approve tool → cancel
+- No regression in existing desktop functionality
+- All existing tests passing
+
 ### Stage 4: Cleanup
 
-- Mark `/rpc` and `/events` as internal
-- Remove `X-User-Id` header (OIDC auth)
+**Work:**
+- Mark `/rpc` and `/events` as internal-only in docs and API gateway config
+- Remove `X-User-Id` header — auth from OIDC token (depends on Step 14)
+
+**Definition of done:**
+- `/rpc` and `/events` not exposed to frontend clients (internal/debug only)
+- All frontend auth via OIDC token — no manual header management
+- API docs updated to reflect internal vs public endpoints
 
 ---
 
