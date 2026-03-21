@@ -23,16 +23,14 @@
 | 10 | Web App Foundation | `cowork-web-app` (new) | ✅ Done | `feature/web-execution-design` | React + Vite + Tailwind + Zustand, API/SSE clients, session + conversation views |
 | 11 | Terraform Infrastructure | `cowork-infra` | ✅ Done | `feature/web-execution-design` | Sandbox module, SG, IAM, session-service RunTask perms |
 | 12 | Docker and CI | `cowork-agent-runtime`, `cowork-infra` | ✅ Done | `feature/web-execution-design` | Dockerfile, .dockerignore, CI Docker build |
-| 13 | Warm Pool | `cowork-session-service`, `cowork-infra` | ⏳ Pending | — | Pre-provisioned idle containers |
-| 14 | Connection Draining | `cowork-session-service`, `cowork-agent-runtime` | ⏳ Pending | — | Graceful shutdown with in-flight requests |
-| 15 | Workspace Snapshot/Restore | `cowork-workspace-service` | ⏳ Pending | — | Session resume from S3 snapshot |
-| 16 | OIDC Authentication | `cowork-session-service`, `cowork-web-app` | ⏳ Pending | — | Browser auth flow |
-| 17 | EventBridge Lifecycle Manager | `cowork-session-service`, `cowork-infra` | ⏳ Pending | — | ECS task state change events |
-| 18 | Auto-Scaling Warm Pool | `cowork-session-service`, `cowork-infra` | ⏳ Pending | — | Dynamic warm pool sizing |
-| 19 | Enhanced File Management | `cowork-web-app` | ⏳ Pending | — | File tree, drag-and-drop upload |
-| 20 | Virus Scanning for Uploads | `cowork-workspace-service`, `cowork-infra` | ⏳ Pending | — | S3 event → Lambda → ClamAV |
-| 21 | GPU-Enabled Sandbox | `cowork-infra`, `cowork-session-service` | ⏳ Pending | — | GPU task definitions |
-| 22 | Shared Workspace Across Sessions | Multiple | ⏳ Pending | — | Workspace reuse for cloud sessions |
+| 13 | SQS Sandbox Dispatch | `cowork-session-service`, `cowork-agent-runtime`, `cowork-infra` | ⏳ Pending | — | Replace RunTask with SQS publish; agent runtime polls as ECS Service worker |
+| 14 | OIDC Authentication | `cowork-session-service`, `cowork-web-app` | ⏳ Pending | — | Browser auth flow, production multi-tenant |
+| 15 | Session Resume for Web | `cowork-agent-runtime`, `cowork-session-service`, `cowork-web-app` | ⏳ Pending | — | Load session history into MessageThread on resume, incremental history sync, reconnection UX |
+| 16 | Connection Draining | `cowork-session-service`, `cowork-agent-runtime` | ⏳ Pending | — | Graceful shutdown with in-flight requests |
+| 17 | EventBridge Crash Detection | `cowork-session-service`, `cowork-infra` | ⏳ Pending | — | ECS task state change events for crash detection |
+| 18 | Version-Aware Task Drain | `cowork-agent-runtime` | ⏳ Pending | — | Tasks check revision after session ends, exit if outdated — zero-interruption deploys |
+| 19 | Lifecycle Manager → EventBridge Migration | `cowork-session-service`, `cowork-infra` | ⏳ Pending | — | Replace polling-based timeout checks with EventBridge Scheduler |
+| 20 | Enhanced File Management | `cowork-web-app` | ⏳ Pending | — | File tree, drag-and-drop upload |
 
 ---
 
@@ -87,8 +85,7 @@ cd cowork-web-app && make dev             # http://localhost:5173
 - `ENVIRONMENT=dev` — table/bucket names prefixed with `dev-`
 - `SESSION_SERVICE_URL=http://localhost:8000` — agent runtime → session service
 - `WORKSPACE_SERVICE_URL=http://localhost:8002` — agent runtime → workspace service
-- `SANDBOX_LAUNCHER_TYPE=local` — session-service spawns agent-runtime as subprocess instead of ECS RunTask
-- `AGENT_RUNTIME_PATH=../cowork-agent-runtime` — path to agent-runtime repo (used by LocalSandboxLauncher)
+- `SQS_QUEUE_URL=http://localhost:4566/000000000000/dev-sandbox-requests` — agent runtime polls LocalStack SQS
 - `SANDBOX_LOCAL_MODE=true` — agent-runtime skips ECS metadata lookup, uses localhost for self-registration
 
 **docker-compose.yml** already provides LocalStack with DynamoDB + S3. The `scripts/localstack-init.sh` script creates all tables and buckets on startup. When new tables, GSIs, or buckets are added in any step, `localstack-init.sh` must be updated in the same step.
@@ -717,150 +714,76 @@ Add Dockerfile for agent-runtime and CI pipeline for sandbox builds.
 
 ---
 
-# Phase 3b — Optimization
+# Phase 3b — Optimization + Production Readiness
 
 Prerequisite: Phase 3a complete and deployed.
 
 ---
 
-## Step 13 — Warm Pool (session-service, infra)
+## Step 13 — SQS Sandbox Dispatch (session-service, agent-runtime, infra)
 
-**Repos:** `cowork-session-service`, `cowork-infra`
+**Repos:** `cowork-session-service`, `cowork-agent-runtime`, `cowork-infra`
+**Design doc:** [sqs-sandbox-dispatch.md](../design/sqs-sandbox-dispatch.md)
 
-Pre-provision idle sandbox containers so sessions start in <3s instead of 15–45s.
-
-### Work
-
-1. Create `services/warm_pool.py` in session-service:
-   - `WarmPoolManager` — background task that maintains a target number of idle containers
-   - `acquire_container() → (task_arn, sandbox_endpoint)` — claim an idle container from the pool, assign it to a session
-   - `replenish()` — if pool size < target, launch new ECS tasks (pre-registered as `POOL_IDLE`)
-   - `drain_excess()` — if pool size > target, stop excess idle containers
-2. New DynamoDB table `{env}-warm-pool` (update `scripts/localstack-init.sh` to create this table):
-   - Track idle containers: `taskArn`, `sandboxEndpoint`, `createdAt`, `status` (POOL_IDLE, POOL_CLAIMED)
-   - Conditional update on claim to prevent double-assignment
-3. Update `POST /sessions` for `cloud_sandbox`:
-   - Try `warm_pool.acquire_container()` first
-   - If pool empty, fall back to cold-start `RunTask` (same as Phase 3a)
-   - If warm container acquired, skip `SANDBOX_PROVISIONING` → go directly to `SANDBOX_READY`
-4. Warm container startup: containers start in HTTP mode, register with Session Service as `POOL_IDLE`, wait for assignment
-5. Assignment flow: Session Service updates the container's `SESSION_ID` env via RPC, container initializes session context
-6. Terraform: add warm pool config variables (target size, min, max), CloudWatch alarm for pool depletion
-
-### Tests
-
-- Unit: WarmPoolManager — replenish, acquire, drain, concurrent acquire (conditional update)
-- Unit: Session creation — warm hit (instant), warm miss (fallback to cold start)
-- Unit: Pool container lifecycle (POOL_IDLE → POOL_CLAIMED → SESSION_RUNNING)
-- Integration: Full warm pool flow with mocked ECS
-
-### Definition of Done
-
-- `make check` passes on session-service
-- Session creation with available warm container skips provisioning wait
-- Pool auto-replenishes after containers are claimed
-- Cold-start fallback works when pool is empty
-- Pool size is configurable per environment
-- **Wiring check**: Verify warm container assignment RPC matches HttpTransport's endpoint. Verify session creation flow still works end-to-end (both warm hit and cold miss paths). Verify pool containers use same task definition and security groups as cold-start containers from Step 5
-- **Self-review**: Review for race conditions in concurrent acquire (conditional update correctness), ensure pool replenishment doesn't exceed max, verify cleanup of stale pool entries (container crashed before claim)
-- **Logical bug review**: Verify conditional update on `POOL_IDLE → POOL_CLAIMED` transition uses correct condition expression (status must equal `POOL_IDLE`, not just exist). Verify pool replenishment doesn't launch tasks when pool is at max (check count before launching). Verify stale detection uses `createdAt` not `lastActivityAt` (pool containers have no user activity). Verify pool drain stops the right containers (LIFO — drain newest first to keep warmed containers)
-- **Local run**: Update `scripts/localstack-init.sh` with `dev-warm-pool` DynamoDB table creation. Test warm pool flow locally with `SANDBOX_LOCAL_MODE=true` — pool "containers" are just DynamoDB entries. Verify acquire/release/replenish operations against LocalStack
-- **Documentation**: Update CLAUDE.md, README.md, and design docs in `cowork-infra/docs/` for any changed behavior, new endpoints, new config options, or architectural changes introduced in this step
-
----
-
-## Step 14 — Connection Draining (session-service, agent-runtime)
-
-**Repos:** `cowork-session-service`, `cowork-agent-runtime`
-
-Gracefully handle sandbox shutdown while SSE connections and in-flight requests are active.
+Replace per-session `RunTask` with SQS dispatch and ECS Service worker pool. Session creation publishes to SQS (~50ms); idle worker tasks poll, pick up sessions, serve them, and terminate. Utilization-based auto-scaling ensures idle capacity is always available.
 
 ### Work
 
-1. Agent-runtime (`http_transport.py`):
-   - On shutdown signal, stop accepting new requests (return 503)
-   - Wait for in-flight RPC requests to complete (up to 30s grace)
-   - Send final SSE event `{"type": "sandbox_shutting_down"}` to all connected clients
-   - Close all SSE connections
-2. Session Service proxy:
-   - On `503` from sandbox, check if session is terminating
-   - If terminating, return structured error `sandbox_shutting_down` with session history URL
-   - If not terminating (transient error), retry once
-3. Web app:
-   - On `sandbox_shutting_down` SSE event, show "Session ending" UI
-   - Fetch final history from Workspace Service
-   - Disable input, show session summary
+1. **Infrastructure (Terraform):**
+   - Create SQS standard queue `{env}-sandbox-requests` with DLQ `{env}-sandbox-requests-dlq` (maxReceiveCount: 3)
+   - Create ECS Service `{env}-sandbox-workers` with task definition (`--transport http`, `SQS_QUEUE_URL` set)
+   - Auto-scaling: target tracking on custom `Cowork/Sandbox/TaskUtilization` metric, `scale_in_enabled = false`
+   - Min/max capacity per environment (dev: 1/5, prod: 5/configurable)
+   - IAM: `sqs:ReceiveMessage`, `sqs:DeleteMessage`, `sqs:GetQueueAttributes` on task role; `sqs:SendMessage` on Session Service role; `cloudwatch:PutMetricData` on task role
+   - Remove `ecs:RunTask` permission from Session Service role
+   - Update `scripts/localstack-init.sh` to create SQS queues
+
+2. **Agent Runtime:**
+   - `agent_host/sandbox/sqs_consumer.py` — SQS polling loop (long-poll 20s, delete on receive)
+   - `agent_host/sandbox/metrics.py` — publish `TaskUtilization` CloudWatch metric (1 = busy, 0 = idle)
+   - Modify `sandbox/startup.py` — if `SQS_QUEUE_URL` set, poll SQS for session config; otherwise read from env vars
+   - After session ends, process exits (ECS replaces the task)
+
+3. **Session Service:**
+   - `clients/sqs_publisher.py` — `publish_session_request(session_id, registration_token, urls)` with retry on throttling
+   - Simplify `SandboxService.provision_sandbox()` — concurrent limit check → SQS publish (remove RunTask call)
+   - Remove `EcsSandboxLauncher`, `LocalSandboxLauncher`, `SandboxLauncher` protocol
+   - Remove `expectedTaskArn` from registration validation and session record
+   - Remove `taskArn` from registration request schema
+
+4. **Platform Contracts:**
+   - Remove `taskArn` from registration request schema
+   - Add SQS message schema (optional, for documentation)
 
 ### Tests
 
-- Unit: HttpTransport drain sequence (stop accepting → flush → close)
-- Unit: Proxy retry vs shutdown detection
-- Unit: Web app handles shutdown event gracefully
-- Integration: Trigger shutdown during active SSE stream, verify clean handoff
+- Unit: SQS publisher — publish, retry on throttling, failure handling
+- Unit: SQS consumer — receive, delete, extract config, handle empty queue
+- Unit: CloudWatch metric publishing
+- Unit: Session creation with SQS publish (mock SQS)
+- Unit: Registration without taskArn validation
+- Integration: Full flow against LocalStack — create session → SQS message → worker picks up → registers → serves → terminates
 
 ### Definition of Done
 
-- No dropped events during graceful shutdown
-- Browser shows clean transition from live to terminated
-- In-flight requests complete before container stops
-- **Wiring check**: Verify shutdown SSE event type is handled by web app. Verify proxy correctly distinguishes 503-from-shutdown vs 503-from-transient-error. Verify workspace sync completes before container exits. Test with real proxy and real web app connected
-- **Self-review**: Review for edge cases (shutdown during file upload, shutdown during LLM streaming), ensure no goroutine/task leaks on shutdown, verify grace period is configurable
-- **Logical bug review**: Verify drain sequence order is correct: stop accepting → flush in-flight → send shutdown event → close connections (not close connections → then try to send event). Verify 503 from sandbox during shutdown includes a distinguishable error code (not generic 503). Verify web app doesn't try to auto-reconnect SSE after receiving `sandbox_shutting_down` event (infinite reconnect loop). Verify workspace sync on shutdown doesn't race with final artifact upload
-- **Local run**: Start agent-runtime in HTTP mode, connect SSE client, send SIGTERM — verify shutdown event arrives before connection closes. Verify in-flight `/rpc` request completes before shutdown
-- **Documentation**: Update CLAUDE.md, README.md, and design docs in `cowork-infra/docs/` for any changed behavior, new endpoints, new config options, or architectural changes introduced in this step
+- `make check` passes on session-service and agent-runtime
+- Session creation publishes to SQS in <100ms
+- Agent runtime in sandbox mode with `SQS_QUEUE_URL` polls and picks up sessions
+- Task terminates cleanly after session ends (workspace synced to S3)
+- ECS replaces terminated task to maintain desired count
+- Auto-scaling increases capacity when utilization exceeds target
+- `EcsSandboxLauncher`, `LocalSandboxLauncher` removed
+- `expectedTaskArn` field and validation removed
+- Local dev works end-to-end with LocalStack SQS
+- **Wiring check**: Verify SQS message schema matches what the consumer expects. Verify registration endpoint accepts requests without `taskArn`. Verify auto-scaling policy targets the correct custom metric namespace and dimensions
+- **Self-review**: Verify SQS message deletion happens before registration (not after — prevents reprocessing on crash). Verify CloudWatch metric is published on both session start and process exit. Verify graceful shutdown (SIGTERM) completes workspace sync within 120s
+- **Logical bug review**: Verify duplicate SQS delivery is handled (conditional update on registration prevents double-serve). Verify SQS long-poll timeout (20s) doesn't conflict with container health check interval. Verify process exit code is 0 on normal termination (ECS doesn't treat it as failure)
+- **Local run**: Verify `make run-sandbox` with `SQS_QUEUE_URL` pointing to LocalStack works end-to-end. Verify without `SQS_QUEUE_URL` the current env-var-based flow still works (backwards compatible)
+- **Documentation**: Update CLAUDE.md, README.md in affected repos. Design docs already updated (web-execution.md, architecture.md, session-service.md, domain-model.md, local-agent-host.md)
 
 ---
 
-## Step 15 — Workspace Snapshot/Restore (workspace-service, session-service, web-app)
-
-**Repos:** `cowork-workspace-service`, `cowork-session-service`, `cowork-web-app`
-
-Allow users to resume work from a terminated sandbox by restoring the workspace state into a new container.
-
-### Work
-
-1. Workspace Service:
-   - `POST /workspaces/{id}/snapshot` — create a point-in-time snapshot of all workspace files in S3 (copy to `{workspaceId}/snapshots/{snapshotId}/`)
-   - `GET /workspaces/{id}/snapshots` — list available snapshots
-   - Auto-snapshot on sandbox termination (triggered by Session Service)
-2. Session Service:
-   - `POST /sessions/{sessionId}/restore` — create a new session from a terminated one:
-     - Create new `cloud_sandbox` session linked to same workspace
-     - Provision sandbox, restore workspace files from latest snapshot
-     - Return new session ID
-3. Web app:
-   - On terminated session view, show "Resume" button
-   - Resume triggers restore flow, shows provisioning state, transitions to new session
-   - Conversation history loaded from Workspace Service (previous session's history)
-
-### Tests
-
-- Unit: Snapshot creation and listing
-- Unit: Restore flow — new session creation, workspace file restore
-- Unit: Web app resume UX (terminated → provisioning → running)
-- Integration: Full terminate → snapshot → restore → verify files present
-
-### Definition of Done
-
-- Terminated sessions show "Resume" option in web app
-- Resume creates new sandbox with all previous workspace files restored
-- Conversation history from previous session is visible
-- Snapshot cleanup (auto-delete after 30 days)
-- **Wiring check**: Verify snapshot S3 keys don't collide with workspace file keys or artifact keys. Verify restore creates workspace sync that matches Step 7's startup flow. Verify web app's resume flow correctly polls for new session provisioning. Verify conversation history loads from Workspace Service API matching Step 4's endpoints
-- **Self-review**: Review for missing error handling on large workspace snapshots (timeout, partial copy), ensure snapshot cleanup doesn't delete active snapshots, verify restore works when original workspace has been deleted
-- **Logical bug review**: Verify snapshot S3 copy handles large files (multipart copy for >5GB). Verify snapshot listing is sorted by creation time (newest first). Verify restore creates a new session linked to same workspace (not a new workspace). Verify conversation history is fetched from workspace-service using the OLD session ID (not new one). Verify snapshot auto-delete TTL doesn't delete snapshots for active sessions
-- **Local run**: Test snapshot/restore flow against LocalStack: create workspace → upload files → create snapshot → list snapshots → restore → verify files present in new workspace. All via `curl` against local services
-- **Documentation**: Update CLAUDE.md, README.md, and design docs in `cowork-infra/docs/` for any changed behavior, new endpoints, new config options, or architectural changes introduced in this step
-
----
-
-# Phase 3c — Scale
-
-Prerequisite: Phase 3b complete and deployed.
-
----
-
-## Step 16 — OIDC Authentication (session-service, web-app)
+## Step 14 — OIDC Authentication (session-service, web-app)
 
 **Repos:** `cowork-session-service`, `cowork-web-app`
 
@@ -911,7 +834,114 @@ Replace simple auth with OIDC for production multi-tenant use.
 
 ---
 
-## Step 17 — EventBridge Lifecycle Manager (session-service, infra)
+## Step 15 — Session Resume for Web (agent-runtime, session-service, web-app)
+
+**Repos:** `cowork-agent-runtime`, `cowork-session-service`, `cowork-web-app`
+**Depends on:** Step 13 (SQS Sandbox Dispatch)
+
+Enable interrupted web sessions to resume on a new worker task. The infrastructure already exists — `session_history` artifact has the full message thread, workspace files are in S3, policy is in Session Service. This step wires them together for seamless resume.
+
+### Problem
+
+When a web session is interrupted (SIGTERM during deploy, crash, idle timeout), the container is destroyed. The user returns and wants to continue. Today, the session is stuck — no container to serve it. With SQS dispatch (Step 13), we can assign a new task, but that task starts with an empty `MessageThread`. It needs the conversation history to give the LLM context.
+
+### Work
+
+1. **Agent Runtime — load history on resume:**
+   - At registration, Session Service returns a flag indicating whether this is a new or resumed session
+   - If resumed: fetch `session_history` artifact from Workspace Service, deserialize `messages` array into `MessageThread`
+   - Agent loop starts with full conversation context — LLM sees the entire prior conversation
+
+2. **Agent Runtime — incremental history sync:**
+   - Sync `session_history` to Workspace Service every N steps (same interval as workspace file sync, default 10)
+   - Currently only synced after task completion — this closes the mid-task gap so resume loses at most one step, not one full task
+
+3. **Session Service — resume publishes to SQS:**
+   - `POST /sessions/{id}/resume` already exists (re-validates policy, extends expiry, transitions status)
+   - Add: publish SQS message so a new worker task picks up the session
+   - Add: transition session back to `SANDBOX_PROVISIONING` before publishing (a new task needs to register)
+
+4. **Web App — reconnection UX:**
+   - Detect SSE disconnect (any reason: deploy, crash, network)
+   - Show "Reconnecting..." indicator
+   - Call `POST /sessions/{id}/resume`
+   - Poll for `SANDBOX_READY`, reconnect SSE stream
+   - Conversation history loads from Workspace Service while waiting (so user sees their prior messages immediately)
+
+### Tests
+
+- Unit: `MessageThread` initialization from `session_history` artifact
+- Unit: Incremental history sync (verify history uploaded every N steps)
+- Unit: Resume endpoint publishes SQS message and transitions status
+- Unit: Web app reconnection flow (SSE drop → resume → reconnect)
+- Integration: Full flow — create session → start task → kill container → resume → verify conversation continues with full context
+
+### Definition of Done
+
+- Interrupted web sessions can be resumed via `POST /sessions/{id}/resume`
+- New worker task loads full conversation history from Workspace Service
+- LLM has complete context on resume — user can say "continue" and the agent picks up naturally
+- History synced every N steps (mid-task gap is one step, not one task)
+- Web app automatically attempts reconnection on SSE disconnect
+- Desktop sessions unaffected (no regression)
+- `make check` passes on agent-runtime, session-service, web-app
+- **Wiring check**: Verify `session_history` artifact format matches what `MessageThread` expects. Verify resume SQS message has same schema as creation. Verify web app reconnection uses `Last-Event-ID` for events that happened after resume
+- **Self-review**: Verify history deserialization handles edge cases (empty history, corrupted artifact, missing messages). Verify incremental sync doesn't overwrite a more recent snapshot (use `snapshotAfterTaskId` ordering)
+- **Logical bug review**: Verify resumed session gets a fresh `registrationToken` (old one was consumed). Verify token budget carries over from original session (don't reset to zero). Verify the web app doesn't show duplicate messages (history from Workspace Service + live events from new SSE stream)
+- **Local run**: Test full resume flow locally with LocalStack — create session, start task, kill agent-runtime process, call resume, verify new process picks up with history
+- **Documentation**: Update CLAUDE.md, README.md, and design docs for changed behavior
+
+---
+
+# Phase 3c — Operational Excellence
+
+Prerequisite: Phase 3b complete and deployed.
+
+---
+
+## Step 16 — Connection Draining (session-service, agent-runtime)
+
+**Repos:** `cowork-session-service`, `cowork-agent-runtime`
+
+Gracefully handle sandbox shutdown while SSE connections and in-flight requests are active.
+
+### Work
+
+1. Agent-runtime (`http_transport.py`):
+   - On shutdown signal, stop accepting new requests (return 503)
+   - Wait for in-flight RPC requests to complete (up to 30s grace)
+   - Send final SSE event `{"type": "sandbox_shutting_down"}` to all connected clients
+   - Close all SSE connections
+2. Session Service proxy:
+   - On `503` from sandbox, check if session is terminating
+   - If terminating, return structured error `sandbox_shutting_down` with session history URL
+   - If not terminating (transient error), retry once
+3. Web app:
+   - On `sandbox_shutting_down` SSE event, show "Session ending" UI
+   - Fetch final history from Workspace Service
+   - Disable input, show session summary
+
+### Tests
+
+- Unit: HttpTransport drain sequence (stop accepting → flush → close)
+- Unit: Proxy retry vs shutdown detection
+- Unit: Web app handles shutdown event gracefully
+- Integration: Trigger shutdown during active SSE stream, verify clean handoff
+
+### Definition of Done
+
+- No dropped events during graceful shutdown
+- Browser shows clean transition from live to terminated
+- In-flight requests complete before container stops
+- **Wiring check**: Verify shutdown SSE event type is handled by web app. Verify proxy correctly distinguishes 503-from-shutdown vs 503-from-transient-error. Verify workspace sync completes before container exits. Test with real proxy and real web app connected
+- **Self-review**: Review for edge cases (shutdown during file upload, shutdown during LLM streaming), ensure no goroutine/task leaks on shutdown, verify grace period is configurable
+- **Logical bug review**: Verify drain sequence order is correct: stop accepting → flush in-flight → send shutdown event → close connections (not close connections → then try to send event). Verify 503 from sandbox during shutdown includes a distinguishable error code (not generic 503). Verify web app doesn't try to auto-reconnect SSE after receiving `sandbox_shutting_down` event (infinite reconnect loop). Verify workspace sync on shutdown doesn't race with final artifact upload
+- **Local run**: Start agent-runtime in HTTP mode, connect SSE client, send SIGTERM — verify shutdown event arrives before connection closes. Verify in-flight `/rpc` request completes before shutdown
+- **Documentation**: Update CLAUDE.md, README.md, and design docs in `cowork-infra/docs/` for any changed behavior, new endpoints, new config options, or architectural changes introduced in this step
+
+---
+
+## Step 17 — EventBridge Crash Detection (session-service, infra)
 
 **Repos:** `cowork-session-service`, `cowork-infra`
 
@@ -966,44 +996,64 @@ Move idle timeout and provisioning timeout checks from in-process background tas
 
 ---
 
-## Step 18 — Auto-Scaling Warm Pool (session-service, infra)
+## Step 18 — Version-Aware Task Drain (agent-runtime)
 
-**Repos:** `cowork-session-service`, `cowork-infra`
+**Repo:** `cowork-agent-runtime`
+**Depends on:** Step 13 (SQS Sandbox Dispatch)
 
-Scale warm pool size based on usage patterns instead of fixed target.
+Enable zero-interruption deployments. After a session ends, the task checks its ECS task definition revision against the service's current revision. If outdated, it exits instead of polling for another session. ECS replaces it with a task running the new version.
 
 ### Work
 
-1. Metrics-based scaling:
-   - Track `sandbox.provision_requests` (counter) and `warm_pool.hit_rate` (percentage)
-   - CloudWatch custom metrics published by Session Service
-2. Scaling policy:
-   - If hit rate < 80% for 15 minutes → shrink pool (reduce target by 20%)
-   - If hit rate < 50% → shrink aggressively (reduce to min)
-   - If cold starts > 5 in 10 minutes → expand pool (increase target by 50%)
-   - Min pool size: 0 (off-hours), Max pool size: configurable per environment
-3. Time-based scaling:
-   - Schedule-based overrides via EventBridge (e.g. scale up at 8am, scale down at 8pm)
-   - Weekend/holiday schedules
-4. Terraform: CloudWatch alarms, EventBridge schedules, scaling config variables
+1. On startup, read own task definition revision from ECS metadata endpoint
+2. After session ends (before process exit), query ECS Service for current task definition revision
+3. If revisions match: this is a no-op (task exits anyway since we terminate after each session)
+4. If revisions differ: log "Newer revision available, exiting for replacement" — same exit behavior
+5. **Key insight**: With the terminate-after-session model from Step 13, version drain happens naturally. This step adds explicit logging and the foundation for a future reuse model where tasks could serve multiple sessions
 
 ### Tests
 
-- Unit: Scaling policy decisions (hit rate → target size)
-- Unit: Schedule-based overrides
-- Integration: Publish metrics → verify scaling action taken
+- Unit: Revision comparison logic (match, mismatch, metadata unavailable)
+- Unit: Graceful handling when ECS metadata is unavailable (local dev)
 
 ### Definition of Done
 
-- Warm pool scales up on demand spikes (cold starts detected)
-- Warm pool scales down during low usage (cost savings)
-- Time-based schedules work for predictable patterns
-- CloudWatch dashboard shows pool metrics
-- **Wiring check**: Verify custom metrics published by session-service match CloudWatch alarm metric names exactly. Verify scaling actions call the same WarmPoolManager API from Step 13. Verify schedule-based scaling doesn't conflict with metrics-based scaling (priority rules)
-- **Self-review**: Review for missing bounds checks (pool size never goes negative, never exceeds max), ensure scaling decisions are logged for debugging, verify dashboard queries match published metric dimensions
-- **Logical bug review**: Verify scaling down doesn't drain containers that are in the process of being claimed (race condition). Verify hit rate calculation handles zero-request periods correctly (0/0 is not 0% — it's no data, don't scale down). Verify time-based schedule uses the correct timezone. Verify min pool size of 0 actually stops all containers (not leaves 1 running)
-- **Local run**: Scaling logic is testable locally — mock CloudWatch metrics, verify scaling decisions. No actual CloudWatch or EventBridge needed for local testing
-- **Documentation**: Update CLAUDE.md, README.md, and design docs in `cowork-infra/docs/` for any changed behavior, new endpoints, new config options, or architectural changes introduced in this step
+- Task logs its revision at startup and on exit
+- Revision mismatch is logged clearly for deploy monitoring
+- No behavioral change in the terminate-after-session model — this is observability + future foundation
+- `make check` passes on agent-runtime
+- **Documentation**: Update CLAUDE.md and design docs for new behavior
+
+---
+
+## Step 19 — Lifecycle Manager → EventBridge Migration (session-service, infra)
+
+**Repos:** `cowork-session-service`, `cowork-infra`
+
+Replace the polling-based `SandboxLifecycleManager` (background task scanning all active sessions every 5 minutes) with precise, event-driven timeout enforcement using EventBridge Scheduler.
+
+### Work
+
+1. **Provisioning timeout**: EventBridge Scheduler creates a one-shot event 180s after session creation. Lambda or Session Service endpoint checks if session is still in `SANDBOX_PROVISIONING` — if so, marks `SESSION_FAILED`
+2. **Idle timeout**: Agent runtime resets a `timeout_at` DynamoDB attribute on each user interaction. EventBridge Scheduler fires at `timeout_at` time. If session is idle (no running task), terminate
+3. **Max duration**: EventBridge Scheduler creates a one-shot event at `createdAt + maxDuration`. Unconditional termination
+4. Remove `SandboxLifecycleManager` background task from Session Service
+5. Terraform: EventBridge Scheduler rules, IAM roles, Lambda functions (if using Lambda targets)
+
+### Tests
+
+- Unit: EventBridge event handlers — provisioning timeout, idle timeout, max duration
+- Unit: `timeout_at` extension on user activity
+- Integration: Session creation triggers scheduled event, verify timeout fires correctly
+
+### Definition of Done
+
+- `SandboxLifecycleManager` background task removed from Session Service
+- All three timeouts enforced via EventBridge Scheduler
+- Timeout precision improved (exact time vs. up to 5-minute polling window)
+- No DynamoDB scan of all active sessions — each session has its own scheduled event
+- `make check` passes on session-service
+- **Documentation**: Update CLAUDE.md, README.md, and design docs for changed behavior
 
 ---
 
@@ -1013,7 +1063,7 @@ Prerequisite: Phase 3c complete and deployed.
 
 ---
 
-## Step 19 — Enhanced File Management (web-app)
+## Step 20 — Enhanced File Management (web-app)
 
 **Repo:** `cowork-web-app`
 **Prerequisite:** [Workspace File Sync](../design/workspace-file-sync.md) (unified upload with S3 persistence + sandbox sync)
@@ -1051,140 +1101,6 @@ Improve the file browser from basic list to a full workspace explorer. Basic upl
 
 ---
 
-## Step 20 — Virus Scanning for Uploads (workspace-service, infra)
-
-**Repos:** `cowork-workspace-service`, `cowork-infra`
-
-Scan uploaded files for malware before they enter the sandbox workspace.
-
-### Work
-
-1. Integrate ClamAV (or AWS-native solution like S3 Object Lambda + ClamAV layer):
-   - S3 event notification on upload to `workspace-files/` prefix
-   - Lambda function scans the file with ClamAV
-   - Tag clean files as `scan-status: clean`, infected files as `scan-status: infected`
-2. Workspace Service:
-   - After upload, check scan status before making file available to sandbox
-   - If infected, delete file and return `400` with `file_infected` error
-   - If scan pending (async), return `202 Accepted` with scan status polling endpoint
-3. Terraform:
-   - Lambda function with ClamAV layer
-   - S3 event notification configuration
-   - IAM roles for Lambda → S3 access
-
-### Tests
-
-- Unit: Scan result handling (clean, infected, pending)
-- Integration: Upload file → verify scan triggered → verify clean file accessible
-
-### Definition of Done
-
-- Uploaded files are scanned before sandbox can access them
-- Infected files are rejected with clear error message
-- Clean files are available within seconds of upload
-- Scan infrastructure deployed via Terraform
-- **Wiring check**: Verify S3 event notification triggers on correct prefix (`workspace-files/`). Verify Lambda scan result tags are read by workspace-service before serving files. Verify scan status polling endpoint is called by web app upload flow. Verify infected file deletion uses same S3 client patterns as workspace-service
-- **Self-review**: Review for missing edge cases (scan timeout, Lambda cold start delay, file uploaded faster than scan completes), ensure scan doesn't block small file uploads excessively, verify Lambda has access to latest ClamAV definitions
-- **Logical bug review**: Verify scan status check doesn't have TOCTOU race (file tagged clean, then replaced before sandbox reads it). Verify `202 Accepted` polling endpoint returns final status (not stuck in `pending` forever — add scan timeout). Verify infected file is deleted from S3 (not just tagged — sandbox must not be able to read it). Verify scan applies to all upload paths (direct workspace upload, workspace sync from agent)
-- **Local run**: For local dev, virus scanning is disabled by default (`VIRUS_SCAN_ENABLED=false`). When enabled locally, use ClamAV Docker container instead of Lambda. Document in README
-- **Documentation**: Update CLAUDE.md, README.md, and design docs in `cowork-infra/docs/` for any changed behavior, new endpoints, new config options, or architectural changes introduced in this step
-
----
-
-# Phase 3e — Advanced
-
-Prerequisite: Phase 3d complete and deployed.
-
----
-
-## Step 21 — GPU-Enabled Sandbox (infra, session-service)
-
-**Repos:** `cowork-infra`, `cowork-session-service`
-
-Support GPU instances for ML workloads (model training, data processing).
-
-### Work
-
-1. Terraform:
-   - New ECS task definition with GPU resource requirements
-   - GPU-capable instance type in ECS capacity provider (p3/g4/g5 instances)
-   - Separate warm pool for GPU instances (expensive — small pool or on-demand only)
-2. Session Service:
-   - Accept `resourceProfile` in session creation: `standard` (default) or `gpu`
-   - Select task definition and capacity provider based on profile
-   - GPU session limits: lower concurrent limit (e.g. 1 per user)
-3. Agent runtime:
-   - No changes needed — same codebase, GPU is available as system resource
-   - `ExecuteCode` tool can access GPU via CUDA (if available in container)
-4. Policy:
-   - New capability `Compute.GPU` — controlled by policy bundle
-   - GPU sessions may have different cost/budget limits
-
-### Tests
-
-- Unit: Resource profile selection (standard vs GPU task definitions)
-- Unit: GPU session limits (lower concurrent cap)
-- Integration: Create GPU session, verify GPU is accessible in container
-
-### Definition of Done
-
-- GPU sandbox can be requested via session creation
-- GPU is accessible inside the container (CUDA, PyTorch, etc.)
-- Separate concurrency limits for GPU sessions
-- Cost tracking per resource profile
-- **Wiring check**: Verify GPU task definition is selected based on `resourceProfile` in session creation request. Verify GPU capacity provider has instances available. Verify policy bundle includes `Compute.GPU` capability for GPU sessions. Verify concurrent limit check distinguishes standard vs GPU sessions
-- **Self-review**: Review for missing fallback when GPU instances are unavailable (queue? reject?), ensure GPU container image includes CUDA drivers, verify cost tracking metrics are published correctly
-- **Logical bug review**: Verify `resourceProfile` is validated against allowed values (not arbitrary string). Verify GPU concurrent limit check is separate from standard limit (user can have 3 standard + 1 GPU, not 3 total). Verify GPU task definition uses correct capacity provider (not default Fargate — needs GPU instances). Verify session response includes `resourceProfile` so web app can show GPU indicator
-- **Local run**: GPU is not available locally. For local dev, `resourceProfile=gpu` creates a standard session with a flag — test the selection logic, not the GPU hardware. Document in README
-- **Documentation**: Update CLAUDE.md, README.md, and design docs in `cowork-infra/docs/` for any changed behavior, new endpoints, new config options, or architectural changes introduced in this step
-
----
-
-## Step 22 — Shared Workspace Across Sessions (workspace-service, session-service, web-app)
-
-**Repos:** `cowork-workspace-service`, `cowork-session-service`, `cowork-web-app`
-
-Allow multiple sessions to share a workspace — enabling iterative work across sessions and team collaboration.
-
-### Work
-
-1. Workspace Service:
-   - Shared workspace type: multiple sessions can reference the same `workspaceId`
-   - Workspace file locking (advisory): prevent concurrent writes to same file from different sessions
-   - Workspace access control: list of authorized `userId`s per workspace
-2. Session Service:
-   - `POST /sessions` accepts existing `workspaceId` for `cloud` sessions (reuse workspace)
-   - Validate user has access to the workspace
-   - Multiple active sessions on same workspace: each gets its own sandbox, but S3 workspace files are shared
-3. Sync conflict handling:
-   - Last-write-wins for file sync (simple, same as git)
-   - Conflict detection: if file changed in S3 since last sync, warn user before overwriting
-4. Web app:
-   - Workspace view: list sessions associated with a workspace
-   - Share workspace: invite other users
-   - Conflict resolution UI
-
-### Tests
-
-- Unit: Workspace access control (authorized user, unauthorized user)
-- Unit: File locking (advisory lock acquire, release, timeout)
-- Unit: Conflict detection (file changed since last sync)
-- Integration: Two sessions on same workspace, verify file changes are visible
-
-### Definition of Done
-
-- Multiple sessions can use the same workspace
-- Workspace files are shared via S3
-- File conflicts are detected and surfaced to user
-- Workspace access control enforced
-- **Wiring check**: Verify workspace access control is checked on session creation (session-service), file operations (workspace-service), and proxy requests (session-service). Verify workspace sync in agent-runtime handles concurrent writes from other sessions. Verify web app workspace view correctly fetches sessions from session-service and files from workspace-service
-- **Self-review**: Review for missing edge cases (session reads file while another session is writing), ensure advisory locks have TTL to prevent deadlocks, verify access control can't be bypassed via direct workspace-service calls, check that conflict resolution UI handles all conflict types
-- **Logical bug review**: Verify workspace access control is checked on every file operation (not just workspace creation). Verify advisory lock TTL is shorter than session idle timeout (lock shouldn't outlive session). Verify conflict detection compares S3 ETag (not timestamp — clock skew). Verify workspace deletion is blocked when active sessions exist (don't delete workspace under a running session). Verify shared workspace file sync handles concurrent modifications (last-write-wins must be consistent, not data-corrupting)
-- **Local run**: Test shared workspace flow locally with two agent-runtime instances on different ports, both pointing at same workspace. Upload file from one, verify visible from other. Document multi-instance local testing in README
-- **Documentation**: Update CLAUDE.md, README.md, and design docs in `cowork-infra/docs/` for any changed behavior, new endpoints, new config options, or architectural changes introduced in this step
-
----
-
 # Known Issues
 
 Issues discovered during implementation that need to be addressed:
@@ -1208,21 +1124,17 @@ Phase 3a (MVP):
   Step 9 (E2E Integration) ──→ Step 10 (Web App) ──→ Step 12 (Docker/CI)
   Step 11 (Terraform) ──────────────────────────────→ Step 12
 
-Phase 3b (Optimization) — depends on Phase 3a:
-  Step 13 (Warm Pool)
-  Step 14 (Connection Draining)
-  Step 15 (Snapshot/Restore)
+Phase 3b (Optimization + Production Readiness) — depends on Phase 3a:
+  Step 13 (SQS Sandbox Dispatch) ─────────────────────────┐
+  Step 14 (OIDC Auth) — independent, production blocker    │
+  Step 15 (Session Resume) — depends on Step 13            │
+  Step 16 (Connection Draining) — depends on Step 13       │
 
-Phase 3c (Scale) — depends on Phase 3b:
-  Step 16 (OIDC Auth)
-  Step 17 (EventBridge Lifecycle)
-  Step 18 (Auto-Scaling Warm Pool) — depends on Step 13
+Phase 3c (Operational Excellence) — depends on Phase 3b:
+  Step 17 (EventBridge Crash Detection) — depends on Step 13
+  Step 18 (Version-Aware Task Drain) — depends on Step 13
+  Step 19 (Lifecycle → EventBridge Migration) — depends on Step 17
 
-Phase 3d (Polish) — depends on Phase 3c:
-  Step 19 (Enhanced File Management)
-  Step 20 (Virus Scanning)
-
-Phase 3e (Advanced) — depends on Phase 3d:
-  Step 21 (GPU Sandbox)
-  Step 22 (Shared Workspace)
+Phase 3d (Polish) — independent:
+  Step 20 (Enhanced File Management)
 ```

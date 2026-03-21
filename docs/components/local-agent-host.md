@@ -1578,9 +1578,11 @@ Passed at runtime via ECS task definition environment or secrets:
 
 ### ECS integration
 
-- The Session Service launches sandbox containers via `ecs:RunTask`, passing `SESSION_ID` and `REGISTRATION_TOKEN` as environment overrides
-- The ECS task definition is provisioned by the `sandbox` Terraform module (`cowork-infra/iac/modules/sandbox/`), which defines the task definition, security group, and IAM roles
-- The container reads its IP and task ARN from the [ECS task metadata endpoint](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/task-metadata-endpoint-v4.html) during self-registration (see `sandbox/startup.py`)
+- Agent runtime runs as an ECS Service worker pool. Session Service publishes to SQS; idle worker tasks poll for sessions. See [sqs-sandbox-dispatch.md](../design/sqs-sandbox-dispatch.md) for full design
+- The ECS Service and task definition are provisioned by the `sandbox` Terraform module (`cowork-infra/iac/modules/sandbox/`), which defines the service, SQS queue, task definition, security group, and IAM roles
+- When `SQS_QUEUE_URL` is set, sandbox mode polls SQS for session config (`sessionId`, `registrationToken`, service URLs) instead of reading from env vars
+- The container reads its IP from the [ECS task metadata endpoint](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/task-metadata-endpoint-v4.html) during self-registration (see `sandbox/startup.py`)
+- Each task serves one session, then terminates. ECS replaces it with a fresh container
 - For local development, set `SANDBOX_LOCAL_MODE=true` to skip ECS metadata lookup and use `localhost`
 
 ---

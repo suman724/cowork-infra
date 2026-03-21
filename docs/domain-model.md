@@ -79,8 +79,7 @@ The governance container for one continuous working period. From the user's pers
 | `createdAt` | datetime | Session creation time |
 | `expiresAt` | datetime | Policy bundle expiry |
 | `sandboxEndpoint` | string (optional) | Internal endpoint of sandbox container — `cloud_sandbox` only |
-| `taskArn` | string (optional) | ECS task ARN reported by container during registration — `cloud_sandbox` only |
-| `expectedTaskArn` | string (optional) | Expected ECS task ARN stored at session creation for validation — `cloud_sandbox` only |
+| `registrationToken` | string (optional) | Single-use UUID for sandbox self-registration validation — `cloud_sandbox` only |
 | `networkAccess` | enum (optional) | `enabled` or `disabled` — sandbox network access policy — `cloud_sandbox` only |
 | `lastActivityAt` | datetime (optional) | Last interaction time, used for idle timeout — `cloud_sandbox` only |
 
