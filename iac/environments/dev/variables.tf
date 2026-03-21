@@ -105,6 +105,24 @@ variable "sandbox_memory" {
   default     = 1024
 }
 
+variable "sandbox_min_capacity" {
+  description = "Minimum sandbox worker tasks (always running)"
+  type        = number
+  default     = 1
+}
+
+variable "sandbox_max_capacity" {
+  description = "Maximum sandbox worker tasks"
+  type        = number
+  default     = 5
+}
+
+variable "sandbox_utilization_target" {
+  description = "Target TaskUtilization % for auto-scaling (0-100)"
+  type        = number
+  default     = 70
+}
+
 variable "llm_gateway_endpoint" {
   description = "LLM Gateway endpoint URL (passed to sandbox containers)"
   type        = string

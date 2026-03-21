@@ -1,17 +1,44 @@
 ###############################################################################
-# Sandbox ECS Task Module
+# Sandbox ECS Service Module (SQS Dispatch)
 #
-# Creates on-demand Fargate task resources for agent-runtime sandboxes.
-# Unlike ecs-service, there is NO ECS service or ALB — containers are
-# launched per-session via RunTask and accessed directly by Session Service.
+# Agent-runtime runs as an ECS Service worker pool. Session Service publishes
+# to an SQS queue; idle worker tasks poll the queue, serve sessions, then
+# terminate. ECS replaces terminated tasks to maintain desired count.
+#
+# Auto-scaling: target tracking on custom TaskUtilization metric with
+# scale_in_enabled = false. See docs/design/sqs-sandbox-dispatch.md.
 #
 # Resources:
-# - ECS task definition (Fargate, awsvpc networking)
+# - SQS queue + dead-letter queue for session dispatch
+# - ECS Service (Fargate, awsvpc networking)
+# - ECS task definition
+# - Application Auto Scaling (target tracking, scale-out only)
 # - Security group (ingress only from Session Service SG on port 8080)
-# - IAM execution role (ECR pull, CloudWatch Logs)
-# - IAM task role (scoped S3, CloudWatch Logs, Session Service registration)
+# - IAM execution role (ECR pull, CloudWatch Logs, Secrets Manager)
+# - IAM task role (S3, SQS, CloudWatch metrics)
 # - CloudWatch log group
 ###############################################################################
+
+# --------------------------------------------------------------------------- #
+# SQS Queue — Session Dispatch
+# --------------------------------------------------------------------------- #
+
+resource "aws_sqs_queue" "sandbox_dlq" {
+  name                      = "${var.name_prefix}-sandbox-requests-dlq"
+  message_retention_seconds = 1209600 # 14 days
+}
+
+resource "aws_sqs_queue" "sandbox_requests" {
+  name                       = "${var.name_prefix}-sandbox-requests"
+  visibility_timeout_seconds = 60
+  message_retention_seconds  = 86400 # 1 day
+  receive_wait_time_seconds  = 20    # Long polling
+
+  redrive_policy = jsonencode({
+    deadLetterTargetArn = aws_sqs_queue.sandbox_dlq.arn
+    maxReceiveCount     = 3
+  })
+}
 
 # --------------------------------------------------------------------------- #
 # CloudWatch Log Group
@@ -50,7 +77,7 @@ resource "aws_security_group" "sandbox" {
 }
 
 # --------------------------------------------------------------------------- #
-# IAM — Execution Role (pulls images, writes logs)
+# IAM — Execution Role (pulls images, writes logs, reads secrets)
 # --------------------------------------------------------------------------- #
 
 resource "aws_iam_role" "execution" {
@@ -133,6 +160,27 @@ resource "aws_iam_role_policy" "task" {
         ]
         Resource = var.artifacts_bucket_arn
       },
+      # SQS: poll and delete messages from the sandbox requests queue
+      {
+        Effect = "Allow"
+        Action = [
+          "sqs:ReceiveMessage",
+          "sqs:DeleteMessage",
+          "sqs:GetQueueAttributes",
+        ]
+        Resource = aws_sqs_queue.sandbox_requests.arn
+      },
+      # CloudWatch: publish TaskUtilization metric for auto-scaling
+      {
+        Effect   = "Allow"
+        Action   = ["cloudwatch:PutMetricData"]
+        Resource = "*"
+        Condition = {
+          StringEquals = {
+            "cloudwatch:namespace" = "Cowork/Sandbox"
+          }
+        }
+      },
       # CloudWatch Logs: write to sandbox log group only
       {
         Effect = "Allow"
@@ -169,12 +217,18 @@ resource "aws_ecs_task_definition" "sandbox" {
       protocol      = "tcp"
     }]
 
-    # Static environment variables — session-specific vars (SESSION_ID,
-    # REGISTRATION_TOKEN, etc.) are passed as overrides in RunTask
-    environment = [for k, v in var.environment_variables : {
-      name  = k
-      value = v
-    }]
+    # Environment variables — includes SQS_QUEUE_URL for worker mode
+    environment = concat(
+      [for k, v in var.environment_variables : {
+        name  = k
+        value = v
+      }],
+      [
+        { name = "SQS_QUEUE_URL", value = aws_sqs_queue.sandbox_requests.url },
+        { name = "SANDBOX_SERVICE_NAME", value = "${var.name_prefix}-sandbox-workers" },
+        { name = "ENVIRONMENT", value = var.environment },
+      ]
+    )
 
     # Secrets from AWS Secrets Manager
     secrets = [for k, v in var.secrets : {
@@ -196,7 +250,98 @@ resource "aws_ecs_task_definition" "sandbox" {
       interval    = 30
       timeout     = 5
       retries     = 3
-      startPeriod = 30
+      startPeriod = 60
     }
+
+    # Stop timeout — give sandbox time to sync workspace on SIGTERM
+    stopTimeout = 120
   }])
+}
+
+# --------------------------------------------------------------------------- #
+# ECS Service — Sandbox Workers
+# --------------------------------------------------------------------------- #
+
+resource "aws_ecs_service" "sandbox_workers" {
+  name            = "${var.name_prefix}-sandbox-workers"
+  cluster         = var.ecs_cluster_id
+  task_definition = aws_ecs_task_definition.sandbox.arn
+  desired_count   = var.min_capacity
+  launch_type     = "FARGATE"
+
+  network_configuration {
+    subnets         = var.private_subnet_ids
+    security_groups = [aws_security_group.sandbox.id]
+  }
+
+  # Don't force new deployment on every apply — let auto-scaling manage count
+  lifecycle {
+    ignore_changes = [desired_count]
+  }
+}
+
+# --------------------------------------------------------------------------- #
+# Application Auto Scaling — Scale-Out Only (TaskUtilization)
+# --------------------------------------------------------------------------- #
+
+resource "aws_appautoscaling_target" "sandbox" {
+  max_capacity       = var.max_capacity
+  min_capacity       = var.min_capacity
+  resource_id        = "service/${var.ecs_cluster_name}/${aws_ecs_service.sandbox_workers.name}"
+  scalable_dimension = "ecs:service:DesiredCount"
+  service_namespace  = "ecs"
+}
+
+resource "aws_appautoscaling_policy" "sandbox_utilization" {
+  name               = "${var.name_prefix}-sandbox-utilization"
+  policy_type        = "TargetTrackingScaling"
+  resource_id        = aws_appautoscaling_target.sandbox.resource_id
+  scalable_dimension = aws_appautoscaling_target.sandbox.scalable_dimension
+  service_namespace  = aws_appautoscaling_target.sandbox.service_namespace
+
+  target_tracking_scaling_policy_configuration {
+    target_value       = var.utilization_target
+    scale_in_cooldown  = 300
+    scale_out_cooldown = 60
+
+    # Scale-out only — tasks self-terminate, ECS replaces to maintain desired
+    disable_scale_in = true
+
+    customized_metric_specification {
+      metric_name = "TaskUtilization"
+      namespace   = "Cowork/Sandbox"
+      statistic   = "Average"
+
+      dimensions {
+        name  = "ServiceName"
+        value = "${var.name_prefix}-sandbox-workers"
+      }
+
+      dimensions {
+        name  = "Environment"
+        value = var.environment
+      }
+    }
+  }
+}
+
+# --------------------------------------------------------------------------- #
+# CloudWatch Alarms
+# --------------------------------------------------------------------------- #
+
+resource "aws_cloudwatch_metric_alarm" "dlq_messages" {
+  alarm_name          = "${var.name_prefix}-sandbox-dlq-depth"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 1
+  metric_name         = "ApproximateNumberOfMessagesVisible"
+  namespace           = "AWS/SQS"
+  period              = 300
+  statistic           = "Maximum"
+  threshold           = 0
+  alarm_description   = "Sandbox DLQ has messages — failed session dispatches"
+  treat_missing_data  = "notBreaching"
+
+  dimensions = {
+    QueueName = aws_sqs_queue.sandbox_dlq.name
+  }
 }

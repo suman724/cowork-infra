@@ -45,16 +45,51 @@ variable "secrets" {
   default     = {}
 }
 
-# --- Networking ---
+# --- ECS Cluster & Networking ---
+
+variable "ecs_cluster_id" {
+  description = "ECS cluster ID where the sandbox service runs"
+  type        = string
+}
+
+variable "ecs_cluster_name" {
+  description = "ECS cluster name (used in auto-scaling resource_id)"
+  type        = string
+}
 
 variable "vpc_id" {
   description = "VPC ID"
   type        = string
 }
 
+variable "private_subnet_ids" {
+  description = "Private subnet IDs for sandbox tasks"
+  type        = list(string)
+}
+
 variable "session_service_sg_id" {
   description = "Security group ID of the Session Service ECS tasks (for ingress rules)"
   type        = string
+}
+
+# --- Auto-Scaling ---
+
+variable "min_capacity" {
+  description = "Minimum number of sandbox worker tasks (always running)"
+  type        = number
+  default     = 1
+}
+
+variable "max_capacity" {
+  description = "Maximum number of sandbox worker tasks"
+  type        = number
+  default     = 10
+}
+
+variable "utilization_target" {
+  description = "Target TaskUtilization percentage for auto-scaling (0-100)"
+  type        = number
+  default     = 70
 }
 
 # --- IAM / Storage ---
