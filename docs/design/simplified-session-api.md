@@ -1,7 +1,7 @@
 # Simplified Session API — Design Doc
 
 **Status:** Proposed
-**Scope:** Session Service, Platform Contracts, Web App, Desktop App
+**Scope:** Session Service, Agent Runtime, Platform Contracts, Web App, Desktop App
 **Date:** 2026-03-21
 
 ---
@@ -19,10 +19,25 @@ The current API exposes backend internals to frontend clients:
 
 1. One API call per user action
 2. No JSON-RPC or task ID management in frontend
-3. Push-based sandbox readiness (no polling)
+3. No polling for sandbox readiness
 4. Simplified event stream
 5. Same logical contract for Web and Desktop
 6. Backward compatible — existing endpoints stay for internal use
+
+---
+
+## Key Design Decision: Bundled First Task
+
+The user's intent when creating a session is always "I want to start working on something." Rather than creating a session and then separately sending a message, **the first prompt is bundled with session creation.**
+
+`POST /sessions` gains an optional `prompt` field. When present, Session Service creates the session, creates the task record, and includes the task in the SQS message. The sandbox picks up the message, registers, downloads workspace, and **immediately starts the task** — no second call, no polling, no SSE notification coordination.
+
+This eliminates the need for:
+- Frontend polling for `SANDBOX_READY`
+- In-memory SSE waiter maps in Session Service (which don't scale across instances)
+- A separate `POST /messages` call for the first message
+
+For **subsequent messages** within the same session, `POST /sessions/{id}/messages` handles orchestration (task record + RPC dispatch) in one call.
 
 ---
 
@@ -41,20 +56,22 @@ This split exists because the cloud cannot reach the user's desktop machine — 
 flowchart TB
     subgraph Web
         WebUI["Web App (React)"]
-        WebUI -->|"HTTP<br/>POST /sessions/{id}/messages<br/>GET /sessions/{id}/stream"| SS
+        WebUI -->|"HTTP<br/>POST /sessions (with prompt)<br/>POST /sessions/{id}/messages<br/>GET /sessions/{id}/stream"| SS
     end
 
     subgraph Desktop
         Renderer["Desktop App (renderer)"]
         Main["Desktop App (main process)"]
-        Renderer -->|"IPC<br/>session:send-message<br/>session:events"| Main
+        Renderer -->|"IPC<br/>session:create (with prompt)<br/>session:send-message<br/>session:events"| Main
         Main -->|"JSON-RPC stdio"| LocalAgent["Agent Runtime (local)"]
         Main -->|"HTTP"| SS
     end
 
     subgraph Cloud["AWS"]
         SS["Session Service"]
-        SS -->|"POST /rpc<br/>GET /events"| CloudAgent["Agent Runtime (ECS)"]
+        SS -->|"SQS (with task)"| SQS["SQS Queue"]
+        SQS -->|"poll"| CloudAgent["Agent Runtime (ECS)"]
+        SS -->|"POST /rpc<br/>GET /events"| CloudAgent
         SS --- DB["DynamoDB"]
         SS --- WS["Workspace Service"]
     end
@@ -62,28 +79,114 @@ flowchart TB
 
 ### Shared Contract
 
-Both implementations expose the same operations:
-
 | Operation | Web (HTTP) | Desktop (IPC) | Request | Response |
 |---|---|---|---|---|
-| Send message | `POST /sessions/{id}/messages` | `session:send-message` | `{ prompt, options? }` | `{ taskId, status }` |
+| Create + first message | `POST /sessions` | `session:create` | `{ ..., prompt, taskOptions? }` | `{ sessionId, taskId? }` |
+| Subsequent messages | `POST /sessions/{id}/messages` | `session:send-message` | `{ prompt, options? }` | `{ taskId }` |
 | Cancel | `POST /sessions/{id}/cancel` | `session:cancel` | — | `{ cancelled, taskId? }` |
 | Approve | `POST /sessions/{id}/approve` | `session:approve` | `{ approvalId, decision }` | `{ status }` |
 | Event stream | `GET /sessions/{id}/stream` | `session:events` (IPC push) | — | Simplified events |
 
-React UI components share a `SessionClient` interface — web uses `fetch()`, desktop uses `ipcRenderer.invoke()`.
+---
+
+## Endpoint Changes
+
+### POST /sessions (modified — optional prompt)
+
+Creates a session. If `prompt` is provided, also creates a task record and includes it in the SQS dispatch. The sandbox auto-starts the task on pickup.
+
+**Request (with prompt — typical):**
+```json
+{
+    "tenantId": "t1",
+    "userId": "u1",
+    "executionEnvironment": "cloud_sandbox",
+    "clientInfo": {},
+    "supportedCapabilities": ["File.Read", "File.Write", "Shell.Exec"],
+    "prompt": "Fix the authentication bug in login.py",
+    "taskOptions": { "maxSteps": 50 }
+}
+```
+
+**Request (without prompt — session only):**
+```json
+{
+    "tenantId": "t1",
+    "userId": "u1",
+    "executionEnvironment": "cloud_sandbox",
+    "clientInfo": {},
+    "supportedCapabilities": ["File.Read", "File.Write", "Shell.Exec"]
+}
+```
+
+**Response (201):**
+```json
+{
+    "sessionId": "sess_123",
+    "workspaceId": "ws_456",
+    "status": "SANDBOX_PROVISIONING",
+    "taskId": "task_789"
+}
+```
+
+`taskId` is present only when `prompt` was provided.
+
+**Internal flow (with prompt):**
+1. Create session record in DynamoDB (`SANDBOX_PROVISIONING`)
+2. Generate `taskId`, create task record in DynamoDB
+3. Publish to SQS — message includes session config AND task info
+4. Return `{ sessionId, taskId, status }`
+
+**Internal flow (without prompt):**
+Unchanged from today — creates session, publishes to SQS, returns.
+
+### SQS Message Schema (extended)
+
+```json
+{
+    "sessionId": "sess_123",
+    "registrationToken": "tok_abc",
+    "sessionServiceUrl": "https://...",
+    "workspaceServiceUrl": "https://...",
+    "publishedAt": "2026-03-21T10:00:00Z",
+    "task": {
+        "taskId": "task_789",
+        "prompt": "Fix the authentication bug in login.py",
+        "maxSteps": 50
+    }
+}
+```
+
+`task` is `null` when no prompt was provided. The sandbox checks for it on startup.
+
+### Sandbox Startup (modified)
+
+After registration and workspace download, the sandbox checks for a bundled task:
+
+```python
+# In sandbox startup (after registration + workspace sync)
+if sqs_config.task:
+    # Auto-start the task — no RPC needed
+    await session_manager.start_task({
+        "taskId": sqs_config.task.task_id,
+        "prompt": sqs_config.task.prompt,
+        "taskOptions": {"maxSteps": sqs_config.task.max_steps},
+    })
+```
+
+Events flow immediately through the agent-runtime's HTTP transport. The frontend connects to `/stream` and receives events as they happen.
 
 ---
 
-## New Endpoints (Session Service)
+## New Endpoints
 
 ### POST /sessions/{id}/messages
 
-Send a message and start a task. One call replaces `POST /tasks` + `POST /rpc StartTask`.
+Send a subsequent message (after the first task completes). One call replaces `POST /tasks` + `POST /rpc StartTask`.
 
 **Request:**
 ```json
-{ "prompt": "Fix the login bug", "options": { "maxSteps": 50 } }
+{ "prompt": "Now add unit tests for the fix", "options": { "maxSteps": 50 } }
 ```
 
 **Response (200):**
@@ -91,13 +194,14 @@ Send a message and start a task. One call replaces `POST /tasks` + `POST /rpc St
 { "taskId": "task_abc", "status": "running" }
 ```
 
-**Errors:** 404 (not found), 403 (not owner), 409 (not active or task running), 502 (agent unreachable)
+**Errors:** 404 (not found), 403 (not owner), 409 (not active or task already running), 502 (agent unreachable)
 
 **Internal flow:**
 1. Validate session is active and caller owns it
-2. Generate `taskId`, create task record in DynamoDB
-3. Proxy `StartTask` JSON-RPC to agent runtime
-4. Return `{ taskId, status }`
+2. Check no task is currently running (409 if so)
+3. Generate `taskId`, create task record in DynamoDB
+4. Proxy `StartTask` JSON-RPC to agent runtime
+5. Return `{ taskId, status }`
 
 ### POST /sessions/{id}/cancel
 
@@ -107,6 +211,10 @@ Cancel the running task, or cancel the session if no task is running.
 ```json
 { "cancelled": "task", "taskId": "task_abc" }
 ```
+
+**Internal flow:**
+1. If a task is running: proxy `CancelTask` RPC to agent runtime
+2. If no task running: cancel the session
 
 ### POST /sessions/{id}/approve
 
@@ -124,13 +232,15 @@ Resolve a pending approval.
 
 ### GET /sessions/{id}/stream
 
-Simplified SSE event stream. Maps internal events to frontend-friendly types. Pushes status changes (no polling needed).
+Simplified SSE event stream. Maps internal agent events to frontend-friendly types.
+
+**Query params:** `since={eventId}` for reconnect replay.
 
 ---
 
 ## Simplified Events
 
-The `/stream` endpoint maps 18+ internal events to 7 frontend types:
+`/stream` maps 18+ internal events to 7 frontend types:
 
 | Internal event | Simplified type | Payload |
 |---|---|---|
@@ -140,98 +250,11 @@ The `/stream` endpoint maps 18+ internal events to 7 frontend types:
 | `approval_requested` | `approval_needed` | `{ approvalId, toolName, riskLevel }` |
 | `task_completed` | `task_done` | `{ taskId, status: "completed" }` |
 | `task_failed` | `task_done` | `{ taskId, status: "failed", error }` |
-| (status transition) | `status_changed` | `{ status }` |
+| `step_limit_approaching` | `warning` | `{ message }` |
 
 Dropped: `step_started`, `step_completed`, `llm_request_started`, `llm_request_completed`, `checkpoint_saved`, `verification_started`, `verification_completed`, `context_compacted`.
 
-The raw `GET /sessions/{id}/events` endpoint remains available for debugging and advanced use.
-
----
-
-## Push-Based Sandbox Readiness
-
-### Problem with polling
-
-Currently, after `POST /sessions`, the frontend polls `GET /sessions/{id}` every second to detect `SANDBOX_READY`. With `/stream`, we need status changes pushed via SSE — but the sandbox hasn't registered yet, so there's no agent-runtime to proxy events from.
-
-### Solution: Registration-triggered notification
-
-Session Service maintains an in-memory map of `sessionId → waiting SSE connections`. When a client connects to `/stream` before the sandbox is ready, it subscribes. When the sandbox calls `POST /sessions/{id}/register`, the registration handler pushes the status event directly:
-
-```mermaid
-sequenceDiagram
-    participant Web as Web App
-    participant SS as Session Service
-    participant SQS as SQS
-    participant Agent as Agent Runtime
-
-    Web->>SS: POST /sessions
-    SS->>SQS: Publish
-    SS-->>Web: 201 { sessionId, status: SANDBOX_PROVISIONING }
-
-    Web->>SS: GET /sessions/{id}/stream (SSE)
-    Note over SS: No sandbox yet.<br/>Register SSE connection<br/>in waiters map.
-
-    Agent->>SQS: ReceiveMessage
-    Agent->>SS: POST /sessions/{id}/register
-    SS->>SS: Status → SANDBOX_READY
-    SS->>SS: Notify waiters for this sessionId
-
-    SS-->>Web: SSE: { type: "status_changed", status: "SANDBOX_READY" }
-    Note over SS: Remove from waiters.<br/>Start proxying agent SSE events.
-
-    Web->>SS: POST /sessions/{id}/messages { prompt }
-```
-
-No polling. The status event is pushed the instant the sandbox registers. The SSE connection transitions from "waiting for sandbox" to "proxying agent events" seamlessly.
-
-### Implementation
-
-```python
-class SseNotifier:
-    """In-memory pub/sub for session status changes."""
-
-    _waiters: dict[str, list[asyncio.Queue]] = {}
-
-    def subscribe(self, session_id: str) -> asyncio.Queue:
-        queue = asyncio.Queue()
-        self._waiters.setdefault(session_id, []).append(queue)
-        return queue
-
-    def unsubscribe(self, session_id: str, queue: asyncio.Queue):
-        if session_id in self._waiters:
-            self._waiters[session_id] = [q for q in self._waiters[session_id] if q is not queue]
-
-    def notify(self, session_id: str, event: dict):
-        for queue in self._waiters.get(session_id, []):
-            queue.put_nowait(event)
-```
-
-In `register_sandbox()`:
-```python
-await self._repo.register_sandbox(session_id, endpoint, "SANDBOX_READY")
-self._sse_notifier.notify(session_id, {"type": "status_changed", "status": "SANDBOX_READY"})
-```
-
-In `/stream` handler:
-```python
-if session.status == "SANDBOX_PROVISIONING":
-    # Wait for sandbox to register
-    queue = sse_notifier.subscribe(session_id)
-    try:
-        event = await asyncio.wait_for(queue.get(), timeout=180)
-        yield format_sse(event)
-    finally:
-        sse_notifier.unsubscribe(session_id, queue)
-
-# Now proxy agent-runtime SSE events with mapping
-async for raw_event in proxy_agent_sse(sandbox_endpoint):
-    mapped = map_event(raw_event)
-    if mapped:
-        yield format_sse(mapped)
-```
-
-Multi-instance safety: Each Session Service instance maintains its own waiter map. The registration request hits one instance (via ALB) — that instance notifies its local waiters. If the SSE connection is on a different instance, the client's SSE will detect the status change on the next proxy attempt (reconnect). For production, a shared notification mechanism (Redis pub/sub or SNS) can be added later.
+Raw `GET /sessions/{id}/events` remains available for debugging.
 
 ---
 
@@ -239,11 +262,11 @@ Multi-instance safety: Each Session Service instance maintains its own waiter ma
 
 | Step | Web BFF (Session Service) | Desktop BFF (Main Process) |
 |---|---|---|
-| **Send message** | Generate taskId → DynamoDB task record → proxy `StartTask` RPC to sandbox | Generate taskId → `StartTask` JSON-RPC via stdio → HTTP task record to Session Service |
+| **Create + first message** | Session + task record in DynamoDB → SQS with task → return | Session via agent-runtime stdio → task record via Session Service HTTP → return |
+| **Subsequent messages** | Generate taskId → DynamoDB task record → proxy `StartTask` RPC | Generate taskId → `StartTask` JSON-RPC via stdio → task record via HTTP |
 | **Cancel** | Proxy `CancelTask` RPC to sandbox | `CancelTask` JSON-RPC via stdio |
 | **Approve** | Proxy `ApproveAction` RPC to sandbox | `ApproveAction` JSON-RPC via stdio |
 | **Events** | Proxy agent SSE → map events → push to client SSE | Receive stdio notifications → map events → push to renderer via IPC |
-| **Session CRUD** | Direct DynamoDB | HTTP to Session Service (cloud) |
 
 ---
 
@@ -253,24 +276,34 @@ Multi-instance safety: Each Session Service instance maintains its own waiter ma
 sequenceDiagram
     participant Web as Web App
     participant SS as Session Service
+    participant SQS as SQS
     participant Agent as Agent Runtime (ECS)
 
-    Web->>SS: POST /sessions
-    SS-->>Web: 201 { sessionId }
+    Web->>SS: POST /sessions { prompt: "Fix the bug", ... }
+    SS->>SS: Create session + task records
+    SS->>SQS: Publish { sessionId, task: { taskId, prompt } }
+    SS-->>Web: 201 { sessionId, taskId }
 
     Web->>SS: GET /sessions/{id}/stream (SSE)
-    Note over SS: Sandbox not ready. Subscribe to waiters.
+    Note over SS: Sandbox not ready yet.<br/>SSE waits for proxy target.
 
+    Agent->>SQS: ReceiveMessage
     Agent->>SS: POST /sessions/{id}/register
-    SS-->>Web: SSE: { type: "status_changed", status: "SANDBOX_READY" }
-    Note over SS: Start proxying agent events.
+    Agent->>Agent: download_workspace()
+    Agent->>Agent: auto-start task from SQS message
 
-    Web->>SS: POST /sessions/{id}/messages { prompt: "Fix the bug" }
-    SS-->>Web: 200 { taskId }
+    Note over SS: Sandbox registered.<br/>Start proxying agent SSE.
 
     SS-->>Web: SSE: { type: "message_chunk", content: "I'll fix..." }
     SS-->>Web: SSE: { type: "tool_started", toolName: "WriteFile" }
     SS-->>Web: SSE: { type: "tool_completed", output: "Done" }
+    SS-->>Web: SSE: { type: "task_done", status: "completed" }
+
+    Note over Web: User sends follow-up message
+    Web->>SS: POST /sessions/{id}/messages { prompt: "Add tests" }
+    SS-->>Web: 200 { taskId: "task_2" }
+
+    SS-->>Web: SSE: { type: "message_chunk", content: "Adding tests..." }
     SS-->>Web: SSE: { type: "task_done", status: "completed" }
 ```
 
@@ -285,25 +318,26 @@ sequenceDiagram
 
     Main->>Agent: Spawn process (stdio)
 
-    UI->>Main: IPC: session:create
+    UI->>Main: IPC: session:create { prompt: "Fix the bug" }
     Main->>Agent: JSON-RPC: CreateSession
-    Main->>SS: POST /sessions
-    Main-->>UI: { sessionId }
-
-    Main-->>UI: IPC push: { type: "status_changed", status: "SESSION_RUNNING" }
-
-    UI->>Main: IPC: session:send-message { prompt: "Fix the bug" }
+    Main->>Main: Generate taskId
     Main->>Agent: JSON-RPC: StartTask { taskId, prompt }
-    Main->>SS: POST /sessions/{id}/tasks { taskId }
-    Main-->>UI: { taskId }
+    Main->>SS: POST /sessions + POST /tasks (background)
+    Main-->>UI: { sessionId, taskId }
 
     Agent-->>Main: stdio: text_chunk
     Main-->>UI: IPC push: { type: "message_chunk", content: "I'll fix..." }
     Agent-->>Main: stdio: task_completed
     Main-->>UI: IPC push: { type: "task_done", status: "completed" }
+
+    UI->>Main: IPC: session:send-message { prompt: "Add tests" }
+    Main->>Main: Generate taskId
+    Main->>Agent: JSON-RPC: StartTask { taskId, prompt }
+    Main->>SS: POST /tasks (background)
+    Main-->>UI: { taskId }
 ```
 
-## Approval Flow (same for both)
+## Approval Flow
 
 ```mermaid
 sequenceDiagram
@@ -324,23 +358,85 @@ sequenceDiagram
 
 ---
 
+## What Changes in Agent Runtime
+
+The SQS consumer and sandbox startup gain awareness of the bundled task:
+
+**SQS message parsing** — `SqsSessionConfig` gets an optional `task` field:
+```python
+@dataclass(frozen=True)
+class SqsTaskConfig:
+    task_id: str
+    prompt: str
+    max_steps: int = 50
+
+@dataclass(frozen=True)
+class SqsSessionConfig:
+    session_id: str
+    registration_token: str
+    session_service_url: str
+    workspace_service_url: str
+    receipt_handle: str
+    task: SqsTaskConfig | None = None  # Bundled first task
+```
+
+**Sandbox startup** — after registration and workspace sync, auto-start the task:
+```python
+# In main.py run_http(), after init_from_registration():
+if sqs_config.task:
+    logger.info("auto_starting_task", task_id=sqs_config.task.task_id)
+    await session_manager.start_task({
+        "taskId": sqs_config.task.task_id,
+        "prompt": sqs_config.task.prompt,
+        "taskOptions": {"maxSteps": sqs_config.task.max_steps},
+    })
+```
+
+---
+
+## SSE `/stream` During Provisioning
+
+When the frontend connects to `/stream` while the sandbox is still provisioning, the SSE connection opens but no events flow yet. The `/stream` endpoint:
+
+1. Checks session status
+2. If `SANDBOX_PROVISIONING` or `SANDBOX_READY` with no sandbox endpoint yet — holds the connection open
+3. Periodically retries resolving the sandbox endpoint (every 2s, from DynamoDB cache)
+4. Once sandbox is registered — starts proxying agent SSE events
+5. Events from the auto-started task arrive immediately (the sandbox started working as soon as it registered)
+
+This is a lightweight retry on the proxy resolution, not a notification system. The retry loop is bounded by the session's provisioning timeout (180s). If the sandbox never registers, the SSE connection returns an error event and closes.
+
+The frontend sees: open SSE connection → brief wait → events start flowing. No separate status polling or notification coordination needed.
+
+---
+
 ## Migration Path
 
-### Phase 1: Session Service endpoints
+### Phase 1: Session Service + Agent Runtime
 
-Add `/messages`, `/cancel`, `/approve`, `/stream` to Session Service. Implement `SseNotifier` for push-based status. Event mapper for simplified types. Existing endpoints unchanged.
+- Add optional `prompt`/`taskOptions` to `POST /sessions` — creates task record, includes in SQS
+- Add `/messages`, `/cancel`, `/approve` endpoints (orchestrate task + RPC)
+- Add `/stream` endpoint (event mapping + proxy retry during provisioning)
+- Agent runtime: parse `task` from SQS message, auto-start after registration
+- Platform: update schemas
 
-### Phase 2: Web App migration
+### Phase 2: Web App
 
-Web App switches to new endpoints. Remove JSON-RPC from frontend. Remove polling. Use `/stream` for events.
+- Use `POST /sessions` with prompt for first message
+- Use `POST /messages` for follow-ups
+- Use `GET /stream` for events
+- Remove JSON-RPC, task ID generation, polling
 
-### Phase 3: Desktop App migration
+### Phase 3: Desktop App
 
-Refactor IPC handlers to simplified contract. Event mapping in main process. Extract shared `SessionClient` TypeScript interface.
+- Refactor IPC handlers to match shared contract
+- Event mapping in main process (stdio notifications → simplified types)
+- Extract shared `SessionClient` TypeScript interface
 
 ### Phase 4: Cleanup
 
-Mark `/rpc` and `/events` as internal. Remove `X-User-Id` header (OIDC auth).
+- Mark `/rpc` and `/events` as internal
+- Remove `X-User-Id` header (OIDC auth)
 
 ---
 
@@ -348,11 +444,11 @@ Mark `/rpc` and `/events` as internal. Remove `X-User-Id` header (OIDC auth).
 
 | Repo | Changes | Phase |
 |---|---|---|
-| `cowork-session-service` | `/messages`, `/cancel`, `/approve`, `/stream`, SseNotifier, event mapper | 1 |
-| `cowork-platform` | Simplified event types, request/response schemas | 1 |
-| `cowork-web-app` | New API client, remove JSON-RPC, use `/stream` | 2 |
+| `cowork-session-service` | `POST /sessions` with prompt, `/messages`, `/cancel`, `/approve`, `/stream`, event mapper | 1 |
+| `cowork-agent-runtime` | SQS consumer parses `task` field, auto-start task after registration | 1 |
+| `cowork-platform` | Simplified event types, updated session creation schema, `/messages` schema | 1 |
+| `cowork-web-app` | New API client, remove JSON-RPC/polling, use `/stream` | 2 |
 | `cowork-desktop-app` | Refactor IPC handlers, event mapping, shared SessionClient | 3 |
-| `cowork-agent-runtime` | No changes | — |
 
 ---
 
@@ -360,7 +456,7 @@ Mark `/rpc` and `/events` as internal. Remove `X-User-Id` header (OIDC auth).
 
 | # | Question |
 |---|---|
-| 1 | Should `/stream` replay conversation history on connect (so frontend renders immediately without separate fetch)? |
-| 2 | Should `/cancel` be two separate endpoints (`/cancel-task` and `/cancel-session`) for clarity? |
-| 3 | Should the event mapper support `?detail=full` for power users who want raw events on `/stream`? |
-| 4 | For multi-instance Session Service: should `SseNotifier` use Redis pub/sub from day one, or start in-memory and migrate? |
+| 1 | Should `/stream` replay conversation history on connect (so frontend renders without separate fetch)? |
+| 2 | Should `/cancel` be two separate endpoints for task vs session, or auto-detect? |
+| 3 | Should `/stream` support `?detail=full` to return raw unfiltered events? |
+| 4 | For resumed sessions: should `POST /sessions/{id}/resume` also accept a `prompt` to bundle the next task? |
