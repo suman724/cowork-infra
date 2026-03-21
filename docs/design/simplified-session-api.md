@@ -441,19 +441,19 @@ These changes are web-focused. Desktop is unaffected in Phases 1-2:
 | Change | Desktop impact |
 |---|---|
 | `POST /sessions` with prompt | None — desktop uses agent-runtime stdio |
-| `POST /sessions/{id}/messages` | None — Phase 3 IPC equivalent |
-| `/cancel`, `/approve` | None — Phase 3 IPC equivalent |
+| `POST /sessions/{id}/messages` | None — Stage 3 IPC equivalent |
+| `/cancel`, `/approve` | None — Stage 3 IPC equivalent |
 | `/stream` event mapping | **Shared contract needed** — mapping logic in `cowork-platform` prevents drift between Python (Session Service) and TypeScript (desktop main process) |
 | Registration status for bundled tasks | None — desktop doesn't use SQS |
 | SQS task bundling | None — desktop doesn't use SQS |
 
-Desktop gains value in **Phase 3** when IPC handlers are refactored to the simplified contract. Until then, desktop continues working exactly as today.
+Desktop gains value in **Stage 3** when IPC handlers are refactored to the simplified contract. Until then, desktop continues working exactly as today.
 
 ---
 
 ## Migration Path
 
-### Phase 1: Session Service + Agent Runtime
+### Stage 1: Session Service + Agent Runtime
 
 - Add optional `prompt`/`taskOptions` to `POST /sessions` — creates task record, includes in SQS
 - Add `/messages`, `/cancel`, `/approve` endpoints (orchestrate task + RPC)
@@ -461,20 +461,20 @@ Desktop gains value in **Phase 3** when IPC handlers are refactored to the simpl
 - Agent runtime: parse `task` from SQS message, auto-start after registration
 - Platform: update schemas
 
-### Phase 2: Web App
+### Stage 2: Web App
 
 - Use `POST /sessions` with prompt for first message
 - Use `POST /messages` for follow-ups
 - Use `GET /stream` for events
 - Remove JSON-RPC, task ID generation, polling
 
-### Phase 3: Desktop App
+### Stage 3: Desktop App
 
 - Refactor IPC handlers to match shared contract
 - Event mapping in main process (stdio notifications → simplified types)
 - Extract shared `SessionClient` TypeScript interface
 
-### Phase 4: Cleanup
+### Stage 4: Cleanup
 
 - Mark `/rpc` and `/events` as internal
 - Remove `X-User-Id` header (OIDC auth)
