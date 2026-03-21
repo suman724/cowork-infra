@@ -476,11 +476,11 @@ Both implementations reference this file. Event names and payload shapes are unc
 
 | Step | Web BFF (Session Service) | Desktop BFF (Main Process) |
 |---|---|---|
-| **Create + first message** | Session + task record in DynamoDB → SQS with task → return | Session via agent-runtime stdio → task record via Session Service HTTP → return |
-| **Subsequent messages** | Generate taskId → DynamoDB task record → proxy `StartTask` RPC | Generate taskId → `StartTask` JSON-RPC via stdio → task record via HTTP |
-| **Cancel** | Proxy `CancelTask` RPC to sandbox | `CancelTask` JSON-RPC via stdio |
+| **Create + first message** | Create session record + task record in DynamoDB → publish to SQS with task → return `{ sessionId, taskId }` | `CreateSession` JSON-RPC via stdio → create session + task records via Session Service HTTP → `StartTask` JSON-RPC via stdio → return `{ sessionId, taskId }` |
+| **Subsequent messages** | `GetSessionState` RPC to check no task running → generate taskId → create task record in DynamoDB → proxy `StartTask` RPC to sandbox → return `{ taskId }` | Check agent state via stdio → generate taskId → `StartTask` JSON-RPC via stdio → create task record via Session Service HTTP → return `{ taskId }` |
+| **Cancel** | `GetSessionState` RPC → if task running: proxy `CancelTask` RPC; if not: cancel session in DynamoDB | Check agent state via stdio → if task running: `CancelTask` JSON-RPC; if not: cancel session via Session Service HTTP |
 | **Approve** | Proxy `ApproveAction` RPC to sandbox | `ApproveAction` JSON-RPC via stdio |
-| **Events** | Proxy agent SSE → map events → push to client SSE | Receive stdio notifications → map events → push to renderer via IPC |
+| **Events** | Proxy agent SSE → filter to allowed types → push to client SSE | Receive stdio notifications → filter to allowed types → push to renderer via IPC |
 
 ---
 
