@@ -8,7 +8,7 @@
 
 ## Problem
 
-Cowork supports two workspace scopes for file access: `local` (direct filesystem on desktop) and `cloud` (S3-backed for web sandbox). Users who store their project files in OneDrive cannot use them in web sessions — they must manually upload files through the browser, losing the folder structure and context of their existing project.
+Cowork supports three workspace scopes: `local` (direct filesystem on desktop), `general` (single-use chat), and `cloud` (S3-backed for web sandbox). Users who store their project files in OneDrive cannot use them in web sessions — they must manually upload files through the browser, losing the folder structure and context of their existing project.
 
 On desktop, OneDrive is mapped as a local drive, so users can already point a `local` workspace at a OneDrive-synced folder with no special handling. The gap is **web/sandbox only**: the agent runtime runs in a container with no access to the user's OneDrive.
 
@@ -33,7 +33,7 @@ On desktop, OneDrive is mapped as a local drive, so users can already point a `l
 
 ## Design Overview
 
-OneDrive integration follows the same pattern as existing S3-backed cloud workspaces. The Workspace Service gets a new `FileStore` implementation that calls Microsoft Graph API instead of S3. The agent runtime is unaware of the change — it calls the same Workspace Service HTTP API.
+OneDrive integration adds a new **storage backend** to the existing `cloud` workspace scope. The workspace scope stays `cloud` — OneDrive is not a new scope but a different place to store files. The Workspace Service gets a new `FileStore` implementation that calls Microsoft Graph API instead of S3. The agent runtime is unaware of the change — it calls the same Workspace Service HTTP API.
 
 ```
                           ┌─────────────────────┐
@@ -41,7 +41,8 @@ OneDrive integration follows the same pattern as existing S3-backed cloud worksp
                           │  (folder picker UI)  │
                           └──────────┬───────────┘
                                      │ POST /sessions
-                                     │ { oneDrive: { driveId, folderItemId, tokens } }
+                                     │ { workspaceHint: { storageBackend: "onedrive",
+                                     │     driveId, folderItemId, tokens } }
                                      ▼
                           ┌─────────────────────┐
                           │   Session Service    │
@@ -87,11 +88,11 @@ This section documents the key trade-offs evaluated and the reasoning behind eac
 
 ### D1: One OneDrive Folder Per Workspace
 
-A workspace maps to exactly one OneDrive folder, identified by `driveId` + `folderItemId`. This binding is set at workspace creation and is immutable for the workspace lifetime.
+A `cloud` workspace with `storageBackend: "onedrive"` maps to exactly one OneDrive folder, identified by `driveId` + `folderItemId`. This binding is set at workspace creation and is immutable for the workspace lifetime.
 
 - Mirrors the `local` scope pattern: one `localPath` = one project directory
 - Policy enforcement scopes `allowedPaths` per workspace — multiple folders would complicate path validation
-- Multiple sessions can reuse the same OneDrive workspace (like `local`, unlike single-use `cloud`)
+- Multiple sessions can reuse the same OneDrive workspace (user passes `workspaceId` in `workspaceHint`)
 
 The workspace record stores `driveId` (not just personal OneDrive) so the same model supports SharePoint document libraries later.
 
@@ -227,9 +228,9 @@ class OneDriveFileStore(FileStore):
     ...
 ```
 
-Dependency injection per-request based on workspace type:
+Dependency injection per-request based on storage backend:
 ```python
-if workspace.workspace_scope == "onedrive":
+if workspace.storage_backend == "onedrive":
     file_store = OneDriveFileStore(
         access_token=request.headers["X-Graph-Access-Token"],
         drive_id=workspace.drive_id,
@@ -241,24 +242,33 @@ else:
 
 ---
 
-## Workspace Scope: `onedrive`
+## Storage Backend Model
 
-New workspace scope alongside `local`, `general`, and `cloud`.
+OneDrive is a **storage backend**, not a new workspace scope. The `workspaceScope` stays `cloud` for all web/sandbox sessions. A new `storageBackend` field on the workspace record determines which `FileStore` implementation the Workspace Service uses.
+
+| Scope | Backend | Source files | Example |
+|---|---|---|---|
+| `local` | n/a (filesystem) | User's machine | Desktop project |
+| `general` | n/a (no files) | None | Desktop chat |
+| `cloud` | `s3` (default) | S3 bucket | Web upload |
+| `cloud` | `onedrive` | OneDrive via Graph API | Web + OneDrive folder |
 
 ### Workspace Record (extended fields)
 
 | Field | Type | Description |
 |---|---|---|
-| `workspaceScope` | `"onedrive"` | New scope value |
-| `driveId` | `string` | OneDrive or SharePoint drive ID |
-| `folderItemId` | `string` | Graph API item ID of the root folder |
-| `folderPath` | `string` | Display path (e.g., `/Projects/myapp`) for UI |
+| `storageBackend` | `"s3"` or `"onedrive"` | Where workspace files are stored (default: `s3`) |
+| `driveId` | `string` (optional) | OneDrive or SharePoint drive ID — present when `storageBackend == "onedrive"` |
+| `folderItemId` | `string` (optional) | Graph API item ID of the root folder — present when `storageBackend == "onedrive"` |
+| `folderPath` | `string` (optional) | Display path (e.g., `/Projects/myapp`) for UI |
+
+Existing fields (`workspaceId`, `workspaceScope`, `tenantId`, `userId`, `s3WorkspacePrefix`, etc.) are unchanged. OneDrive workspaces have `workspaceScope == "cloud"` and `storageBackend == "onedrive"`.
 
 ### Workspace Reuse (User-Controlled)
 
 No automatic idempotent resolution for OneDrive workspaces. Instead, the web app lists the user's existing workspaces (via `GET /workspaces?tenantId=X&userId=Y`, using the existing `tenantId-userId-index` GSI) and lets the user choose:
 
-- **"Continue existing workspace"** — reuse a prior workspace for the same OneDrive folder (sees past sessions)
+- **"Continue existing workspace"** — reuse a prior workspace for the same OneDrive folder (pass `workspaceId` in `workspaceHint`)
 - **"Start fresh"** — create a new workspace regardless
 
 This avoids a new GSI and gives the user control over whether to group sessions or keep them separate. The existing `tenantId-userId-index` GSI already supports listing a user's workspaces.
@@ -268,7 +278,7 @@ This avoids a new GSI and gives the user control over whether to group sessions 
 | Aspect | Behavior |
 |---|---|
 | Creation | User creates via web app when starting a session with a OneDrive folder. |
-| Reuse | User-controlled — web app lists existing workspaces and offers "continue" or "start fresh." |
+| Reuse | User-controlled — pass existing `workspaceId` in `workspaceHint`, or omit to create fresh. |
 | Deletion | User-initiated. Deletes workspace record + all artifacts in S3. Does NOT delete OneDrive files. |
 | TTL | No auto-expiry (user's ongoing project). |
 
@@ -278,7 +288,7 @@ This avoids a new GSI and gives the user control over whether to group sessions 
 
 ### Session Service
 
-**`POST /sessions` — extended request:**
+**`POST /sessions` — extended `workspaceHint`:**
 
 ```json
 {
@@ -286,21 +296,32 @@ This avoids a new GSI and gives the user control over whether to group sessions 
   "userId": "user_123",
   "executionEnvironment": "cloud_sandbox",
   "workspaceHint": {
-    "oneDrive": {
-      "driveId": "b!abc123...",
-      "folderItemId": "01ABC...",
-      "folderPath": "/Projects/myapp",
-      "accessToken": "eyJ...",
-      "refreshToken": "0.ARw..."
-    }
+    "storageBackend": "onedrive",
+    "driveId": "b!abc123...",
+    "folderItemId": "01ABC...",
+    "folderPath": "/Projects/myapp",
+    "accessToken": "eyJ...",
+    "refreshToken": "0.ARw..."
   }
 }
 ```
 
-When `workspaceHint.oneDrive` is present:
-1. Session Service resolves or creates an `onedrive`-scoped workspace via Workspace Service
+To reuse an existing OneDrive workspace:
+```json
+{
+  "executionEnvironment": "cloud_sandbox",
+  "workspaceHint": {
+    "workspaceId": "ws-existing-123",
+    "accessToken": "eyJ...",
+    "refreshToken": "0.ARw..."
+  }
+}
+```
+
+When `workspaceHint.storageBackend == "onedrive"`:
+1. Session Service creates a `cloud`-scoped workspace with `storageBackend: "onedrive"` via Workspace Service
 2. Stores `accessToken` + `refreshToken` (encrypted) on the session record
-3. Proceeds with sandbox provisioning as normal
+3. Proceeds with sandbox provisioning as normal (SQS dispatch)
 
 **Token refresh endpoint (internal):**
 
