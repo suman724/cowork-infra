@@ -496,24 +496,26 @@ The desktop main process only calls Session Service HTTP for operations the agen
 sequenceDiagram
     participant Web as Web App
     participant SS as Session Service
+    participant WS as Workspace Service
     participant SQS as SQS
     participant Agent as Agent Runtime (ECS)
 
     Web->>SS: POST /sessions { prompt: "Fix the bug", ... }
-    SS->>SS: Create session + task records
+    SS->>WS: Resolve/create workspace
+    SS->>SS: Create session + task records in DynamoDB
     SS->>SQS: Publish { sessionId, task: { taskId, prompt } }
-    SS-->>Web: 201 { sessionId, taskId }
+    SS-->>Web: 201 { sessionId, workspaceId, taskId }
 
     Web->>SS: GET /sessions/{id}/stream (SSE)
-    Note over SS: Sandbox not ready yet.<br/>SSE waits for proxy target.
+    Note over SS: Sandbox not ready yet.<br/>SSE retries proxy resolution.
 
     Agent->>SQS: ReceiveMessage
     Agent->>SS: POST /sessions/{id}/register
     SS->>SS: Has bundled task → status = SESSION_RUNNING
-    Agent->>Agent: download_workspace()
+    Agent->>WS: download_workspace()
     Agent->>Agent: auto-start task from SQS message
 
-    Note over SS: Sandbox registered (SESSION_RUNNING).<br/>Start proxying agent SSE.
+    Note over SS: Sandbox registered.<br/>Start proxying agent SSE.
 
     SS-->>Web: SSE: { type: "text_chunk", content: "I'll fix..." }
     SS-->>Web: SSE: { type: "tool_requested", toolName: "WriteFile" }
@@ -522,6 +524,10 @@ sequenceDiagram
 
     Note over Web: User sends follow-up message
     Web->>SS: POST /sessions/{id}/messages { prompt: "Add tests" }
+    SS->>Agent: GetSessionState RPC (check no task running)
+    Agent-->>SS: { hasActiveTask: false }
+    SS->>SS: Create task record in DynamoDB
+    SS->>Agent: StartTask RPC { taskId, prompt }
     SS-->>Web: 200 { taskId: "task_2" }
 
     SS-->>Web: SSE: { type: "text_chunk", content: "Adding tests..." }
@@ -536,6 +542,7 @@ sequenceDiagram
     participant Main as Desktop (main process)
     participant Agent as Agent Runtime (stdio)
     participant SS as Session Service (cloud)
+    participant WS as Workspace Service (cloud)
 
     Main->>Agent: Spawn process (stdio)
 
@@ -544,6 +551,7 @@ sequenceDiagram
     Agent->>SS: POST /sessions (internal)
     Agent-->>Main: { sessionId, workspaceId, policyBundle }
     Main->>Agent: JSON-RPC: StartTask { prompt }
+    Note over Agent: Agent generates taskId,<br/>creates task record internally
     Agent->>SS: POST /tasks (internal)
     Agent-->>Main: { taskId, status: "running" }
     Main-->>UI: { sessionId, taskId }
@@ -554,13 +562,15 @@ sequenceDiagram
     Main-->>UI: IPC push: { type: "task_completed", taskId: "..." }
 
     UI->>Main: IPC: session:send-message { prompt: "Add tests" }
+    Main->>Agent: JSON-RPC: GetSessionState
+    Agent-->>Main: { hasActiveTask: false }
     Main->>Agent: JSON-RPC: StartTask { prompt }
     Agent->>SS: POST /tasks (internal)
     Agent-->>Main: { taskId, status: "running" }
     Main-->>UI: { taskId }
 ```
 
-Note: The main process does not call Session Service directly for session/task creation — the agent-runtime handles that internally via its `SessionClient` and `WorkspaceClient`. The main process only forwards stdio RPCs and filters events.
+Note: The main process does not call Session Service for session/task creation — the agent-runtime handles that internally via its `SessionClient`. The main process forwards stdio RPCs, checks agent state, and filters events. It only calls Session Service directly for UI queries (list workspaces, fetch history).
 
 ## Approval Flow
 
