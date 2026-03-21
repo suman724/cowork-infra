@@ -211,10 +211,13 @@ Send a subsequent message (after the first task completes). One call replaces `P
 
 **Internal flow:**
 1. Validate session is active and caller owns it
-2. Check no task is currently running (409 if so)
-3. Generate `taskId`, create task record in DynamoDB
-4. Proxy `StartTask` JSON-RPC to agent runtime
-5. Return `{ taskId, status }`
+2. Proxy `GetSessionState` RPC to agent runtime — check if a task is running
+3. If task running → return 409 immediately (no DynamoDB write)
+4. Generate `taskId`, create task record in DynamoDB
+5. Proxy `StartTask` JSON-RPC to agent runtime
+6. Return `{ taskId, status }`
+
+The state check (step 2) queries the agent-runtime directly — it's the source of truth for whether a task is running. This avoids writing a task record and then rolling it back if the agent rejects the start. The round-trip to the sandbox (~5-10ms on the same VPC) is cheaper than a DynamoDB write + rollback.
 
 ### POST /sessions/{id}/cancel
 
