@@ -152,7 +152,7 @@ The existing session status state machine is extended with sandbox-specific stat
 | `SESSION_COMPLETED` | Agent finished |
 | `SESSION_FAILED` | Unrecoverable error |
 | `SESSION_CANCELLED` | User cancelled |
-| `SANDBOX_TERMINATED` | Container shut down (idle timeout, max duration, or explicit) (new) |
+| `SANDBOX_TERMINATED` | Container shut down (idle timeout, max duration, or explicit). Resumable — transitions to `SANDBOX_PROVISIONING` via `POST /sessions/{id}/resume` |
 
 Desktop sessions skip `SANDBOX_PROVISIONING` and `SANDBOX_READY` — they transition directly from `SESSION_CREATED` to `SESSION_RUNNING` as before.
 

@@ -187,17 +187,15 @@ Design:
 
 ### POST /sessions/{sessionId}/resume — Resume Session
 
-Called by the Local Agent Host after a desktop restart when a checkpoint exists in the Local State Store.
+Automatically dispatches based on `executionEnvironment`:
 
-**Request:**
-```json
-{
-  "sessionId": "sess_789",
-  "checkpointCursor": "step_004"
-}
-```
+**Desktop sessions:** Called by the Local Agent Host after a desktop restart. Re-validates policy, extends expiry, returns refreshed bundle. Transitions to `SESSION_RUNNING`.
 
-**Response:**
+**Sandbox sessions:** Called by the web app when a user wants to resume a terminated/completed/failed session. Generates a fresh `registrationToken`, transitions to `SANDBOX_PROVISIONING`, publishes to SQS for a new worker task to pick up. The worker loads prior session history from Workspace Service.
+
+**Request:** `POST /sessions/{sessionId}/resume` (no body required)
+
+**Response (desktop):**
 ```json
 {
   "sessionId": "sess_789",
@@ -206,6 +204,19 @@ Called by the Local Agent Host after a desktop restart when a checkpoint exists 
   "policyBundle": { ... }
 }
 ```
+
+**Response (sandbox):**
+```json
+{
+  "sessionId": "sess_789",
+  "workspaceId": "ws_456",
+  "status": "SANDBOX_PROVISIONING"
+}
+```
+
+**Errors:**
+- 404 — session not found
+- 409 — session is still active (SANDBOX_PROVISIONING, SANDBOX_READY, SESSION_RUNNING, etc.) or expired
 
 ---
 
