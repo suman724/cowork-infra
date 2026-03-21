@@ -684,11 +684,12 @@ Desktop gains value in **Stage 3** when IPC handlers are refactored to the simpl
 
 ---
 
-## Open Questions
+## Design Decisions (from open questions)
 
-| # | Question |
-|---|---|
-| 1 | Should `/stream` replay conversation history on connect (so frontend renders without separate fetch)? |
-| 2 | Should `/cancel` be two separate endpoints for task vs session, or auto-detect? |
-| 3 | Should `/stream` support `?detail=full` to return raw unfiltered events? |
-| 4 | For resumed sessions: should `POST /sessions/{id}/resume` also accept a `prompt` to bundle the next task? |
+**History replay on `/stream`**: No. SSE is for live events. Frontend fetches history from Workspace Service on page load (existing pattern). Mixing history into the SSE stream conflates two concerns.
+
+**`/cancel` auto-detect vs separate endpoints**: Single endpoint, auto-detects via `GetSessionState` RPC. Described in internal flow above.
+
+**Raw events on `/stream`**: No. `GET /sessions/{id}/events` already serves raw unfiltered events. Two endpoints, clear purpose — `/stream` for frontends, `/events` for debugging.
+
+**`POST /sessions/{id}/resume` with prompt**: Yes — consistent with the bundled task pattern on `POST /sessions`. When a user resumes a session with a message, one call handles both resumption and task start. `POST /sessions/{id}/resume` accepts an optional `prompt` + `taskOptions`, same as `POST /sessions`.
