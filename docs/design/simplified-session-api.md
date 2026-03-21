@@ -269,6 +269,16 @@ Dropped: `step_started`, `step_completed`, `llm_request_started`, `llm_request_c
 
 Raw `GET /sessions/{id}/events` remains available for debugging.
 
+### Shared event mapping contract
+
+The event mapping is implemented in two places — Session Service (Python, for web `/stream`) and Desktop main process (TypeScript, for IPC events). To prevent drift, the mapping table lives in `cowork-platform` as the source of truth:
+
+```
+cowork-platform/contracts/enums/simplified-event-mapping.json
+```
+
+Both implementations reference this file. CI validates that the mapping is consistent. If a new internal event type is added, the mapping file determines whether it's exposed to frontends or dropped.
+
 ---
 
 ## How Each BFF Works Internally
@@ -421,6 +431,23 @@ When the frontend connects to `/stream` while the sandbox is still provisioning,
 This is a lightweight retry on the proxy resolution, not a notification system. The retry loop is bounded by the session's provisioning timeout (180s). If the sandbox never registers, the SSE connection returns an error event and closes.
 
 The frontend sees: open SSE connection → brief wait → events start flowing. No separate status polling or notification coordination needed.
+
+---
+
+## Desktop App Impact
+
+These changes are web-focused. Desktop is unaffected in Phases 1-2:
+
+| Change | Desktop impact |
+|---|---|
+| `POST /sessions` with prompt | None — desktop uses agent-runtime stdio |
+| `POST /sessions/{id}/messages` | None — Phase 3 IPC equivalent |
+| `/cancel`, `/approve` | None — Phase 3 IPC equivalent |
+| `/stream` event mapping | **Shared contract needed** — mapping logic in `cowork-platform` prevents drift between Python (Session Service) and TypeScript (desktop main process) |
+| Registration status for bundled tasks | None — desktop doesn't use SQS |
+| SQS task bundling | None — desktop doesn't use SQS |
+
+Desktop gains value in **Phase 3** when IPC handlers are refactored to the simplified contract. Until then, desktop continues working exactly as today.
 
 ---
 
