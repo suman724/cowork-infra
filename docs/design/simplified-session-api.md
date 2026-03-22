@@ -802,7 +802,7 @@ Desktop gains value in **Stage 3** when IPC handlers are refactored to the simpl
 
 **Orphaned task records on provisioning timeout:** `POST /sessions` with prompt creates the task record immediately. If the sandbox never starts, the provisioning timeout marks the session `SESSION_FAILED` but the task stays in "created" state. **Mitigation:** The lifecycle manager should fail the task record when it fails the session.
 
-**Proxy cache stale after registration:** The proxy endpoint cache (30s TTL) may not reflect a newly registered sandbox. The `/stream` retry (every 2s) reads from cache and may not find the endpoint for up to 30s. **Mitigation:** The registration handler should invalidate the proxy cache for the session ID, so the next `/stream` retry resolves immediately.
+**Proxy cache stale after registration:** The proxy endpoint cache is in-memory per Session Service instance. Instance A handles registration (stores endpoint), but Instance B serves the `/stream` SSE connection — its cache is stale for up to 30s. Cross-instance cache invalidation adds complexity. **Mitigation:** Bypass cache for sessions in `SANDBOX_PROVISIONING` or `SANDBOX_READY` states — read directly from DynamoDB. Only cache for established sessions (`SESSION_RUNNING` and beyond) where the endpoint is stable. The `/stream` retry during provisioning (~7 DynamoDB reads over 15s) is negligible.
 
 **Desktop agent-runtime crash:** If the agent-runtime process crashes, the stdio pipe breaks. The main process needs to detect this. **Mitigation:** Main process listens for process exit/pipe EOF, notifies the renderer with an error event, and offers to restart the agent-runtime. Session history is preserved in Workspace Service.
 
