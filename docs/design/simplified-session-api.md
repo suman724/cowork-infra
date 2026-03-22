@@ -37,7 +37,11 @@ This eliminates the need for:
 - In-memory SSE waiter maps in Session Service (which don't scale across instances)
 - A separate `POST /messages` call for the first message
 
-For **subsequent messages** within the same session, `POST /sessions/{id}/messages` handles orchestration (task record + RPC dispatch) in one call.
+For **all subsequent messages**, `POST /sessions/{id}/messages` is the universal entry point. It detects the sandbox state and does the right thing:
+- **Sandbox alive** → check agent state, create task, proxy `StartTask` RPC
+- **Sandbox dead** (terminated, completed, failed, cancelled) → generate new token, re-provision via SQS with bundled task
+
+The frontend never checks sandbox status. It just sends messages.
 
 ---
 
@@ -108,11 +112,13 @@ Note: The main process is a thin forwarder — it sends stdio RPCs and filters e
 
 | Operation | Web (HTTP) | Desktop (IPC) | Request | Response |
 |---|---|---|---|---|
-| Create + first message | `POST /sessions` | `session:create` | `{ ..., prompt, taskOptions? }` | `{ sessionId, taskId? }` |
-| Subsequent messages | `POST /sessions/{id}/messages` | `session:send-message` | `{ prompt, options? }` | `{ taskId }` |
+| New session | `POST /sessions` | `session:create` | `{ ..., prompt?, taskOptions? }` | `{ sessionId, taskId? }` |
+| Send message | `POST /sessions/{id}/messages` | `session:send-message` | `{ prompt, taskOptions? }` | `{ taskId, status }` |
 | Cancel | `POST /sessions/{id}/cancel` | `session:cancel` | — | `{ cancelled, taskId? }` |
 | Approve | `POST /sessions/{id}/approve` | `session:approve` | `{ approvalId, decision }` | `{ status }` |
-| Event stream | `GET /sessions/{id}/stream` | `session:events` (IPC push) | — | Simplified events |
+| Event stream | `GET /sessions/{id}/stream` | `session:events` (IPC push) | — | Filtered events |
+
+`/messages` is the universal entry point for existing sessions — it handles active sandboxes (proxy RPC), dead sandboxes (re-provision via SQS), and task-running checks internally. The frontend never checks sandbox state.
 
 ---
 
@@ -255,7 +261,7 @@ Events flow immediately through the agent-runtime's HTTP transport. The frontend
 
 ### POST /sessions/{id}/messages
 
-Send a subsequent message (after the first task completes). One call replaces `POST /tasks` + `POST /rpc StartTask`.
+Universal entry point for sending a message to an existing session. Handles all scenarios — active sandbox, dead sandbox, re-provisioning — internally. The frontend never checks sandbox state.
 
 **Request:**
 ```json
@@ -275,7 +281,7 @@ Send a subsequent message (after the first task completes). One call replaces `P
 | `taskOptions.maxSteps` | integer | No | Max agent loop steps (1-200, default 50) |
 | `taskOptions.planOnly` | boolean | No | If true, agent creates a plan without executing |
 
-**Response (200):**
+**Response (200) — sandbox alive:**
 ```json
 {
     "taskId": "task_abc",
@@ -283,26 +289,44 @@ Send a subsequent message (after the first task completes). One call replaces `P
 }
 ```
 
+**Response (200) — sandbox dead, re-provisioning:**
+```json
+{
+    "taskId": "task_abc",
+    "status": "provisioning"
+}
+```
+
 | Field | Type | Description |
 |---|---|---|
 | `taskId` | string | Generated task ID |
-| `status` | string | `"running"` |
+| `status` | string | `"running"` (sandbox alive, task started) or `"provisioning"` (sandbox dead, re-provisioning via SQS with bundled task) |
 
 **Errors:**
 - `404` — session not found
 - `403` — not session owner
-- `409` — session not active, or a task is already running
-- `502` — agent runtime unreachable
+- `409` — a task is already running
+- `502` — agent runtime unreachable (sandbox alive but not responding)
 
-**Internal flow:**
-1. Validate session is active and caller owns it
-2. Proxy `GetSessionState` RPC to agent runtime — check if a task is running
-3. If task running → return 409 immediately (no DynamoDB write)
+**Internal flow (sandbox alive):**
+1. Validate session exists and caller owns it
+2. Check session status — sandbox is in an active state (`SANDBOX_READY`, `SESSION_RUNNING`, etc.)
+3. Proxy `GetSessionState` RPC to agent runtime — check if a task is running
+4. If task running → return 409 immediately
+5. Generate `taskId`, create task record in DynamoDB
+6. Proxy `StartTask` JSON-RPC to agent runtime with `{ taskId, prompt, taskOptions }`
+7. Return `{ taskId, status: "running" }`
+
+**Internal flow (sandbox dead):**
+1. Validate session exists and caller owns it
+2. Check session status — sandbox is not active (`SANDBOX_TERMINATED`, `SESSION_COMPLETED`, `SESSION_FAILED`, `SESSION_CANCELLED`)
+3. Generate fresh `registrationToken`
 4. Generate `taskId`, create task record in DynamoDB
-5. Proxy `StartTask` JSON-RPC to agent runtime with `{ taskId, prompt, taskOptions }`
-6. Return `{ taskId, status: "running" }`
+5. Transition session to `SANDBOX_PROVISIONING`
+6. Publish to SQS with bundled task `{ sessionId, registrationToken, task: { taskId, prompt } }`
+7. Return `{ taskId, status: "provisioning" }`
 
-The state check (step 2) queries the agent-runtime directly — it's the source of truth for whether a task is running. This avoids writing a task record and then rolling it back if the agent rejects the start. The round-trip to the sandbox (~5-10ms on the same VPC) is cheaper than a DynamoDB write + rollback.
+The frontend handles both responses the same way — connect to `GET /stream`, events arrive when the task starts (immediately if alive, after provisioning if dead).
 
 ### POST /sessions/{id}/cancel
 
@@ -340,9 +364,11 @@ Cancel the running task, or cancel the session if no task is running.
 
 **Internal flow:**
 1. Validate session exists and caller owns it
-2. Proxy `GetSessionState` RPC to agent runtime — check if a task is running
-3. If task running → proxy `CancelTask` RPC → return `{ cancelled: "task", taskId }`
-4. If no task running → cancel session in DynamoDB → return `{ cancelled: "session", sessionId }`
+2. If session status is not active (already terminated/completed/failed/cancelled) → cancel session in DynamoDB → return `{ cancelled: "session" }`
+3. Proxy `GetSessionState` RPC to agent runtime — check if a task is running
+4. If task running → proxy `CancelTask` RPC → return `{ cancelled: "task", taskId }`
+5. If no task running → cancel session in DynamoDB → return `{ cancelled: "session", sessionId }`
+6. If sandbox unreachable (502) → fall back to cancel session in DynamoDB → return `{ cancelled: "session", sessionId }`
 
 ### POST /sessions/{id}/approve
 
@@ -479,14 +505,15 @@ Both implementations reference this file. Event names and payload shapes are unc
 
 | Step | Web BFF (Session Service) | Desktop BFF (Main Process) |
 |---|---|---|
-| **Create + first message** | Resolve workspace → create session + task records in DynamoDB → publish to SQS with task → return `{ sessionId, taskId }` | `CreateSession` stdio RPC (agent-runtime creates session internally) → `StartTask` stdio RPC (agent-runtime creates task internally) → return `{ sessionId, taskId }` |
-| **Subsequent messages** | `GetSessionState` RPC → generate taskId → create task record in DynamoDB → proxy `StartTask` RPC → return `{ taskId }` | `GetSessionState` stdio RPC → `StartTask` stdio RPC (agent-runtime creates task internally) → return `{ taskId }` |
+| **New session** | Resolve workspace → create session (+ task) in DynamoDB → SQS (with task if prompt) → return `{ sessionId, taskId? }` | `CreateSession` stdio RPC → (optionally) `StartTask` stdio RPC → return `{ sessionId, taskId? }` |
+| **Send message (sandbox alive)** | `GetSessionState` RPC → create task in DynamoDB → proxy `StartTask` RPC → return `{ taskId, status: "running" }` | `GetSessionState` stdio RPC → `StartTask` stdio RPC → return `{ taskId }` |
+| **Send message (sandbox dead)** | New token → create task in DynamoDB → `SANDBOX_PROVISIONING` → SQS with bundled task → return `{ taskId, status: "provisioning" }` | Not applicable — desktop agent-runtime is always alive while app is open |
 | **Cancel** | `GetSessionState` RPC → if task: proxy `CancelTask` RPC; if not: cancel session in DynamoDB | `GetSessionState` stdio RPC → if task: `CancelTask` stdio RPC; if not: cancel via Session Service HTTP |
 | **Approve** | Proxy `ApproveAction` RPC to sandbox | `ApproveAction` stdio RPC |
 | **Events** | Proxy agent SSE → filter to allowed types → push to client SSE | Receive stdio notifications → filter to allowed types → push to renderer via IPC |
 | **List workspaces, history** | Direct DynamoDB / Workspace Service | HTTP to Session Service / Workspace Service |
 
-The desktop main process only calls Session Service HTTP for operations the agent-runtime doesn't handle: listing workspaces, fetching session history for UI display, session resume, and session cancel (when no task is running).
+The desktop main process only calls Session Service HTTP for operations the agent-runtime doesn't handle: listing workspaces, fetching session history for UI display, and session cancel (when no task is running). The "sandbox dead" path is web-only — on desktop, the agent-runtime process lives as long as the app is open.
 
 ---
 
@@ -522,16 +549,32 @@ sequenceDiagram
     SS-->>Web: SSE: { type: "tool_completed", output: "Done" }
     SS-->>Web: SSE: { type: "task_completed", taskId: "task_789" }
 
-    Note over Web: User sends follow-up message
+    Note over Web: User sends follow-up (sandbox still alive)
     Web->>SS: POST /sessions/{id}/messages { prompt: "Add tests" }
     SS->>Agent: GetSessionState RPC (check no task running)
     Agent-->>SS: { hasActiveTask: false }
     SS->>SS: Create task record in DynamoDB
     SS->>Agent: StartTask RPC { taskId, prompt }
-    SS-->>Web: 200 { taskId: "task_2" }
+    SS-->>Web: 200 { taskId: "task_2", status: "running" }
 
     SS-->>Web: SSE: { type: "text_chunk", content: "Adding tests..." }
     SS-->>Web: SSE: { type: "task_completed", taskId: "task_2" }
+
+    Note over Agent: Sandbox terminates (idle timeout)
+
+    Note over Web: User returns later, sends message (sandbox dead)
+    Web->>SS: POST /sessions/{id}/messages { prompt: "Now deploy it" }
+    SS->>SS: Session is SANDBOX_TERMINATED
+    SS->>SS: New token, create task, → SANDBOX_PROVISIONING
+    SS->>SQS: Publish with bundled task
+    SS-->>Web: 200 { taskId: "task_3", status: "provisioning" }
+
+    Note over Web: Connect /stream, wait for events
+    Agent->>SQS: ReceiveMessage (new worker)
+    Agent->>SS: POST /sessions/{id}/register
+    Agent->>Agent: load history + download workspace + auto-start task
+    SS-->>Web: SSE: { type: "text_chunk", content: "Deploying..." }
+    SS-->>Web: SSE: { type: "task_completed", taskId: "task_3" }
 ```
 
 ## Desktop Session Lifecycle
@@ -676,7 +719,8 @@ Desktop gains value in **Stage 3** when IPC handlers are refactored to the simpl
 **Definition of done:**
 - `POST /sessions` with `prompt` creates session + task record and includes task in SQS message
 - `POST /sessions` without `prompt` behaves identically to today (no regression)
-- `POST /messages` checks agent state via `GetSessionState`, creates task, proxies `StartTask`, returns `{ taskId }`
+- `POST /messages` with active sandbox: checks agent state via `GetSessionState`, creates task, proxies `StartTask`, returns `{ taskId, status: "running" }`
+- `POST /messages` with dead sandbox: generates new token, creates task, transitions to `SANDBOX_PROVISIONING`, publishes SQS with bundled task, returns `{ taskId, status: "provisioning" }`
 - `POST /cancel` auto-detects task vs session cancel via `GetSessionState`
 - `POST /approve` proxies `ApproveAction` and returns agent-runtime response
 - `GET /stream` filters events to allow-list, retries proxy resolution during provisioning, closes on timeout
@@ -686,7 +730,8 @@ Desktop gains value in **Stage 3** when IPC handlers are refactored to the simpl
 - Unit tests for all new endpoints (Session Service)
 - Unit tests for SQS task parsing and auto-start (agent runtime)
 - E2E test: `POST /sessions` with prompt → `/stream` SSE → events arrive → `task_completed`
-- E2E test: `POST /sessions` without prompt → `/messages` → events → `task_completed`
+- E2E test: `POST /sessions` without prompt → `/messages` (sandbox alive) → events → `task_completed`
+- E2E test: `/messages` on terminated session → re-provisions via SQS → events arrive → `task_completed`
 - `make check` passes on session-service, agent-runtime, cowork-platform
 
 ### Stage 2: Web App
@@ -759,4 +804,4 @@ Desktop gains value in **Stage 3** when IPC handlers are refactored to the simpl
 
 **Raw events on `/stream`**: No. `GET /sessions/{id}/events` already serves raw unfiltered events. Two endpoints, clear purpose — `/stream` for frontends, `/events` for debugging.
 
-**`POST /sessions/{id}/resume` with prompt**: Yes — consistent with the bundled task pattern on `POST /sessions`. When a user resumes a session with a message, one call handles both resumption and task start. `POST /sessions/{id}/resume` accepts an optional `prompt` + `taskOptions`, same as `POST /sessions`.
+**No separate `/resume` endpoint**: `POST /sessions/{id}/messages` is the universal entry point for existing sessions. It detects sandbox state internally — if alive, proxies RPC; if dead, re-provisions via SQS with bundled task. The frontend never checks sandbox status. The existing `POST /sessions/{id}/resume` (backend endpoint) is retained for internal use but not exposed as a simplified API.
