@@ -308,23 +308,25 @@ Universal entry point for sending a message to an existing session. Handles all 
 - `409` — a task is already running
 - `502` — agent runtime unreachable (sandbox alive but not responding)
 
-**Internal flow (sandbox alive):**
+**Internal flow:**
 1. Validate session exists and caller owns it
-2. Check session status — sandbox is in an active state (`SANDBOX_READY`, `SESSION_RUNNING`, etc.)
-3. Proxy `GetSessionState` RPC to agent runtime — check if a task is running
-4. If task running → return 409 immediately
-5. Generate `taskId`, create task record in DynamoDB
-6. Proxy `StartTask` JSON-RPC to agent runtime with `{ taskId, prompt, taskOptions }`
-7. Return `{ taskId, status: "running" }`
+2. Check session status:
 
-**Internal flow (sandbox dead):**
-1. Validate session exists and caller owns it
-2. Check session status — sandbox is not active (`SANDBOX_TERMINATED`, `SESSION_COMPLETED`, `SESSION_FAILED`, `SESSION_CANCELLED`)
-3. Generate fresh `registrationToken`
-4. Generate `taskId`, create task record in DynamoDB
-5. Transition session to `SANDBOX_PROVISIONING`
-6. Publish to SQS with bundled task `{ sessionId, registrationToken, task: { taskId, prompt } }`
-7. Return `{ taskId, status: "provisioning" }`
+   **If `SANDBOX_PROVISIONING`** → return 409 "session still provisioning, please wait"
+
+   **If active** (`SANDBOX_READY`, `SESSION_RUNNING`, `WAITING_FOR_*`, `SESSION_PAUSED`):
+   3a. Proxy `GetSessionState` RPC to agent runtime — check if a task is running
+   4a. If task running → return 409 "task already running"
+   5a. Generate `taskId`, create task record in DynamoDB
+   6a. Proxy `StartTask` JSON-RPC to agent runtime with `{ taskId, prompt, taskOptions }`
+   7a. Return `{ taskId, status: "running" }`
+
+   **If ended** (`SANDBOX_TERMINATED`, `SESSION_COMPLETED`, `SESSION_FAILED`, `SESSION_CANCELLED`):
+   3b. Generate fresh `registrationToken`
+   4b. Generate `taskId`, create task record in DynamoDB
+   5b. Transition session to `SANDBOX_PROVISIONING`
+   6b. Publish to SQS with bundled task `{ sessionId, registrationToken, task: { taskId, prompt } }`
+   7b. Return `{ taskId, status: "provisioning" }`
 
 The frontend handles both responses the same way — connect to `GET /stream`, events arrive when the task starts (immediately if alive, after provisioning if dead).
 
@@ -793,6 +795,18 @@ Desktop gains value in **Stage 3** when IPC handlers are refactored to the simpl
 | `cowork-platform` | Frontend event allow-list, updated session creation schema, `/messages` schema | 1 |
 | `cowork-web-app` | New API client, remove JSON-RPC/polling, use `/stream` | 2 |
 | `cowork-desktop-app` | Refactor IPC handlers, event filtering, shared SessionClient | 3 |
+
+---
+
+## Known Gaps and Mitigations
+
+**Orphaned task records on provisioning timeout:** `POST /sessions` with prompt creates the task record immediately. If the sandbox never starts, the provisioning timeout marks the session `SESSION_FAILED` but the task stays in "created" state. **Mitigation:** The lifecycle manager should fail the task record when it fails the session.
+
+**Proxy cache stale after registration:** The proxy endpoint cache (30s TTL) may not reflect a newly registered sandbox. The `/stream` retry (every 2s) reads from cache and may not find the endpoint for up to 30s. **Mitigation:** The registration handler should invalidate the proxy cache for the session ID, so the next `/stream` retry resolves immediately.
+
+**Desktop agent-runtime crash:** If the agent-runtime process crashes, the stdio pipe breaks. The main process needs to detect this. **Mitigation:** Main process listens for process exit/pipe EOF, notifies the renderer with an error event, and offers to restart the agent-runtime. Session history is preserved in Workspace Service.
+
+**Cancel during provisioning:** When a user cancels during `SANDBOX_PROVISIONING`, the SQS message is already published. A worker will pick it up, attempt registration, fail (session is `SESSION_CANCELLED`), and the message goes to DLQ after 3 attempts. This is expected behavior — the DLQ alarm fires but is not a bug.
 
 ---
 
