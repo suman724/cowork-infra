@@ -120,6 +120,29 @@ Note: The main process is a thin forwarder — it sends stdio RPCs and filters e
 
 `/messages` is the universal entry point for existing sessions — it handles active sandboxes (proxy RPC), dead sandboxes (re-provision via SQS), and task-running checks internally. The frontend never checks sandbox state.
 
+### Endpoint Change Summary
+
+| Endpoint | Change | Description |
+|---|---|---|
+| `POST /sessions` | **Modified** | Add optional `prompt` + `taskOptions`. When present, create task record and include in SQS message. |
+| `POST /sessions/{id}/register` | **Modified** | Set `SESSION_RUNNING` (not `SANDBOX_READY`) when session has a bundled task. |
+| `POST /sessions/{id}/messages` | **New** | Universal send message. Detects sandbox state — proxy RPC if alive, re-provision via SQS if dead. |
+| `POST /sessions/{id}/cancel` | **New** | Auto-detects task vs session cancel via `GetSessionState`. Falls back to session cancel if sandbox unreachable. |
+| `POST /sessions/{id}/approve` | **New** | Proxy `ApproveAction` to agent-runtime. No JSON-RPC envelope for frontend. |
+| `GET /sessions/{id}/stream` | **New** | Filtered SSE proxy. Drops internal event types. Bypasses cache during provisioning. |
+| `GET /sessions/{id}` | Unchanged | — |
+| `POST /sessions/{id}/resume` | Unchanged | Retained for internal use. `/messages` handles resume transparently. |
+| `POST /sessions/{id}/tasks` | Unchanged | Internal — called by `/messages` and `POST /sessions` (with prompt) internally. |
+| `POST /sessions/{id}/tasks/{taskId}/complete` | Unchanged | Internal — called by agent-runtime. |
+| `GET /sessions/{id}/tasks` | Unchanged | — |
+| `POST /sessions/{id}/rpc` | Unchanged | Internal/debug — raw JSON-RPC proxy. |
+| `GET /sessions/{id}/events` | Unchanged | Internal/debug — raw unfiltered SSE. |
+| `POST /sessions/{id}/upload` | Unchanged | — |
+| `GET /sessions/{id}/files` | Unchanged | — |
+| `GET /sessions/{id}/files/{path}` | Unchanged | — |
+
+**Total: 2 modified, 4 new, 0 deleted.** All existing endpoints remain for backward compatibility and internal use.
+
 ---
 
 ## Endpoint Changes
