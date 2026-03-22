@@ -203,6 +203,8 @@ Creates a session. If `prompt` is provided, also creates a task record and inclu
 4. Publish to SQS — message includes session config AND task info
 5. Return `{ sessionId, workspaceId, taskId, status }`
 
+Note: If the sandbox never starts (provisioning timeout), the lifecycle manager transitions the session to `SESSION_FAILED` and must also fail the task record to prevent orphaned tasks in "created" state.
+
 **Internal flow (without prompt):**
 Unchanged from today — creates session, publishes to SQS, returns.
 
@@ -366,11 +368,14 @@ Cancel the running task, or cancel the session if no task is running.
 
 **Internal flow:**
 1. Validate session exists and caller owns it
-2. If session status is not active (already terminated/completed/failed/cancelled) → cancel session in DynamoDB → return `{ cancelled: "session" }`
-3. Proxy `GetSessionState` RPC to agent runtime — check if a task is running
-4. If task running → proxy `CancelTask` RPC → return `{ cancelled: "task", taskId }`
-5. If no task running → cancel session in DynamoDB → return `{ cancelled: "session", sessionId }`
-6. If sandbox unreachable (502) → fall back to cancel session in DynamoDB → return `{ cancelled: "session", sessionId }`
+2. If session is `SANDBOX_PROVISIONING` → cancel session in DynamoDB → return `{ cancelled: "session" }`. The SQS message is already published; the worker will attempt registration, fail (session is `SESSION_CANCELLED`), and the message goes to DLQ after 3 attempts. This is expected.
+3. If session is already ended (terminated/completed/failed/cancelled) → return `{ cancelled: "session" }`
+4. Proxy `GetSessionState` RPC to agent runtime — check if a task is running
+5. If task running → proxy `CancelTask` RPC → return `{ cancelled: "task", taskId }`
+6. If no task running → cancel session in DynamoDB → return `{ cancelled: "session", sessionId }`
+7. If sandbox unreachable (502) → fall back to cancel session in DynamoDB → return `{ cancelled: "session", sessionId }`
+
+If a bundled task was created with the session, the cancel should also fail the task record to prevent orphaned tasks.
 
 ### POST /sessions/{id}/approve
 
@@ -617,6 +622,8 @@ sequenceDiagram
 
 Note: The main process does not call Session Service for session/task creation — the agent-runtime handles that internally via its `SessionClient`. The main process forwards stdio RPCs, checks agent state, and filters events. It only calls Session Service directly for UI queries (list workspaces, fetch history).
 
+**Crash recovery:** If the agent-runtime process crashes (pipe EOF), the main process detects it, pushes an error event to the renderer, and offers to restart. Session history is preserved in Workspace Service — the user can restart the agent and resume.
+
 ## Approval Flow
 
 ```mermaid
@@ -680,9 +687,11 @@ When the frontend connects to `/stream` while the sandbox is still provisioning,
 
 1. Checks session status
 2. If `SANDBOX_PROVISIONING` or `SANDBOX_READY` with no sandbox endpoint yet — holds the connection open
-3. Periodically retries resolving the sandbox endpoint (every 2s, from DynamoDB cache)
-4. Once sandbox is registered — starts proxying agent SSE events
+3. Periodically retries resolving the sandbox endpoint (every 2s, **directly from DynamoDB** — no cache). Proxy cache is bypassed for provisioning/ready states because the cache is per-instance and the registration may have been handled by a different Session Service instance.
+4. Once sandbox endpoint is found — starts proxying agent SSE events (with `since=0` to replay all buffered events)
 5. Events from the auto-started task arrive immediately (the sandbox started working as soon as it registered)
+
+Once the session reaches `SESSION_RUNNING`, subsequent `/stream` reconnects use the normal proxy cache (endpoint is stable).
 
 This is a lightweight retry on the proxy resolution, not a notification system. The retry loop is bounded by the session's provisioning timeout (180s). If the sandbox never registers, the SSE connection returns an error event and closes.
 
@@ -729,6 +738,9 @@ Desktop gains value in **Stage 3** when IPC handlers are refactored to the simpl
 - Agent runtime auto-starts bundled task after registration + workspace download
 - Registration sets `SESSION_RUNNING` when bundled task exists, `SANDBOX_READY` otherwise
 - All existing endpoints unchanged (backward compatible)
+- Lifecycle manager fails orphaned task records when session fails (provisioning timeout)
+- Proxy cache bypassed during provisioning/ready states (multi-instance safe)
+- Cancel during provisioning marks session cancelled + fails bundled task record
 - Unit tests for all new endpoints (Session Service)
 - Unit tests for SQS task parsing and auto-start (agent runtime)
 - E2E test: `POST /sessions` with prompt → `/stream` SSE → events arrive → `task_completed`
@@ -770,6 +782,7 @@ Desktop gains value in **Stage 3** when IPC handlers are refactored to the simpl
 - Events filtered using the same allow-list from `cowork-platform`
 - Shared `SessionClient` interface used by both web and desktop React components
 - Desktop app works end-to-end: create session → send message → approve tool → cancel
+- Agent-runtime crash detected (pipe EOF) → error event to renderer → restart offered
 - No regression in existing desktop functionality
 - All existing tests passing
 
