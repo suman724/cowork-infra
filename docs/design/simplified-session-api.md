@@ -126,8 +126,8 @@ Note: The main process is a thin forwarder — it sends stdio RPCs and filters e
 |---|---|---|
 | `POST /sessions` | **Modified** | Add optional `prompt` + `taskOptions`. When present, create task record and include in SQS message. |
 | `POST /sessions/{id}/register` | **Modified** | Set `SESSION_RUNNING` (not `SANDBOX_READY`) when session has a bundled task. |
-| `POST /sessions/{id}/messages` | **New** | Universal send message. Detects sandbox state — proxy RPC if alive, re-provision via SQS if dead. |
-| `POST /sessions/{id}/cancel` | **New** | Auto-detects task vs session cancel via `GetSessionState`. Falls back to session cancel if sandbox unreachable. |
+| `POST /sessions/{id}/messages` | **New** | Universal send message. If provisioning → 409. If active → `GetSessionState` check, create task record, proxy `StartTask`. If ended → new token, create task record, re-provision via SQS with bundled task. |
+| `POST /sessions/{id}/cancel` | **New** | If provisioning → cancel session + fail bundled task. If active → `GetSessionState` check, cancel task or session. If ended → return cancelled. If unreachable → fall back to session cancel. |
 | `POST /sessions/{id}/approve` | **New** | Proxy `ApproveAction` to agent-runtime. No JSON-RPC envelope for frontend. |
 | `GET /sessions/{id}/stream` | **New** | Filtered SSE proxy. Drops internal event types. Bypasses cache during provisioning. |
 | `GET /sessions/{id}` | Unchanged | — |
