@@ -151,7 +151,9 @@ This data enables a smooth backfill into a graph database in Phase 2 without ret
 - (-) No relationship traversal or contradiction resolution until Phase 2
 - (-) Multi-hop queries ("user worked on Team Alpha → Team Alpha owns billing → user has billing context") not possible until Phase 2
 
-**Phase 2 adds**: Graph database (FalkorDB or Neo4j), bi-temporal fact tracking, contradiction resolution via graph, hybrid retrieval (vector + BM25 + graph traversal). Graphiti (MIT license) is the reference implementation.
+**Phase 1 includes**: Hybrid search (vector similarity + BM25 keyword search) combined via Reciprocal Rank Fusion (RRF). Both MongoDB Atlas and OpenSearch support this natively.
+
+**Phase 2 adds**: Graph database (FalkorDB or Neo4j), bi-temporal fact tracking, contradiction resolution via graph, graph traversal as a third retrieval signal alongside existing vector + BM25. Graphiti (MIT license) is the reference implementation.
 
 ---
 
@@ -516,8 +518,8 @@ sequenceDiagram
 
     AH->>MS: POST /v1/memories/search<br/>{query: user_prompt, tenant_id,<br/>user_id, agent_id, top_k: 10}
 
-    MS->>MS: Vector search<br/>(filter: tenant_id + applicable scopes)
-    MS->>MS: Optional rerank
+    MS->>MS: Hybrid search: vector + BM25<br/>(filter: tenant_id + applicable scopes)
+    MS->>MS: Combine via RRF + optional rerank
     MS->>MS: Update last_accessed_at
 
     MS-->>AH: {results: [{content, scope,<br/>memory_type, relevance, recency}]}
@@ -911,6 +913,7 @@ Error codes: `MEMORY_NOT_FOUND`, `INVALID_REQUEST`, `TENANT_NOT_FOUND`, `RATE_LI
     "memory_types": ["semantic", "procedural"],
     "top_k": 10,
     "threshold": 0.3,
+    "search_mode": "hybrid",
     "rerank": false,
     "filters": {
         "metadata.categories": {"$in": ["language_preference", "development"]}
@@ -929,6 +932,8 @@ Error codes: `MEMORY_NOT_FOUND`, `INVALID_REQUEST`, `TENANT_NOT_FOUND`, `RATE_LI
             "memory_type": "semantic",
             "scores": {
                 "relevance": 0.92,
+                "keyword": 0.78,
+                "combined": 0.88,
                 "recency": 0.85
             },
             "entities": [
@@ -944,6 +949,30 @@ Error codes: `MEMORY_NOT_FOUND`, `INVALID_REQUEST`, `TENANT_NOT_FOUND`, `RATE_LI
     "query_time_ms": 45
 }
 ```
+
+**Search modes** (`search_mode` field):
+
+| Mode | Behavior | Default |
+|---|---|---|
+| `hybrid` | Vector similarity + BM25 keyword search, combined via Reciprocal Rank Fusion (RRF) | **Yes** |
+| `vector` | Vector similarity only (cosine) | No |
+| `keyword` | BM25 keyword search only | No |
+
+**Hybrid search flow:**
+1. Run vector search (cosine similarity on embeddings) → ranked list A
+2. Run BM25 keyword search (on `content` field) → ranked list B
+3. Combine via RRF: `score = Σ 1/(k + rank)` for each result across both lists (k=60, standard constant)
+4. Return top-K by combined score
+
+Both MongoDB Atlas (`$vectorSearch` + `$search`) and OpenSearch (k-NN + BM25) support this natively on the same collection/index. No additional infrastructure.
+
+**Scores returned per result:**
+- `relevance`: cosine similarity from vector search
+- `keyword`: BM25 score from keyword search (0.0 if result only matched vector search)
+- `combined`: RRF combined score
+- `recency`: derived from timestamps
+
+**Optional cross-encoder reranking** (`rerank: true`): After RRF combination, pass top-N candidates to a cross-encoder model for more accurate ranking. Adds ~100-200ms latency. Caller opts in per request.
 
 ---
 
@@ -1322,7 +1351,8 @@ Everything needed for agents to use persistent memory end-to-end. Ships as one u
 - MongoDB Atlas vector store (primary)
 - OpenSearch vector store (secondary, switchable via env var)
 - ENN/ANN switching per tenant (default ENN, flip at ~10K memories)
-- Reranker support (optional, caller opts in)
+- Hybrid search: vector similarity + BM25 keyword search combined via Reciprocal Rank Fusion (RRF). Both MongoDB Atlas and OpenSearch support this natively on the same collection/index — no additional infrastructure.
+- Cross-encoder reranker support (optional, caller opts in)
 - Rate limiting / quotas per tenant
 - GDPR user deletion (purge user-scoped memories, preserve tenant-level)
 - Audit event emission via structured logs
@@ -1343,12 +1373,12 @@ See [memory-service-implementation.md](memory-service-implementation.md) for the
 
 ### Phase 2 — Context Graph
 
-Adds relationship traversal, temporal fact tracking, and contradiction resolution.
+Adds relationship traversal, temporal fact tracking, and contradiction resolution. BM25 hybrid search is already in Phase 1 — Phase 2 adds graph traversal as a third retrieval signal.
 
 - Graph database integration (FalkorDB or Neo4j — selection TBD)
 - Graphiti-based temporal knowledge graph (bi-temporal: `valid_from`/`valid_until` + `ingested_at`/`expired_at`)
 - Automated contradiction detection and resolution (invalidate old facts, never hard-delete)
-- Hybrid retrieval: vector similarity + BM25 keyword search + graph traversal
+- Graph traversal retrieval: find related memories via entity relationships (adds to existing vector + BM25 hybrid)
 - Entity deduplication via graph-based resolution
 - Backfill existing memories into graph using entity + temporal metadata captured in Phase 1
 
