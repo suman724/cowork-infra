@@ -135,11 +135,45 @@ flowchart TD
   output["output/<br/><small>formatting<br/>truncation</small>"]
   platform["platform/<br/><small>OS abstraction</small>"]
 
-  router --> nav & click & type & sel & scroll & back & extract & ss & submit & dl & wait
-  nav & click & type & sel & scroll & back & extract & ss & submit & dl & wait --> bm
-  nav & click & type & extract & submit --> dom
-  nav & click & type & extract --> ps
-  click & type & submit --> sd
+  router --> nav
+  router --> click
+  router --> type
+  router --> sel
+  router --> scroll
+  router --> back
+  router --> extract
+  router --> ss
+  router --> submit
+  router --> dl
+  router --> wait
+
+  nav --> bm
+  click --> bm
+  type --> bm
+  sel --> bm
+  scroll --> bm
+  back --> bm
+  extract --> bm
+  ss --> bm
+  submit --> bm
+  dl --> bm
+  wait --> bm
+
+  nav --> dom
+  click --> dom
+  type --> dom
+  extract --> dom
+  submit --> dom
+
+  nav --> ps
+  click --> ps
+  type --> ps
+  extract --> ps
+
+  click --> sd
+  type --> sd
+  submit --> sd
+
   ss --> output
   dl --> platform
   dl --> output
