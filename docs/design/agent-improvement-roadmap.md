@@ -18,84 +18,117 @@ The roadmap is informed by:
 
 ---
 
-## Phase A — Tooling, MCP & Plan Quality
+## Phase A — Plan Quality, Tool Execution & Tooling Expansion
 
-**Goal:** Expand the agent's tool capabilities and fix critical gaps in how sub-agents interact with plans.
+**Goal:** Fix critical gaps in plan+sub-agent execution, improve the tool execution pipeline, expand tooling with browser automation, and enable third-party tool integration via MCP.
 
-**Why first:** Tools are the agent's hands. MCP enables third-party integrations. Plan+sub-agent fixes ensure multi-step tasks execute reliably. Everything else builds on these.
+**Execution order:** Plan+sub-agent fixes first (quick wins, high impact on task quality), then tool execution improvements, then browser automation, then MCP client last (most complex, builds on everything else).
 
-### A1: MCP Client
+### A1: Add "failed" Status to PlanStep
 
-**Repo:** `cowork-agent-runtime` (tool_runtime/mcp/)
-**Design doc:** `local-tool-runtime.md` Section 9
+**Repo:** `cowork-agent-sdk`
+**Design doc:** `plan-subagent-improvements.md`
 
-Enables the agent to use tools from remote MCP servers — third-party APIs, custom tools, enterprise integrations — without modifying the agent runtime.
-
-**What to build:**
-- MCP server connection over streamable HTTP
-- Tool manifest discovery and translation to ToolDefinition format
-- Namespace prefixing: `{serverName}/{toolName}` to avoid collisions
-- Per-tool timeout and output truncation (same as built-in tools)
-- Policy bundle allowlisting of MCP tools
-- Connection resilience: retry with exponential backoff, mark unavailable after sustained failures
-- Token-based authentication (credentials in policy bundle or workspace config)
-
-**Acceptance criteria:**
-- Agent can discover and call tools from a remote MCP server
-- MCP tools appear in tool definitions sent to LLM with namespace prefix
-- Policy enforcer gates MCP tools the same as built-in tools
-- Connection failure doesn't crash the agent — tools marked unavailable, reconnect on retry
-- Unit tests with mock MCP server, integration test with real MCP server
-
-### A2: Browser Automation
-
-**Repo:** `cowork-agent-runtime` (tool_runtime/tools/browser/)
-**Design doc:** `browser-automation.md`
-
-Adds 11 browser tools using Playwright for web research, form filling, and multi-step workflows with human-in-the-loop oversight.
+PlanStep only has `pending`, `in_progress`, `completed`, `skipped`. No way to represent failure.
 
 **What to build:**
-- BrowserManager: Playwright lifecycle (lazy launch, idle timeout, session-end cleanup)
-- DomService: Accessibility tree extraction with indexed interactive elements
-- PageState: Token-efficient page representation for LLM
-- 11 tools: Navigate, Click, Type, Select, Scroll, Back, Extract, Screenshot, Submit, Download, Wait
-- SensitiveDetector: Password fields, destructive buttons, payment forms
-- Three-tier HITL: domain approval → sensitive action detection → submission checkpoints
-- User takeover: pause agent, user interacts with headed browser, resume
-- Session persistence: cookies/localStorage saved per workspace
-- Session-scoped opt-in: browser tools only available when user enables toggle + policy grants `Browser.*`
+- Add `"failed"` to PlanStep status literal type
+- Update `UpdatePlanStep` tool to accept `"failed"` status
+- Update plan rendering to show failed steps distinctly
 
 **Acceptance criteria:**
-- Agent can navigate to a URL, extract information, fill forms, click buttons
-- HITL approval triggers for new domains, sensitive actions, and form submissions
-- User can pause and interact with the browser directly
-- Browser state persists across Cowork sessions within the same workspace
-- No browser resources allocated until first browser tool call (lazy launch)
+- Agent can mark a step as failed
+- Failed steps render visibly in working memory
+- Plan continuation logic treats failed steps same as completed/skipped (not blocking)
 
-### A3: Streaming Tool Output
+### A2: Pass Plan Context to Sub-agents
+
+**Repo:** `cowork-agent-runtime`
+**Design doc:** `plan-subagent-improvements.md`
+
+Sub-agents have zero visibility into the parent's plan.
+
+**What to build:**
+- Include parent plan summary in sub-agent context: goal, all steps with status, current step highlighted
+- Fix `EnterPlanMode` tool description (currently misleading — says "only read-only tools" but SpawnAgent is available)
+- Add system prompt guidance for delegation during plan execution
+
+**Acceptance criteria:**
+- Sub-agent's system prompt includes parent plan context
+- Sub-agent output is relevant to the specific plan step it's executing
+
+### A3: Auto-Update Plan Step on Sub-agent Return
+
+**Repos:** `cowork-agent-sdk`, `cowork-agent-runtime`
+**Design doc:** `plan-subagent-improvements.md`
+
+When a sub-agent completes work for a plan step, the parent must manually call `UpdatePlanStep`. The LLM often forgets.
+
+**What to build:**
+- `SpawnAgent` gains optional `planStepIndex` parameter
+- On sub-agent completion: auto-call `UpdatePlanStep(planStepIndex, "completed")`
+- On sub-agent failure: auto-call `UpdatePlanStep(planStepIndex, "failed")` (uses A1)
+- Emit `plan_updated` event after auto-update
+
+**Acceptance criteria:**
+- Plan step status updates automatically when sub-agent returns
+- Parent doesn't need to remember to call `UpdatePlanStep`
+- Works for both successful and failed sub-agents
+
+### A4: Improve Sub-agent Result Handling
+
+**Repo:** `cowork-agent-runtime`
+**Design doc:** `plan-subagent-improvements.md`
+
+Sub-agent results are truncated to 2000 characters. Complex work output is lost.
+
+**What to build:**
+- Increase default result limit to 8000 characters
+- For results exceeding the limit: write full result to workspace file, return file path + summary
+
+**Acceptance criteria:**
+- Sub-agent results not silently truncated
+- Parent can access full results via workspace file if needed
+
+### A5: Pass Read-Only Working Memory to Sub-agents
+
+**Repo:** `cowork-agent-runtime`
+**Design doc:** `plan-subagent-improvements.md`
+
+Sub-agents start with empty working memory — no task tracker, no notes, no plan context.
+
+**What to build:**
+- Read-only snapshot of parent's working memory at spawn time
+- Include in sub-agent's system prompt as context
+- Contains: task tracker summary, notes
+
+**Acceptance criteria:**
+- Sub-agent sees parent's task list and notes
+- Sub-agent cannot corrupt parent's working memory
+
+### A6: Streaming Tool Output
 
 **Repos:** `cowork-agent-runtime`, `cowork-agent-sdk`
-**Design doc:** `local-agent-host.md` (Phase 2 item)
+**Design doc:** `tool-execution-improvements.md`
 
-Long-running shell commands currently block until completion. Users see nothing until the command finishes.
+Long-running shell commands block until completion. Users see nothing until the command finishes.
 
 **What to build:**
 - Callback-based output streaming from RunCommand
 - Output chunks emitted as events (new `tool_output_chunk` event type)
 - Final result still assembled for thread history
-- Timeout still applies to total execution time
 
 **Acceptance criteria:**
-- User sees incremental output from long-running commands (e.g., `npm install`, `make build`)
+- User sees incremental output from long-running commands
 - Output chunks appear in SSE stream
-- Final output in thread history is complete (not just chunks)
+- Final output in thread history is complete
 
-### A4: Force Cancellation with Hard Timeout
+### A7: Force Cancellation with Hard Timeout
 
 **Repo:** `cowork-agent-runtime`
-**Design doc:** `local-agent-host.md` (Phase 2 item)
+**Design doc:** `tool-execution-improvements.md`
 
-Currently, tool cancellation is cooperative — if a tool ignores the cancellation event, it runs indefinitely.
+Tool cancellation is cooperative — a runaway tool runs indefinitely.
 
 **What to build:**
 - Configurable hard timeout per tool type (default: 300s for shell, 30s for code)
@@ -107,109 +140,71 @@ Currently, tool cancellation is cooperative — if a tool ignores the cancellati
 - Partial output captured and returned to LLM
 - No zombie processes left behind
 
-### A5: Shell Argument Inspection
+### A8: Shell Argument Inspection
 
 **Repo:** `cowork-agent-runtime`
-**Design doc:** `local-tool-runtime.md` (Phase 2 item)
+**Design doc:** `tool-execution-improvements.md`
 
-Currently, policy only inspects the base command (e.g., `rm`). Cannot distinguish `rm -rf /` from `rm temp.txt`.
+Policy only inspects the base command. Cannot distinguish `rm -rf /` from `rm temp.txt`.
 
 **What to build:**
 - Argument pattern matching in PolicyEnforcer
-- Capability `allowedCommands` extended with regex patterns that include arguments
-- Risk assessor considers arguments (e.g., `rm -rf` = high risk, `rm <specific-file>` = low risk)
+- Capability `allowedCommands` extended with patterns that include arguments
+- Risk assessor considers arguments
 
 **Acceptance criteria:**
 - Policy can allow `git *` but block `git push --force`
 - Risk assessment elevates destructive argument patterns
 
-### A6: Pass Plan Context to Sub-agents
+### A9: Browser Automation
 
-**Repo:** `cowork-agent-runtime`
+**Repo:** `cowork-agent-runtime` (tool_runtime/tools/browser/)
+**Design doc:** `browser-automation.md`
 
-**Problem:** Sub-agents have zero visibility into the parent's plan. They don't know which step they're working on, what the overall goal is, or what other steps exist.
-
-**What to build:**
-- When spawning a sub-agent during plan execution, include in the sub-agent's context:
-  - The parent plan's goal
-  - The current step description and index
-  - Summary of completed steps (what was already done)
-  - Summary of remaining steps (what comes after)
-- Context injected via the existing `context` parameter in `spawn_sub_agent()`
-
-**Acceptance criteria:**
-- Sub-agent's system prompt includes parent plan context
-- Sub-agent output is relevant to the specific plan step it's executing
-- No changes to LoopContext protocol or sub-agent isolation model
-
-### A7: Auto-Update Plan Step on Sub-agent Return
-
-**Repos:** `cowork-agent-sdk`, `cowork-agent-runtime`
-
-**Problem:** When a sub-agent completes work for a plan step, the parent must manually call `UpdatePlanStep`. The LLM often forgets, leaving steps stuck in "in_progress."
+11 browser tools using Playwright for web research, form filling, and multi-step workflows.
 
 **What to build:**
-- When `SpawnAgent` is called with a `planStepIndex` parameter, register a callback
-- On sub-agent completion: if result.status == "completed", auto-call `UpdatePlanStep(planStepIndex, "completed")`
-- On sub-agent failure: auto-call `UpdatePlanStep(planStepIndex, "failed")` (requires A8)
-- Emit `plan_updated` event after auto-update
-- Parent LLM sees the updated plan in working memory on next turn
+- BrowserManager: Playwright lifecycle (lazy launch, idle timeout, session-end cleanup)
+- DomService: Accessibility tree extraction with indexed interactive elements
+- PageState: Token-efficient page representation for LLM
+- 11 tools: Navigate, Click, Type, Select, Scroll, Back, Extract, Screenshot, Submit, Download, Wait
+- SensitiveDetector: Password fields, destructive buttons, payment forms
+- Three-tier HITL: domain approval → sensitive action detection → submission checkpoints
+- User takeover: pause agent, interact with headed browser, resume
+- Session persistence: cookies/localStorage saved per workspace
+- Session-scoped opt-in: browser tools only when user enables toggle + policy grants `Browser.*`
 
 **Acceptance criteria:**
-- Plan step status updates automatically when sub-agent returns
-- Parent doesn't need to remember to call `UpdatePlanStep`
-- LLM can still manually call `UpdatePlanStep` to override if needed
-- Works for both successful and failed sub-agents
+- Agent can navigate to a URL, extract information, fill forms, click buttons
+- HITL approval triggers for new domains, sensitive actions, and form submissions
+- User can pause and interact with the browser directly
+- Browser state persists across Cowork sessions within the same workspace
+- No browser resources allocated until first browser tool call (lazy launch)
 
-### A8: Add "failed" Status to PlanStep
+### A10: MCP Client
 
-**Repo:** `cowork-agent-sdk`
+**Repo:** `cowork-agent-runtime` (tool_runtime/mcp/)
+**Design doc:** `mcp-client.md`
 
-**Problem:** PlanStep only has `pending`, `in_progress`, `completed`, `skipped`. No way to represent failure. A failed sub-agent leaves the step stuck in "in_progress" forever.
+Enables the agent to use tools from remote MCP servers — third-party APIs, custom tools, enterprise integrations.
 
 **What to build:**
-- Add `"failed"` to PlanStep status literal type
-- Update `UpdatePlanStep` tool to accept `"failed"` status
-- Update plan rendering to show failed steps distinctly
-- Update ReactLoop plan continuation logic — failed steps are treated as "not incomplete" (don't block completion)
+- MCP 2025-11-25 spec: Streamable HTTP transport, session management, tool annotations
+- Tool manifest discovery with pagination and list change notifications
+- Namespace prefixing: `{serverName}/{toolName}`
+- Per-tool timeout, output truncation, response size cap (10MB)
+- Policy bundle: `mcpServers` config with `MCP.{serverName}` capability mapping
+- Per-server circuit breaker (5 failures → open, 30s → half-open)
+- Bearer token auth via Secrets Manager (web) or env var (desktop)
+- Response translation: text, structured content, image, audio, resource links, error
 
 **Acceptance criteria:**
-- Agent can mark a step as failed
-- Failed steps render visibly in working memory
-- Plan continuation logic treats failed steps same as completed/skipped (not blocking)
-
-### A9: Improve Sub-agent Result Handling
-
-**Repo:** `cowork-agent-runtime`
-
-**Problem:** Sub-agent results are truncated to 2000 characters. Complex work output is lost.
-
-**What to build:**
-- Increase default result limit to 8000 characters
-- For results exceeding the limit: write full result to a workspace file, return file path + summary
-- Sub-agent result includes structured fields: `{ status, summary, full_result_path?, steps, artifacts? }`
-
-**Acceptance criteria:**
-- Sub-agent results not silently truncated
-- Parent can access full results via workspace file if needed
-- LLM sees a useful summary even for large results
-
-### A10: Pass Read-Only Working Memory to Sub-agents
-
-**Repo:** `cowork-agent-runtime`
-
-**Problem:** Sub-agents start with empty working memory — no task tracker, no notes, no plan context beyond what A6 provides.
-
-**What to build:**
-- Create a read-only snapshot of parent's working memory at spawn time
-- Include in sub-agent's system prompt as context (not as editable working memory)
-- Contains: task tracker summary, notes, plan overview
-- Sub-agent cannot modify parent's working memory
-
-**Acceptance criteria:**
-- Sub-agent sees parent's task list, notes, and plan context
-- Sub-agent cannot corrupt parent's working memory
-- Context is a snapshot (not live — no synchronization needed)
+- Agent can discover and call tools from a remote MCP server
+- MCP tools appear in tool definitions sent to LLM with namespace prefix
+- Policy enforcer gates MCP tools the same as built-in tools
+- Connection failure doesn't crash the agent — circuit breaker, graceful degradation
+- Tool annotations (readOnlyHint, destructiveHint) influence policy decisions
+- Unit tests with mock MCP server, integration test with real MCP server
 
 ---
 
@@ -472,17 +467,17 @@ Real-time file change detection for GetPatchPreview. Currently uses in-memory li
 ## Dependency Graph
 
 ```
-Phase A (Tooling + Plan Quality)
-  ├── A1 (MCP) ─────────────────────────────────────────────┐
-  ├── A2 (Browser) ──────────────────────────────────────────┤
-  ├── A3 (Streaming output) ─────────────────────────────────┤
-  ├── A4 (Force cancel) ─────────────────────────────────────┤
-  ├── A5 (Shell args) ──────────────────────────────────────┤
-  ├── A6 (Plan context to sub-agents) ──┐                    │
-  ├── A7 (Auto plan step update) ───────┤ depends on A8      │
-  ├── A8 (Failed status for PlanStep) ──┘                    │
-  ├── A9 (Sub-agent results) ───────────────────────────────┤
-  └── A10 (Read-only working memory) ───────────────────────┘
+Phase A (Plan Quality + Tool Execution + Tooling Expansion)
+  ├── A1 (Failed status for PlanStep) ──┐
+  ├── A2 (Plan context to sub-agents) ──┤
+  ├── A3 (Auto plan step update) ───────┤ depends on A1
+  ├── A4 (Sub-agent results) ──────────┤
+  ├── A5 (Read-only working memory) ───┘
+  ├── A6 (Streaming output) ─────────────────────────────────┐
+  ├── A7 (Force cancel) ─────────────────────────────────────┤
+  ├── A8 (Shell args) ──────────────────────────────────────┤
+  ├── A9 (Browser) ──────────────────────────────────────────┤
+  └── A10 (MCP) ─────────────────────────────────────────────┘
                                                               │
 Phase B (Loop Quality) ──────────────────────────────────────┘
   ├── B1 (Sprint contracts) ──┐
@@ -505,7 +500,7 @@ Phase D (Memory & Services) ← depends on C2 for auth
   ├── D2 (OneDrive) ← depends on C2 for EntraID SSO
   └── D3 (Agent Teams) ← depends on B3 (evaluator pattern)
 
-Phase E (Sub-agent improvements) ← depends on A6-A10
+Phase E (Sub-agent improvements) ← depends on A1-A5
   ├── E1 (Adaptive steps)
   ├── E2 (Skill nesting)
   ├── E3 (Per-capability budgets)
@@ -531,8 +526,8 @@ Phase G (UI) ← depends on C3 (simplified API)
 
 These tracks can run concurrently:
 
-**Track 1 — Agent Quality:** A6→A7→A8→A9→A10 → B1→B3→B4
-**Track 2 — Tooling:** A1 (MCP) → A2 (Browser) → A3 (Streaming) → A4 (Force cancel) → A5 (Shell args)
+**Track 1 — Plan Quality:** A1→A2→A3→A4→A5 → B1→B3→B4
+**Track 2 — Tool Execution & Tooling:** A6 (Streaming) → A7 (Force cancel) → A8 (Shell args) → A9 (Browser) → A10 (MCP)
 **Track 3 — Production:** C1→C2→C3→C4
 **Track 4 — Memory:** D1 (Memory Service)
 **Track 5 — Operations:** F1→F2 (can start anytime)
