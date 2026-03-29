@@ -33,6 +33,10 @@ docs/   ← Architecture design docs, ADRs, runbooks, threat models
 - Bucket: `{env}-workspace-artifacts`
 - Object key: `{workspaceId}/{sessionId}/{artifactType}/{artifactId}`
 
+## Capabilities
+
+`File.Read`, `File.Write`, `File.Delete`, `Shell.Exec`, `Network.Http`, `Workspace.Upload`, `BackendTool.Invoke`, `LLM.Call`, `Search.Web`, `Code.Execute`, `Browser.Navigate`, `Browser.Interact`, `Browser.Extract`, `Browser.Submit`, `Browser.Download`
+
 ## Design Docs (in `docs/`)
 
 | Doc | Scope |
