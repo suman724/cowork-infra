@@ -1350,9 +1350,9 @@ The following are explicitly out of scope for Phase B. They may be scheduled in 
 
 ### Implementation Order
 
-Implementation is split into 10 steps matching the B1-B8 roadmap items, plus 2 supporting steps. Each step is independently testable.
+Implementation is split into 12 steps. Each step is independently testable.
 
-**Step 1: Platform contracts (B8 partial)** — `cowork-platform`
+**Step 1: Platform contracts (B8)** — `cowork-platform`
 - Add 5 `Browser.*` capabilities to capability schema + codegen
 - Add browser error codes to `ErrorCode` constants
 - Add browser event types to `EventType` constants
@@ -1409,7 +1409,25 @@ Implementation is split into 10 steps matching the B1-B8 roadmap items, plus 2 s
 - Sensitive approval flow: catches `BrowserSensitiveApprovalRequired`, routes through `ApprovalGate`
 - Submit approval flow: catches `BrowserSubmitApprovalRequired`, routes through `ApprovalGate`
 
-**Step 9: Desktop App integration (B7)** — `cowork-desktop-app`
+**Step 9: Event types + wiring** — `cowork-agent-runtime`
+- `EventEmitter`: Add `emit_browser_started()`, `emit_browser_stopped()`, `emit_browser_page_state()`, `emit_browser_auth_required()`, `emit_browser_takeover_started()`, `emit_browser_takeover_ended()`, `emit_browser_domain_approved()`
+- `BrowserManager` emits lifecycle events via callback to `EventEmitter`
+- Browser tools emit `browser_page_state` after each action (screenshot + URL for side panel)
+
+**Step 10: Session + StartTask plumbing** — `cowork-agent-runtime`
+- `SessionManager.start_task()`: Read `browserEnabled` from `taskOptions`, pass to `LoopRuntime` → `ToolExecutor` → `ToolRouter`
+- `SessionManager`: Wire `browser:pause` / `browser:resume` JSON-RPC methods to `BrowserManager.pause_event`
+- `LoopRuntime`: Pass `browser_enabled` through to `ToolExecutor` on construction
+- System prompt: When browser tools are enabled, add guidance for when to use browser vs file/shell tools
+
+**Step 11: Policy Service** — `cowork-policy-service`
+- Add `Browser.*` capabilities to static policy config schema
+- Add `browserConfig` section: `allowedDomains`, `blockedDomains`, `browserIdleTimeoutSeconds`, viewport settings
+- Session-type awareness: config supports `desktop` vs `sandbox` profiles. Sandbox profile omits `Browser.*` capabilities. Desktop profile includes them (subject to tenant policy).
+- Default policy: browser capabilities disabled (must be explicitly granted per tenant)
+- Tests: policy bundle includes/excludes browser capabilities based on session type and tenant config
+
+**Step 12: Desktop App integration (B7)** — `cowork-desktop-app`
 - `renderer/views/conversation/browser-panel.tsx` — side panel with URL bar, screenshot, action buttons
 - `renderer/components/browser-toggle.tsx` — enable/disable toggle in prompt area
 - `renderer/components/browser-approval.tsx` — 3 approval dialog variants (domain, sensitive, submission)
@@ -1418,11 +1436,9 @@ Implementation is split into 10 steps matching the B1-B8 roadmap items, plus 2 s
 - `shared/ipc-channels.ts` — add browser channel constants
 - Streaming tool output: listen for `tool_output_chunk` events, render in conversation view
 - JSON-RPC: wire `browser:pause/resume` to agent-runtime RPC
-
-**Step 10: Event types + wiring** — `cowork-agent-runtime`
-- `EventEmitter`: Add `emit_browser_started()`, `emit_browser_stopped()`, `emit_browser_page_state()`, `emit_browser_auth_required()`, `emit_browser_takeover_started()`, `emit_browser_takeover_ended()`, `emit_browser_domain_approved()`
-- `BrowserManager` emits lifecycle events via callback to `EventEmitter`
-- Browser tools emit `browser_page_state` after each action (screenshot + URL for side panel)
+- Toggle sends `browserEnabled` in `StartTask` taskOptions
+- Handle `browser_page_state`, `browser_auth_required`, `browser_started`, `browser_stopped` events
+- Handle policy check: gray out toggle if session policy lacks `Browser.*` capabilities
 
 ---
 
@@ -1618,9 +1634,11 @@ Implementation is split into 10 steps matching the B1-B8 roadmap items, plus 2 s
 | **New:** `cowork-desktop-app/src/renderer/components/browser-toggle.tsx` | Toggle in prompt area, grayed if policy denies |
 | **New:** `cowork-desktop-app/src/renderer/components/browser-approval.tsx` | 3 approval dialog variants (domain/sensitive/submission) |
 | **New:** `cowork-desktop-app/src/renderer/state/browser-store.ts` | Zustand store: browserEnabled, browserStatus, currentUrl, currentScreenshot, approvedDomains, panelOpen |
-| `cowork-desktop-app/src/main/ipc-handlers.ts` | Add `browser:*` channel handlers |
+| `cowork-desktop-app/src/main/ipc-handlers.ts` | Add `browser:*` channel handlers, wire pause/resume to JSON-RPC |
 | `cowork-desktop-app/src/shared/ipc-channels.ts` | Add browser channel constants |
 | `cowork-desktop-app/src/renderer/views/conversation/` | Render `tool_output_chunk` events inline (streaming command output from Phase A) |
+| `cowork-desktop-app/src/renderer/views/conversation/` | Toggle sends `browserEnabled` in `StartTask` taskOptions |
+| `cowork-desktop-app/src/renderer/views/conversation/` | Listen for `browser_page_state`, `browser_auth_required`, `browser_started`, `browser_stopped` events |
 
 **Tests:**
 | Test | Assertion |
@@ -1628,14 +1646,18 @@ Implementation is split into 10 steps matching the B1-B8 roadmap items, plus 2 s
 | `test_browser_panel_opens_on_browser_started` | Panel opens when `browser_started` event received |
 | `test_browser_panel_updates_screenshot` | Screenshot updates on `browser_page_state` event |
 | `test_browser_toggle_grayed_without_capability` | Toggle disabled when policy lacks `Browser.*` |
+| `test_browser_toggle_sends_option_in_start_task` | StartTask includes `browserEnabled: true` when toggle on |
 | `test_browser_store_reset_on_session_end` | Store clears on session end |
 | `test_tool_output_chunk_renders_inline` | Streaming output appears in conversation view |
+| `test_browser_auth_required_shows_notification` | Auth required event shows login prompt with Resume button |
 
 **Acceptance criteria:**
 - [ ] Side panel opens on first browser tool, shows URL + screenshot + action buttons
 - [ ] Toggle grayed out if policy doesn't grant `Browser.*`
+- [ ] Toggle sends `browserEnabled: true` in `StartTask` taskOptions
 - [ ] 3 approval dialog variants render correctly with appropriate risk levels
 - [ ] Takeover focuses browser window, Pause suspends agent, Resume continues
+- [ ] Auth required notification shows with Resume button
 - [ ] `tool_output_chunk` events render as streaming output in conversation view
 - [ ] `make check` passes in `cowork-desktop-app`
 
@@ -1668,15 +1690,76 @@ Implementation is split into 10 steps matching the B1-B8 roadmap items, plus 2 s
 
 ---
 
+### Session + StartTask Plumbing
+
+This is not a roadmap item — it's the glue that makes browser tools reachable from the user. Without it, the tools exist but nothing enables them.
+
+**Code changes:**
+| File | Change |
+|------|--------|
+| `cowork-agent-runtime/src/agent_host/session/session_manager.py` | Read `browserEnabled` from `taskOptions` in `start_task()`. Pass to `LoopRuntime` constructor. Wire `browser.pause` / `browser.resume` JSON-RPC methods to `BrowserManager`. |
+| `cowork-agent-runtime/src/agent_host/loop/loop_runtime.py` | Accept `browser_enabled: bool` parameter. Pass to `ToolExecutor` on construction. |
+| `cowork-agent-runtime/src/agent_host/loop/tool_executor.py` | Accept `browser_enabled: bool`. Pass to `ToolRouter` so it conditionally registers browser tools. |
+| `cowork-agent-runtime/src/agent_host/server/handlers.py` | Register `browser.pause` and `browser.resume` JSON-RPC methods. |
+| `cowork-agent-runtime/src/agent_host/loop/system_prompt.py` or equivalent | When browser tools enabled, add guidance: "You have browser tools available. Use them for web research, form filling, and data extraction. For local file work, use the file and shell tools." |
+
+**Tests:**
+| Test | Assertion |
+|------|-----------|
+| `test_start_task_browser_enabled_passes_to_tool_executor` | `browserEnabled: true` in taskOptions → ToolExecutor receives flag |
+| `test_start_task_browser_disabled_by_default` | No `browserEnabled` → browser tools not registered |
+| `test_browser_pause_rpc_sets_event` | `browser.pause` RPC sets BrowserManager pause event |
+| `test_browser_resume_rpc_clears_event` | `browser.resume` RPC clears pause event |
+
+**Acceptance criteria:**
+- [ ] `browserEnabled` flows from `StartTask` → `SessionManager` → `LoopRuntime` → `ToolExecutor` → `ToolRouter`
+- [ ] Browser tools only registered when `browserEnabled=true` AND policy grants `Browser.*`
+- [ ] `browser.pause` / `browser.resume` JSON-RPC methods work
+- [ ] System prompt includes browser guidance when tools enabled
+- [ ] Default is `browserEnabled=false` — zero impact on existing sessions
+- [ ] `make check` passes
+
+---
+
+### Policy Service Updates
+
+The Policy Service must generate policy bundles that include or exclude browser capabilities based on tenant config and session type.
+
+**Code changes:**
+| File | Change |
+|------|--------|
+| `cowork-policy-service/src/policy_service/config/` | Add `browserPolicy` section to static config schema: `enabled` (bool), `allowedDomains`, `blockedDomains`, `browserIdleTimeoutSeconds`, `viewportWidth`, `viewportHeight`, `maxDownloadFileSizeBytes` |
+| `cowork-policy-service/src/policy_service/services/policy_builder.py` | When building policy bundle: if `browserPolicy.enabled=true` AND session type is `desktop`, include 5 `Browser.*` capabilities with scope fields. If session type is `sandbox` or `browserPolicy.enabled=false`, omit. |
+| `cowork-policy-service/src/policy_service/config/default.yaml` (or `.json`) | Add default browser policy: `enabled: false` (must be explicitly enabled per tenant) |
+
+**Tests:**
+| Test | Assertion |
+|------|-----------|
+| `test_policy_bundle_includes_browser_when_enabled` | Desktop session + enabled → 5 Browser.* capabilities in bundle |
+| `test_policy_bundle_excludes_browser_when_disabled` | Disabled → no Browser.* capabilities |
+| `test_policy_bundle_excludes_browser_for_sandbox` | Sandbox session → no Browser.* even if enabled |
+| `test_policy_bundle_browser_domains` | `allowedDomains` and `blockedDomains` flow into capability scope |
+| `test_policy_bundle_browser_defaults` | Missing browser config → no Browser.* (safe default) |
+
+**Acceptance criteria:**
+- [ ] Browser capabilities included in policy bundle only when explicitly enabled AND desktop session
+- [ ] Sandbox sessions never get browser capabilities regardless of config
+- [ ] `allowedDomains`, `blockedDomains`, idle timeout, viewport, download size flow through policy bundle
+- [ ] Default config has browser disabled (zero impact on existing deployments)
+- [ ] `make check` passes in `cowork-policy-service`
+
+---
+
 ### Cross-cutting Requirements
 
-All items (B1-B8):
+All items:
 - [ ] Single feature branch: `feature/phase-b-browser-automation` per repo
-- [ ] `make check` passes in all affected repos
+- [ ] `make check` passes in all affected repos (`cowork-platform`, `cowork-agent-runtime`, `cowork-desktop-app`, `cowork-policy-service`, `cowork-infra`)
 - [ ] No regressions in existing tests
 - [ ] Structured logging with `structlog` for all new code paths
 - [ ] Error handling: browser exceptions mapped to error codes, no unhandled exceptions
 - [ ] Backward compatible: browser tools are opt-in, existing sessions unaffected
 - [ ] SSRF prevention: block `file://`, `javascript:`, `data:`, local/private IPs
 - [ ] Playwright as optional dependency: `pip install cowork-agent-runtime[browser]` extras group
+- [ ] End-to-end testable: user can enable toggle → start task → agent uses browser tools → results shown
 - [ ] PR with squash merge to main after all items complete
