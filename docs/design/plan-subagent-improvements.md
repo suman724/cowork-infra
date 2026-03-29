@@ -9,15 +9,17 @@
 
 ## Problem
 
-Sub-agents are completely isolated from the parent's plan. When the agent follows a multi-step plan and spawns sub-agents to execute steps, five critical gaps cause unreliable execution:
+Sub-agents are completely isolated from the parent's plan. When the agent follows a multi-step plan and spawns sub-agents to execute steps, seven gaps cause unreliable execution:
 
-1. **No plan visibility:** Sub-agent doesn't know which step it's working on or what the overall goal is
-2. **No automatic plan updates:** Parent must manually call `UpdatePlanStep` after sub-agent returns — LLM often forgets, leaving steps stuck in "in_progress"
-3. **No failure state:** PlanStep has no "failed" status — a crashed sub-agent leaves the step permanently stuck
-4. **Truncated results:** Sub-agent output capped at 2000 characters — complex work is silently lost
-5. **No context inheritance:** Sub-agent starts with empty working memory — no visibility into parent's task tracker, notes, or broader plan
+1. **LLM doesn't use SpawnAgent during plans:** The `EnterPlanMode` tool description says "only read-only tools are available" — the LLM interprets this as SpawnAgent being blocked. In reality, SpawnAgent is an agent-internal tool and remains available during plan mode. The description is misleading.
+2. **No system prompt guidance for delegation:** The plan execution guidance never suggests using SpawnAgent to delegate steps. The LLM defaults to doing everything itself.
+3. **No plan visibility:** Sub-agent doesn't know which step it's working on or what the overall goal is
+4. **No automatic plan updates:** Parent must manually call `UpdatePlanStep` after sub-agent returns — LLM often forgets, leaving steps stuck in "in_progress"
+5. **No failure state:** PlanStep has no "failed" status — a crashed sub-agent leaves the step permanently stuck
+6. **Truncated results:** Sub-agent output capped at 2000 characters — complex work is silently lost
+7. **No context inheritance:** Sub-agent starts with empty working memory — no visibility into parent's task tracker, notes, or broader plan
 
-These gaps mean that plan execution with sub-agents is fragile and depends heavily on the LLM remembering to manage plan state manually.
+These gaps mean that plan execution with sub-agents is fragile — the LLM rarely delegates to sub-agents during plans, and when it does, plan state management depends entirely on the LLM remembering to update it manually.
 
 ---
 
@@ -69,6 +71,43 @@ sequenceDiagram
 ---
 
 ## Changes
+
+### Fix: EnterPlanMode Tool Description
+
+**File:** `cowork-agent-runtime/src/agent_host/loop/agent_tools.py`
+
+The `EnterPlanMode` tool description currently says "only read-only tools are available." This is misleading — only external tools are restricted. Agent-internal tools (SpawnAgent, CreatePlan, UpdatePlanStep, memory tools) remain available.
+
+**Current description (inaccurate):**
+```
+Enter plan mode for exploration. Only read-only tools are available.
+```
+
+**Updated description:**
+```
+Enter plan mode for exploration. Only read-only external tools are available
+(ReadFile, ListDirectory, FindFiles, GrepFiles, ViewImage, FetchUrl, WebSearch).
+Agent-internal tools remain available: SpawnAgent, CreatePlan, UpdatePlanStep,
+SaveMemory, RecallMemory, ListMemories.
+```
+
+### Fix: System Prompt Guidance for Delegation
+
+**File:** `cowork-agent-sdk/src/agent_sdk/loop/system_prompt.py`
+
+Add guidance for using SpawnAgent during plan execution. This goes after the existing plan step guidance:
+
+**Add after the existing plan step guidance:**
+```
+- For complex plan steps, you may delegate to a sub-agent using SpawnAgent
+  with the planStepIndex parameter. The sub-agent will receive the plan context
+  and the step will be automatically updated on completion. Use sub-agents for
+  steps that are self-contained and don't depend on your current conversation state.
+```
+
+This guidance only becomes fully effective after A7 (auto-update) is implemented — but fixing the description (above) and adding the guidance together ensures the LLM knows delegation is available.
+
+---
 
 ### A8: Add "failed" Status to PlanStep
 
@@ -358,9 +397,10 @@ sequenceDiagram
 
 | File | Changes |
 |---|---|
+| `cowork-agent-sdk/src/agent_sdk/loop/system_prompt.py` | Add guidance for delegating plan steps to sub-agents via SpawnAgent with `planStepIndex`. |
 | `cowork-agent-sdk/src/agent_sdk/memory/plan.py` | Add `"failed"` to PlanStep status. Add optional `acceptance_criteria` field (placeholder for Phase B1). |
 | `cowork-agent-sdk/src/agent_sdk/loop/react_loop.py` | No changes needed — existing continuation logic already only blocks on `pending`/`in_progress`. |
-| `cowork-agent-runtime/src/agent_host/loop/agent_tools.py` | Add `planStepIndex` parameter to SpawnAgent. Auto-update plan step on sub-agent return. |
+| `cowork-agent-runtime/src/agent_host/loop/agent_tools.py` | Fix EnterPlanMode description. Add `planStepIndex` parameter to SpawnAgent. Auto-update plan step on sub-agent return. |
 | `cowork-agent-runtime/src/agent_host/loop/loop_runtime.py` | Accept `plan_step_index` in `spawn_sub_agent()`. Build plan context + working memory snapshot. Increase result limit. Write large results to workspace file. |
 | **New:** `cowork-agent-runtime/src/agent_host/loop/plan_context.py` | `build_sub_agent_plan_context()` helper. |
 
@@ -370,6 +410,8 @@ sequenceDiagram
 
 ### Unit Tests
 
+- EnterPlanMode description includes SpawnAgent as available
+- System prompt includes delegation guidance when plan guidance is rendered
 - `PlanStep` accepts `"failed"` status, renders correctly
 - `UpdatePlanStep` with `"failed"` status works
 - `build_sub_agent_plan_context()` generates correct markdown for various plan states
