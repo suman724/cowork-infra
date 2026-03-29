@@ -80,7 +80,7 @@ The core requirement is human-in-the-loop browser automation. This means every b
 - Headed mode for user visibility and takeover
 - Screenshot capture for the side panel and conversation history
 - Accessibility tree API for token-efficient page state
-- Storage state persistence for cross-session auth
+- Persistent browser context (`userDataDir`) for cross-session auth
 - Native Electron support (future Phase 4 embedding)
 - Multi-browser support (Chromium, Firefox, WebKit)
 - Industry standard, Microsoft-backed
@@ -207,37 +207,46 @@ stateDiagram-v2
   ShuttingDown --> [*]: cleanup complete
 
   note right of Launching: Lazy — no browser\nresources until needed
-  note right of Suspended: Storage state persisted\nPlaywright closed\nRe-launches on next call
-  note right of ShuttingDown: Storage state persisted\nto workspace directory
+  note right of Suspended: Playwright closed\nProfile dir persists on disk\nRe-launches on next call
+  note right of ShuttingDown: Browser closed\nProfile dir persists on disk
 ```
 
 ### Launch behavior
 
 1. First browser tool call triggers launch
-2. `BrowserManager` starts Playwright in **headed mode** (visible browser window)
-3. Creates a browser context with:
-   - Storage state loaded from workspace directory (if exists — preserves auth from previous sessions)
-   - Viewport size: 1280×800 (configurable)
-   - User-agent: default Chromium (no stealth/anti-detection)
-4. Opens a single page (tab)
-5. Returns the page handle to the requesting tool
+2. `BrowserManager` starts Playwright with a **persistent context** in **headed mode** (visible browser window):
+   ```python
+   context = await playwright.chromium.launch_persistent_context(
+       user_data_dir=f"{workspace_dir}/.cowork/browser-profile",
+       headless=False,
+       viewport={"width": 1280, "height": 800},
+       args=["--disk-cache-size=0"],  # Disable disk cache to keep profile small
+   )
+   ```
+3. Chrome manages its own state in the profile directory — cookies, localStorage, IndexedDB, service workers all persist automatically across browser restarts. No custom serialization needed.
+4. Disk cache is disabled (`--disk-cache-size=0`) to keep the profile directory small (~10-20MB instead of 100-500MB). Pages load from network on every visit — acceptable tradeoff for a tool-driven browser.
+5. Opens a single page (tab)
+6. Returns the page handle to the requesting tool
+
+**Profile directory:** `{workspace_dir}/.cowork/browser-profile/` — managed entirely by Chrome. We never read or write to it directly. Contains cookies, localStorage, IndexedDB, preferences. Survives browser restarts, session boundaries, and crashes.
 
 ### Idle timeout
 
 - Timer resets on every browser tool call
 - After `browserIdleTimeoutSeconds` (default 600s / 10 min, configurable via policy bundle) of no browser tool calls:
-  - Storage state (cookies, localStorage) persisted to disk
   - Browser closed (Playwright process terminates)
   - State transitions to `Suspended`
-- Next browser tool call re-launches (same as initial launch, but with persisted storage state)
+  - Profile directory remains on disk — no export needed, Chrome already persisted state
+- Next browser tool call re-launches with the same `user_data_dir` — Chrome loads cookies, localStorage, etc. from the profile directory automatically
 
 ### Session-end cleanup
 
 On session end or browser toggle off:
-1. Persist storage state to `{workspace_dir}/.cowork/browser-state.json`
-2. Close all pages and browser context
-3. Stop Playwright
-4. State file is encrypted at rest using the OS keychain key (same mechanism as other workspace secrets)
+1. Close all pages and browser context
+2. Stop Playwright
+3. Profile directory remains on disk for next session in the same workspace
+
+No export or serialization step — Chrome manages its own persistence. The profile directory is on the user's local machine (browser automation is desktop-only), so OS-level disk encryption (FileVault / BitLocker) provides at-rest protection.
 
 ### Multiple pages
 
@@ -879,11 +888,12 @@ If auto-detection fails (e.g., a custom login form that doesn't use `type=passwo
 
 ### Session persistence
 
-- After successful authentication, Playwright's storage state (cookies + localStorage) is held in the browser context
-- On session end or idle timeout, storage state is persisted to `{workspace_dir}/.cowork/browser-state.json`
-- Next session in the same workspace loads this state → user stays logged in
-- Storage state file is encrypted at rest
-- User can clear stored sessions via browser profile management (Phase 3 UI)
+- Chrome manages its own state via the persistent context profile directory (`{workspace_dir}/.cowork/browser-profile/`)
+- After successful authentication, cookies and localStorage are automatically written to the profile by Chrome
+- Next session in the same workspace re-launches with the same profile → user stays logged in
+- No custom export/import — Chrome handles persistence natively
+- At-rest protection via OS disk encryption (FileVault / BitLocker) — browser automation is desktop-only
+- User can clear stored sessions by deleting the profile directory, or via browser profile management UI (Phase 3)
 
 ---
 
@@ -921,7 +931,7 @@ sequenceDiagram
 - **Default:** OFF at session start
 - **Enable:** User clicks toggle. Takes effect on the next task (next `StartTask` call).
 - **Disable:** User clicks toggle again. Browser tools removed from next LLM call. Idle timeout still applies — browser shuts down after 10 minutes of inactivity, or immediately on session end.
-- **Re-enable:** Same session, browser context reused (no re-auth needed if browser is still running or storage state was persisted).
+- **Re-enable:** Same session, browser context reused (no re-auth needed — profile directory preserves state).
 
 ### Why explicit opt-in
 
@@ -1191,20 +1201,20 @@ _NEVER_PARALLELIZE_BROWSER = {
 | `BROWSER_PATH_DENIED` | Download path not in allowed paths | Agent asks user for valid path |
 | `BROWSER_SENSITIVE_DENIED` | User denied sensitive action | Agent tries alternative approach |
 | `BROWSER_SUBMIT_DENIED` | User denied form submission | Agent reports to user |
-| `BROWSER_CRASHED` | Browser process crashed | Re-launch browser, restore storage state |
+| `BROWSER_CRASHED` | Browser process crashed | Re-launch browser with same profile directory |
 
 ### Crash recovery
 
 If the Playwright browser process crashes:
 1. `BrowserManager` detects process exit via Playwright's `browser.on("disconnected")` event
 2. Emits `browser_stopped` event with `reason: "crashed"`
-3. On next browser tool call: re-launches browser with persisted storage state
+3. On next browser tool call: re-launches browser with the same `userDataDir` — Chrome's profile directory survives crashes, so cookies and auth state are preserved
 4. Agent re-extracts page state (may need to re-navigate)
 
-Browser crashes do not affect the agent session — only the browser state is lost.
+Browser crashes do not affect the agent session — only the in-memory page state is lost. Auth state persists in the profile directory.
 
 **Edge cases:**
-- **Corrupted storage state file:** If `browser-state.json` fails to parse, log a warning, delete the file, and launch with a fresh browser context. User will need to re-authenticate.
+- **Corrupted profile directory:** If Playwright fails to launch with the existing profile (e.g., locked files, corrupted SQLite), log a warning, delete the profile directory, and launch fresh. User will need to re-authenticate.
 - **Crash during auth takeover:** Emit `browser_stopped` + `browser_takeover_ended` events. User sees a notification. On next browser tool call, re-launch and re-navigate. The LLM will detect the login page again and request takeover.
 - **Repeated crashes (3+ within 5 minutes):** Mark browser capability as temporarily unavailable. Return `BROWSER_LAUNCH_FAILED` with message suggesting the user restart the session. Do not retry indefinitely.
 
@@ -1231,7 +1241,7 @@ Browser crashes do not affect the agent session — only the browser state is lo
 - The agent never sees or stores user passwords
 - `BrowserType` into password fields triggers approval — the agent must declare what it's doing
 - Form data summaries in submission checkpoints redact sensitive values
-- Storage state files (cookies) are encrypted at rest
+- Browser profile directory protected by OS disk encryption (FileVault / BitLocker)
 - No credential manager integration — authentication is always user-driven via takeover
 
 ### Content isolation
@@ -1260,7 +1270,7 @@ Browser crashes do not affect the agent session — only the browser state is lo
 - Three-tier HITL (domain approval, sensitive detection, submission checkpoints)
 - User takeover with pause/resume
 - Hybrid auth detection with takeover fallback
-- Persistent browser sessions per workspace (encrypted storage state)
+- Persistent browser sessions per workspace (Chrome profile directory, disk cache disabled)
 - Session-scoped opt-in toggle, policy-gated
 - Browser side panel in desktop app
 - Browser-specific approval dialogs
