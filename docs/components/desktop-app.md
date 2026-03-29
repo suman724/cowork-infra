@@ -744,7 +744,76 @@ Clicking any notification brings the Desktop App to the foreground and navigates
 
 ---
 
-## 12. Open Questions
+## 12. Browser Integration (Phase 2)
+
+Browser automation adds a browser side panel, toggle, and approval dialogs to the desktop app. The browser itself runs as a separate headed Playwright process — the desktop app only displays screenshots and provides controls. Full design: [browser-automation.md](browser-automation.md).
+
+### Browser side panel
+
+Collapsible right panel in the conversation view. Hidden by default, opens automatically on first browser tool call. Shows:
+- Current page URL (read-only)
+- Screenshot stream (event-driven updates after each browser action)
+- Action buttons: **Takeover** (focus browser window), **Pause** (suspend agent), **Close** (shut down browser)
+
+### Browser toggle
+
+Per-session opt-in control in the prompt input area (🌐 icon, off by default). Grayed out if policy doesn't grant `Browser.*` capabilities. Enabling adds browser tools to the LLM's tool definitions; disabling removes them and shuts down the browser.
+
+### Browser approval dialogs
+
+Three variants extend the existing approval system:
+- **Domain approval** (low risk) — first interaction with a new domain
+- **Sensitive action** (medium risk) — password fields, destructive buttons, payment forms (includes screenshot)
+- **Submission checkpoint** (high risk) — form submissions with form data summary and screenshot
+
+### New event types
+
+| Event | Payload | Purpose |
+|-------|---------|---------|
+| `browser_started` | `{ browserChannel }` | Browser launched (side panel opens) |
+| `browser_stopped` | `{ reason }` | Browser closed (idle, session end, user close, crash) |
+| `browser_page_state` | `{ url, screenshotBase64 }` | Screenshot update for side panel |
+| `browser_auth_required` | `{ domain, signals[] }` | Auth detected, waiting for user takeover |
+| `browser_takeover_started` | — | User took over browser control |
+| `browser_takeover_ended` | — | User resumed agent control |
+| `browser_domain_approved` | `{ domain }` | User approved a new domain |
+
+### New IPC channels
+
+| Channel | Direction | Purpose |
+|---------|-----------|---------|
+| `browser:takeover` | Renderer → Main | Focus browser window for user interaction |
+| `browser:pause` | Renderer → Main | Suspend agent after current tool completes |
+| `browser:resume` | Renderer → Main | Resume agent loop after takeover |
+| `browser:close` | Renderer → Main | Shut down browser, disable toggle |
+| `push:browser-page-state` | Main → Renderer | Screenshot + URL update |
+| `push:browser-auth-required` | Main → Renderer | Auth detection notification |
+
+### State management
+
+New `browser-store` (Zustand) tracks `browserEnabled`, `browserStatus`, `currentUrl`, `currentScreenshot`, `approvedDomains`, and `panelOpen`. Follows the same pattern as existing stores in `state/`.
+
+### Package layout additions
+
+```
+renderer/
+  views/
+    conversation/
+      browser-panel.tsx     — Browser side panel component (NEW)
+  components/
+    browser-toggle.tsx      — Browser enable/disable toggle (NEW)
+    browser-approval.tsx    — Browser-specific approval dialogs (NEW)
+  state/
+    browser-store.ts        — Browser state management (NEW)
+main/
+  ipc-handlers.ts           — Add browser:* channel handlers (MODIFIED)
+shared/
+  ipc-channels.ts           — Add browser channel constants (MODIFIED)
+```
+
+---
+
+## 13. Open Questions
 
 | Question | Context | Recommendation |
 |----------|---------|----------------|

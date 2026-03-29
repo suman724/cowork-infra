@@ -191,7 +191,7 @@ stateDiagram-v2
 ### Idle timeout
 
 - Timer resets on every browser tool call
-- After 10 minutes of no browser tool calls:
+- After `browserIdleTimeoutSeconds` (default 600s / 10 min, configurable via policy bundle) of no browser tool calls:
   - Storage state (cookies, localStorage) persisted to disk
   - Browser closed (Playwright process terminates)
   - State transitions to `Suspended`
@@ -212,13 +212,16 @@ On session end or browser toggle off:
 
 ### Configuration
 
-| Setting | Default | Source |
-|---------|---------|--------|
-| `browserHeadless` | `false` | Policy bundle or session options |
-| `browserViewportWidth` | `1280` | Session options |
-| `browserViewportHeight` | `800` | Session options |
-| `browserIdleTimeoutSeconds` | `600` | Policy bundle |
-| `browserChannel` | `chromium` | Session options (chromium, firefox, webkit) |
+All settings are configurable — none are hardcoded constants. Policy bundle settings are managed by admins; session options are per-session user choices.
+
+| Setting | Default | Source | Notes |
+|---------|---------|--------|-------|
+| `browserHeadless` | `false` | Policy bundle | Phase 2: always headed. Phase 3+: headless for CI/standalone runtime |
+| `browserViewportWidth` | `1280` | Policy bundle (overridable via session options) | Standard desktop viewport |
+| `browserViewportHeight` | `800` | Policy bundle (overridable via session options) | Standard desktop viewport |
+| `browserIdleTimeoutSeconds` | `600` | Policy bundle | 10 min default. Browser suspends after this idle period |
+| `browserChannel` | `chromium` | Policy bundle | Phase 2: Chromium only. Phase 3+: Firefox, WebKit |
+| `maxDownloadFileSizeBytes` | `524288000` | Policy bundle | 500MB default. Downloads exceeding this are rejected |
 
 ---
 
@@ -258,8 +261,9 @@ Showing 10 of 47 issues
 ### Element indexing
 
 - Interactive elements are assigned monotonic indices `[1]`, `[2]`, ... per page snapshot
-- Indices are stable within a snapshot but may change after navigation or dynamic content updates
+- Indices are stable within a snapshot but may change after navigation, DOM mutations, or dynamic content updates (lazy loading, AJAX, JavaScript re-renders)
 - The agent references elements by index: `BrowserClick({ index: 5 })`
+- **Guidance for the LLM:** Always re-extract page state (via `BrowserExtract` or the page state returned by action tools) after any action that may alter the DOM. Never reuse stale indices from a previous snapshot
 - Non-interactive content (headings, paragraphs, tables) is included as markdown text for context but not indexed
 
 ### What counts as interactive
@@ -496,9 +500,9 @@ The a11y tree is truncated at 20,000 tokens with the standard truncation strateg
 **Behavior:**
 1. Capture screenshot via `page.screenshot()` or `element.screenshot()`
 2. Return as base64 PNG image content (multimodal attachment for LLM)
-3. Store as artifact for conversation history
+3. Store as artifact in Workspace Service: type `browser_screenshot`, key `{workspaceId}/{sessionId}/browser_screenshot/{artifactId}`, content type `image/png`
 
-**Output:** Screenshot image. Returned as `ImageContent` (same as `ViewImage` tool).
+**Output:** Screenshot image. Returned as `ImageContent` (same as `ViewImage` tool). Artifact metadata includes `url`, `timestamp`, and `fullPage` flag for history retrieval.
 
 ---
 
@@ -518,7 +522,7 @@ The a11y tree is truncated at 20,000 tokens with the standard truncation strateg
 2. Extract form data summary:
    - Find the enclosing `<form>` element
    - List all input fields with their labels and current values
-   - Redact sensitive fields (password → `"••••••"`, credit card → `"••••1234"`)
+   - Redact sensitive fields using the redaction algorithm below
 3. **Always trigger submission checkpoint approval** — present form summary + screenshot to user
 4. If approved: click the submit element
 5. Wait for navigation or response
@@ -526,6 +530,21 @@ The a11y tree is truncated at 20,000 tokens with the standard truncation strateg
 7. Return updated page state with submission result
 
 **Output:** Updated page state after submission. Approval dialog includes form field summary.
+
+**Form data redaction algorithm:**
+
+Field labels are extracted in priority order: `<label for="">` text → `aria-label` → `placeholder` → `name` attribute → `id` attribute. For fields detected as sensitive, values are redacted before inclusion in the approval payload:
+
+| Detection | Rule | Display |
+|-----------|------|---------|
+| `input[type=password]` | Full redaction | `"••••••"` |
+| `autocomplete="cc-number"` or field matching `/card.*(number\|num)/i` | Show last 4 digits | `"••••••••1234"` |
+| `autocomplete="cc-csc"` or field matching `/cvv\|cvc\|csc/i` | Full redaction | `"•••"` |
+| `autocomplete="cc-exp"` or field matching `/expir/i` | Show as-is | Not redacted (low sensitivity) |
+| Field matching `/ssn\|social.*security\|tax.*id/i` | Show last 4 digits | `"•••-••-1234"` |
+| All other fields | Show as-is | Not redacted |
+
+Short values (≤2 characters) are fully redacted to `"••"` regardless of type, to prevent leaking information.
 
 **Approval payload:**
 ```json
@@ -1128,12 +1147,17 @@ _NEVER_PARALLELIZE_BROWSER = {
 ### Crash recovery
 
 If the Playwright browser process crashes:
-1. `BrowserManager` detects process exit
+1. `BrowserManager` detects process exit via Playwright's `browser.on("disconnected")` event
 2. Emits `browser_stopped` event with `reason: "crashed"`
 3. On next browser tool call: re-launches browser with persisted storage state
 4. Agent re-extracts page state (may need to re-navigate)
 
 Browser crashes do not affect the agent session — only the browser state is lost.
+
+**Edge cases:**
+- **Corrupted storage state file:** If `browser-state.json` fails to parse, log a warning, delete the file, and launch with a fresh browser context. User will need to re-authenticate.
+- **Crash during auth takeover:** Emit `browser_stopped` + `browser_takeover_ended` events. User sees a notification. On next browser tool call, re-launch and re-navigate. The LLM will detect the login page again and request takeover.
+- **Repeated crashes (3+ within 5 minutes):** Mark browser capability as temporarily unavailable. Return `BROWSER_LAUNCH_FAILED` with message suggesting the user restart the session. Do not retry indefinitely.
 
 ---
 

@@ -295,6 +295,11 @@ Capabilities are issued in the policy bundle and enforced by **Local Policy Enfo
 | `LLM.Call` | Call LLM Gateway | model allowlist, token budgets | No |
 | `Search.Web` | Web search via Tavily API | — | No |
 | `Code.Execute` | Execute Python code | `allowedLanguages`, `maxExecutionTimeSeconds`, `allowCodeNetwork` | Usually yes |
+| `Browser.Navigate` | Navigate browser to URLs | `allowedDomains`, `blockedDomains` | First visit to new domain |
+| `Browser.Interact` | Click, type, select, scroll in browser | — | Sensitive elements only |
+| `Browser.Extract` | Read page content and take screenshots | — | No |
+| `Browser.Submit` | Submit forms in browser | — | Always |
+| `Browser.Download` | Download files via browser | `allowedPaths`, `maxFileSizeBytes` | Always |
 
 > Full policy bundle structure and LLM policy fields: [services/policy-service.md](services/policy-service.md)
 >
@@ -304,7 +309,8 @@ Capabilities are issued in the policy bundle and enforced by **Local Policy Enfo
 
 - **Phase 1 — built-in tools:** File, shell, and network tools run directly inside the Local Tool Runtime, always available.
 - **Phase 1 — skills:** The SkillLoader discovers skill definitions from multiple sources and registers them as tools. Skills are loaded at session startup with the following priority order (higher priority wins on name collision): **policy bundle > workspace > user > built-in**. Workspace-level skills are discovered from `{workspace}/.cowork/skills/` — this allows project-specific skills to be checked into a repository.
-- **Phase 2+ — MCP extension:** Local Tool Runtime acts as an MCP client. It discovers and connects to remote MCP servers over streamable HTTP, translating their tool manifests to the internal `ToolRequest`/`ToolResult` contract. MCP servers are never invoked directly by the agent loop — capability checks and approval gates always happen in the routing layer first.
+- **Phase 2 — browser automation:** 11 Playwright-based browser tools (navigate, click, type, select, scroll, back, extract, screenshot, submit, download, wait) with three-tier HITL: domain approval → sensitive element detection → submission checkpoints. Session-scoped opt-in, lazy browser launch, user takeover support. Full design: [components/browser-automation.md](components/browser-automation.md).
+- **Phase 2+ — MCP extension:** Local Tool Runtime acts as an MCP client. It discovers and connects to remote MCP servers over streamable HTTP, translating their tool manifests to the internal `ToolRequest`/`ToolResult` contract. MCP servers are never invoked directly by the agent loop — capability checks and approval gates always happen in the routing layer first. Full design: [design/mcp-client.md](design/mcp-client.md).
 
 ---
 
