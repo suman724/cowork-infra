@@ -896,6 +896,21 @@ sequenceDiagram
 3. **Resource awareness** — launching a browser is a visible, resource-consuming action. The user should expect it.
 4. **Security surface** — browser automation expands the attack surface (network access to arbitrary domains). Opt-in makes this a conscious choice.
 
+### Web sandbox exclusion
+
+Browser automation is **desktop-only**. The Policy Service must not grant `Browser.*` capabilities for web sandbox sessions. The same agent-runtime codebase runs in both environments, but the policy bundle controls what tools are available.
+
+**Why browser tools are incompatible with web sandbox:**
+
+1. **No headed browser window.** Browser tools launch a visible Chromium window that the user observes and can take over. In a headless ECS container, there is no display — Playwright would need to run headless, defeating the HITL design (no screenshot stream, no user takeover, no visual confirmation before form submissions).
+2. **No user takeover.** The core safety model depends on the user being able to pause the agent, interact with the browser directly (e.g., to authenticate), and resume. This requires the browser window to be on the user's machine, not in a remote container.
+3. **SSRF risk from shared infrastructure.** A browser running inside the VPC can reach internal services, metadata endpoints (169.254.169.254), and other containers. The desktop browser runs on the user's machine with only their network access — a much smaller blast radius.
+4. **Resource isolation.** Playwright consumes significant memory (~200-500MB per browser instance). In a shared ECS worker pool, this would reduce session density and require larger task definitions.
+
+**How it works:** The Policy Service determines capabilities based on session type. Desktop sessions can include `Browser.*` capabilities (subject to tenant policy). Web sandbox sessions omit them entirely. The agent-runtime doesn't need any conditional logic — it simply never sees `Browser.*` in the policy bundle, so browser tools are never registered, and the LLM never sees them.
+
+**Future consideration (Phase 3+):** If headless browser support is added for CI/automation use cases, a separate capability (e.g., `Browser.Headless`) with its own policy rules could enable limited browser functionality in web sandbox — extract and screenshot only, no user takeover, no form submission, stricter domain restrictions.
+
 ---
 
 ## 11. Desktop App Changes
