@@ -258,7 +258,7 @@ Human-in-the-loop oversight system.
 
 ### B7: Desktop App Integration & User Takeover
 
-Browser UI in the desktop app and user takeover capability.
+Browser UI in the desktop app, user takeover capability, and streaming tool output rendering.
 
 **What to build:**
 - Browser side panel: collapsible right panel showing URL, screenshot stream, action buttons
@@ -267,11 +267,13 @@ Browser UI in the desktop app and user takeover capability.
 - Auth pause flow: detect login forms/401s/OAuth redirects → pause → user authenticates → resume
 - New event types: `browser_started`, `browser_stopped`, `browser_page_state`, `browser_auth_required`, `browser_takeover_started`
 - New IPC channels: `browser:takeover`, `browser:pause`, `browser:resume`, `browser:close`
+- Streaming tool output: render `tool_output_chunk` events (from Phase A / A6) in the conversation view — show real-time command output during long-running shell commands (npm install, make build, etc.)
 
 **Acceptance criteria:**
 - User can see browser state in real-time via side panel
 - User can take over the browser at any time, agent pauses cleanly
 - Authentication flows handled via takeover (auto-detected when possible)
+- Long-running commands show incremental output in the conversation view
 
 ### B8: Policy & Contract Updates
 
