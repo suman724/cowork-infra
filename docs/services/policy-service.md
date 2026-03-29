@@ -107,6 +107,11 @@ Capabilities define what the agent is permitted to do. Each capability has a nam
 | `LLM.Call` | Call LLM Gateway | Model allowlist, token budgets | No | LLM Gateway, Policy Service |
 | `Search.Web` | Web search | — | No | Local Tool Runtime |
 | `Code.Execute` | Execute Python code | Language allowlist, timeout, network flag | Usually yes | Local Policy Enforcer, Local Tool Runtime |
+| `Browser.Navigate` | Navigate browser to URLs | Domain allowlist/blocklist | First visit to new domain | Local Policy Enforcer, Local Tool Runtime |
+| `Browser.Interact` | Click, type, select, scroll in browser | — | Sensitive elements only | Local Tool Runtime (SensitiveDetector) |
+| `Browser.Extract` | Read page content and take screenshots | — | No | Local Tool Runtime |
+| `Browser.Submit` | Submit forms in browser | — | Always | Local Tool Runtime |
+| `Browser.Download` | Download files via browser | Allowed paths, file size limit | Always | Local Policy Enforcer, Local Tool Runtime |
 
 ### Scope Fields
 
@@ -114,18 +119,22 @@ Capability entries can include any of these scope constraints:
 
 | Field | Applies to |
 |-------|-----------|
-| `allowedPaths` | File.Read, File.Write, File.Delete |
+| `allowedPaths` | File.Read, File.Write, File.Delete, Browser.Download |
 | `blockedPaths` | File.Read, File.Write, File.Delete |
 | `allowedCommands` | Shell.Exec |
 | `blockedCommands` | Shell.Exec |
-| `allowedDomains` | Network.Http |
-| `maxFileSizeBytes` | File.Read, File.Write, Workspace.Upload |
+| `allowedDomains` | Network.Http, Browser.Navigate |
+| `blockedDomains` | Browser.Navigate |
+| `maxFileSizeBytes` | File.Read, File.Write, Workspace.Upload, Browser.Download |
 | `maxOutputBytes` | Shell.Exec, tool outputs |
 | `requiresApproval` | All capabilities |
 | `approvalRuleId` | All capabilities where requiresApproval is true |
 | `allowedLanguages` | Code.Execute |
 | `maxExecutionTimeSeconds` | Code.Execute |
 | `allowCodeNetwork` | Code.Execute |
+| `browserIdleTimeoutSeconds` | Browser.* (default: 600) |
+| `browserViewportWidth` | Browser.* (default: 1280) |
+| `browserViewportHeight` | Browser.* (default: 800) |
 
 > **Workspace path enrichment:** The Policy Service does **not** inject workspace-specific paths into `allowedPaths`. That is the responsibility of the Local Agent Host, which appends the session's workspace directory to file-operation capabilities after receiving the policy bundle. This keeps the Policy Service workspace-agnostic and reusable across desktop and backend execution environments. See [components/local-agent-host.md](../components/local-agent-host.md), Section 8.1.
 
