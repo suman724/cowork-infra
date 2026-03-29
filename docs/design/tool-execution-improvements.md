@@ -1,9 +1,10 @@
 # Tool Execution Improvements — Design Doc
 
-**Status:** Proposed
-**Scope:** cowork-agent-runtime, cowork-agent-sdk
+**Status:** Implementation Ready
+**Scope:** cowork-agent-runtime, cowork-agent-sdk, cowork-platform
 **Date:** 2026-03-28
-**Roadmap:** Phase A, items A3-A5
+**Roadmap:** Phase A, items A6-A8
+**Branch:** `feature/phase-a-implementation` (single branch for all Phase A work)
 
 ---
 
@@ -399,7 +400,165 @@ No HTTP endpoint changes. All modifications are internal to the agent-runtime to
 
 ## Dependency Between A3, A4, A5
 
-- **A3 (Streaming) and A4 (Force cancel)** both modify `RunCommand` — implement together to avoid double refactoring
-- **A5 (Shell args)** is independent — modifies PolicyEnforcer, not tool execution
-- **A3 depends on** the `ExecutionContext` extension — coordinate with ToolRouter changes
-- **A4 depends on** `asyncio.CancelledError` propagation through the tool execution chain
+- **A6 (Streaming) and A7 (Force cancel)** both modify `RunCommand` — implement together to avoid double refactoring
+- **A8 (Shell args)** is independent — modifies PolicyEnforcer, not tool execution
+- **A6 depends on** the `ExecutionContext` extension — coordinate with ToolRouter changes
+- **A7 depends on** `asyncio.CancelledError` propagation through the tool execution chain
+
+---
+
+## Implementation Plan
+
+### Codebase Context (Current State)
+
+Key structures discovered during implementation readiness review:
+
+**`RunCommand`** (`tool_runtime/tools/shell/run_command.py:24-153`): Uses `asyncio.create_subprocess_exec()` with `os.setsid` for process groups. Captures stdout/stderr via `process.communicate()` (blocking until completion). Timeout via `asyncio.wait_for()` (default 300s). On timeout: `platform.kill_process_tree()`. Output >10KB triggers artifact extraction.
+
+**`ExecutionContext`** (`tool_runtime/models.py:25-43`): `@dataclass(frozen=True)` with capability constraint fields. Adding `on_output_chunk` requires changing from frozen or passing callback separately. **Decision:** Add `on_output_chunk` field and change to `frozen=False`, since ExecutionContext is created fresh per tool call and never shared across threads.
+
+**`ToolExecutor._execute_single()`** (`agent_host/loop/tool_executor.py:205-382`): Handles plan mode check → policy check → approval gate → ToolRouter dispatch → artifact upload → event emission. No timeout wrapper currently — timeout is only in RunCommand itself. Adding per-tool timeout wraps the ToolRouter dispatch call.
+
+**`ToolRouter.execute()`** (`tool_runtime/router/tool_router.py`): Dispatches to registered tool. Passes `ExecutionContext` to tool. Adding `on_output_chunk` requires passing it through ExecutionContext.
+
+**`command_matcher.py`** (`agent_sdk/policy/command_matcher.py:1-68`): `extract_base_command()` strips path prefix, returns first token. `check_command()` compares base command against allowlist/blocklist. No pattern matching — only exact base command comparison.
+
+**`PolicyEnforcer`** (`agent_sdk/policy/policy_enforcer.py`): Pure, stateless, no I/O. `check_tool_call()` delegates to `check_command()` for `Shell.Exec`. No risk assessment currently.
+
+### Resolved Ambiguities
+
+| Question | Resolution |
+|----------|-----------|
+| ExecutionContext is frozen — how to add callback? | Change to `frozen=False`. Context is created fresh per call, never shared. Safe. |
+| Line-by-line vs batched streaming? | Line-by-line. Each `\n`-terminated line emits one chunk. Simple, predictable. |
+| How does ToolRouter pass callback? | Via `ExecutionContext.on_output_chunk` field. ToolRouter passes ExecutionContext to tool unchanged. |
+| File tools excluded from timeout? | Yes. `_TOOL_TIMEOUTS` dict omits file tools. `_execute_single()` only wraps in `wait_for` when tool name is in `_TOOL_TIMEOUTS` or `_DEFAULT_TOOL_TIMEOUT` applies. File tools (ReadFile, WriteFile, etc.) are excluded via a `_NO_TIMEOUT_TOOLS` set. |
+| SIGTERM grace period configurable? | No — hardcoded 5s. Sufficient for all current tools. |
+| Pattern matching: wildcard semantics? | `*` matches zero or more remaining tokens. `"git *"` matches `"git"`, `"git push"`, `"git push --force origin"`. |
+| Risk assessor integration? | `assess_command_risk()` is a standalone function. Not wired into PolicyEnforcer in Phase A — available for future use (approval flow, UI risk display). |
+| Backward compat for base-only patterns? | If pattern has no spaces and no `*`, use existing base command matching. Patterns with spaces/wildcards use new `matches_command_pattern()`. |
+
+### Implementation Order
+
+**Step 7: A8 — Shell argument inspection** (`cowork-agent-sdk`)
+- Add `matches_command_pattern()` to `command_matcher.py`
+- Update `check_command()` to use pattern matching for complex patterns
+- Create `risk_assessor.py` with `assess_command_risk()`
+- Extend tests in `test_command_matcher.py`, create `test_risk_assessor.py`
+
+**Step 8: A6+A7 — Streaming output + force cancellation** (`cowork-agent-runtime`, `cowork-platform`)
+- Modify `ExecutionContext` to add `on_output_chunk` (change to `frozen=False`)
+- Modify `RunCommand`: replace `process.communicate()` with line-by-line streaming, add `_kill_process()`, handle `CancelledError`
+- Modify `ToolExecutor._execute_single()`: create output chunk callback, wrap execution in `asyncio.wait_for()` with per-tool timeout
+- Add `tool_output_chunk` to platform contract enums
+- Add tests for streaming, timeout, cancellation, backward compat
+
+---
+
+## Definition of Done — A6 through A8
+
+### A6: Streaming Tool Output
+
+**Code changes:**
+| File | Change |
+|------|--------|
+| `cowork-agent-runtime/src/tool_runtime/models.py` | Change `ExecutionContext` from `frozen=True` to `frozen=False`. Add `on_output_chunk: Callable[[str], None] \| None = None` field. |
+| `cowork-agent-runtime/src/tool_runtime/tools/shell/run_command.py` | Replace `process.communicate()` with `async for line in process.stdout` loop. Call `context.on_output_chunk(line)` per line if callback set. Accumulate lines for final result. Handle stderr separately via `process.stderr.read()` after stdout completes. |
+| `cowork-agent-runtime/src/agent_host/loop/tool_executor.py` | In `_execute_single()`: create `on_output_chunk` lambda that calls `self._event_emitter.emit_tool_output_chunk(tool_call_id, tool_name, content, task_id)`. Pass via `ExecutionContext`. |
+| `cowork-platform/contracts/enums/event-types.json` | Add `"tool_output_chunk"` to the enum array. |
+| `cowork-platform/contracts/enums/frontend-event-types.json` | Add `"tool_output_chunk"` to the frontend allow-list array. |
+
+**Tests:**
+| Test | File | Assertion |
+|------|------|-----------|
+| `test_run_command_streaming_emits_lines` | `test_run_command.py` | Callback called once per line of stdout |
+| `test_run_command_streaming_final_result_complete` | `test_run_command.py` | Final result equals full stdout content |
+| `test_run_command_no_callback_backward_compat` | `test_run_command.py` | No callback → same behavior as before |
+| `test_run_command_timeout_during_streaming` | `test_run_command.py` | Timeout kills process, partial lines returned |
+| `test_tool_executor_creates_output_chunk_callback` | `test_tool_executor.py` | Callback wired to event emitter |
+
+**Acceptance criteria:**
+- [ ] Long-running commands emit `tool_output_chunk` events per line
+- [ ] Final tool result is complete accumulated output (same as today for LLM)
+- [ ] No callback → behavior unchanged (backward compatible)
+- [ ] Timeout still kills process and returns partial output
+- [ ] Output truncation (80/20 head/tail) still applies to final result
+- [ ] `tool_output_chunk` event type added to platform contracts
+- [ ] `make check` passes in `cowork-agent-runtime` and `cowork-platform`
+
+---
+
+### A7: Force Cancellation with Hard Timeout
+
+**Code changes:**
+| File | Change |
+|------|--------|
+| `cowork-agent-runtime/src/agent_host/loop/tool_executor.py` | Add `_TOOL_TIMEOUTS` dict (RunCommand=300, ExecuteCode=30, HttpRequest=30, FetchUrl=30, WebSearch=15), `_DEFAULT_TOOL_TIMEOUT = 60`, `_NO_TIMEOUT_TOOLS` set (all file tools). Wrap `self._tool_router.execute()` in `asyncio.wait_for(timeout)`. Catch `asyncio.TimeoutError` → return `ToolExecutionResult(status="timeout", ...)`. Catch `asyncio.CancelledError` → return `ToolExecutionResult(status="cancelled", ...)`. |
+| `cowork-agent-runtime/src/tool_runtime/tools/shell/run_command.py` | Add `_kill_process(process, grace_seconds=5)` method: `process.terminate()` → `wait_for(process.wait(), timeout=5)` → `process.kill()`. In streaming loop: catch `asyncio.CancelledError` → call `_kill_process()` → return partial output. |
+
+**Tests:**
+| Test | File | Assertion |
+|------|------|-----------|
+| `test_run_command_cancelled_kills_process` | `test_run_command.py` | CancelledError triggers process termination |
+| `test_kill_process_sigterm_then_sigkill` | `test_run_command.py` | SIGTERM sent first, SIGKILL after grace timeout |
+| `test_run_command_cancelled_returns_partial_output` | `test_run_command.py` | Partial stdout captured before cancellation |
+| `test_tool_executor_per_tool_timeout` | `test_tool_executor.py` | RunCommand gets 300s, ExecuteCode gets 30s |
+| `test_tool_executor_default_timeout` | `test_tool_executor.py` | Unknown tool gets 60s default |
+| `test_tool_executor_no_timeout_for_file_tools` | `test_tool_executor.py` | ReadFile, WriteFile etc. not wrapped in wait_for |
+| `test_tool_executor_timeout_returns_timeout_result` | `test_tool_executor.py` | TimeoutError caught, status="timeout" returned |
+
+**Acceptance criteria:**
+- [ ] Runaway shell commands killed after configured timeout
+- [ ] SIGTERM → 5s grace → SIGKILL escalation
+- [ ] Partial output captured and returned to LLM
+- [ ] File tools not wrapped in timeout (local I/O, always fast)
+- [ ] Per-tool timeout configurable via `_TOOL_TIMEOUTS` dict
+- [ ] `make check` passes
+
+---
+
+### A8: Shell Argument Inspection
+
+**Code changes:**
+| File | Change |
+|------|--------|
+| `cowork-agent-sdk/src/agent_sdk/policy/command_matcher.py` | Add `matches_command_pattern(command: str, pattern: str) -> bool`. Tokenize both with `shlex.split()`, compare token-by-token, `*` matches zero-or-more remaining tokens. Update `check_command()`: for patterns containing spaces or `*`, use `matches_command_pattern()`; for simple patterns (no spaces, no `*`), use existing base command comparison. |
+| **New:** `cowork-agent-sdk/src/agent_sdk/policy/risk_assessor.py` | `_HIGH_RISK_PATTERNS` list (substring patterns: `"rm -rf /"`, `"rm -rf ~"`, `"rm -rf ."`, `"git push --force"`, `"git push -f"`, `"git reset --hard"`, `"chmod 777"`, `"dd if="`, `"mkfs"`, `"> /dev/"`). `assess_command_risk(command: str) -> Literal["high", "low"]` — substring check against patterns. |
+
+**Tests:**
+| Test | File | Assertion |
+|------|------|-----------|
+| `test_matches_pattern_exact_subcommand` | `test_command_matcher.py` | `"git push"` matches `"git push"` |
+| `test_matches_pattern_wildcard` | `test_command_matcher.py` | `"git push origin main"` matches `"git push *"` |
+| `test_matches_pattern_wildcard_zero_args` | `test_command_matcher.py` | `"git push"` matches `"git push *"` (zero remaining) |
+| `test_matches_pattern_no_match` | `test_command_matcher.py` | `"npm install"` doesn't match `"git *"` |
+| `test_matches_pattern_base_only` | `test_command_matcher.py` | `"git status"` matches `"git"` |
+| `test_matches_pattern_flags` | `test_command_matcher.py` | `"git push --force origin"` matches `"git push --force *"` |
+| `test_check_command_blocked_with_pattern` | `test_command_matcher.py` | `"git push --force x"` blocked by `["git push --force *"]` |
+| `test_check_command_allowed_with_pattern` | `test_command_matcher.py` | `"git status"` allowed by `["git *"]` |
+| `test_check_command_base_only_backward_compat` | `test_command_matcher.py` | `["git", "npm"]` (no spaces) still works as before |
+| `test_assess_risk_high_rm_rf` | `test_risk_assessor.py` | `"rm -rf /"` → `"high"` |
+| `test_assess_risk_high_force_push` | `test_risk_assessor.py` | `"git push --force origin"` → `"high"` |
+| `test_assess_risk_low_normal_command` | `test_risk_assessor.py` | `"git status"` → `"low"` |
+| `test_assess_risk_high_all_patterns` | `test_risk_assessor.py` | Every pattern in `_HIGH_RISK_PATTERNS` detected |
+
+**Acceptance criteria:**
+- [ ] `matches_command_pattern()` handles exact, wildcard, subcommand, and base-only patterns
+- [ ] `check_command()` uses pattern matching for complex patterns (spaces/wildcards)
+- [ ] Existing base-command-only policies (`["git", "npm"]`) still work unchanged
+- [ ] Blocklist patterns checked before allowlist (deny takes precedence)
+- [ ] `assess_command_risk()` detects all high-risk patterns via substring match
+- [ ] `make check` passes in `cowork-agent-sdk`
+
+---
+
+## Cross-cutting Requirements
+
+All items (A1-A8):
+- [ ] Single feature branch: `feature/phase-a-implementation`
+- [ ] `make check` passes in all affected repos (lint + format-check + typecheck + test)
+- [ ] No regressions in existing tests
+- [ ] Structured logging with `structlog` for all new code paths
+- [ ] Error handling: no unhandled exceptions, graceful fallbacks
+- [ ] Backward compatible: no breaking changes to existing tool calls or APIs
+- [ ] PR with squash merge to main after all items complete

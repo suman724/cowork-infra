@@ -1,9 +1,10 @@
 # Plan & Sub-Agent Improvements — Design Doc
 
-**Status:** Proposed
+**Status:** Implementation Ready
 **Scope:** cowork-agent-sdk, cowork-agent-runtime
 **Date:** 2026-03-28
-**Roadmap:** Phase A, items A6-A10
+**Roadmap:** Phase A, items A1-A5
+**Branch:** `feature/phase-a-implementation` (single branch for all Phase A work)
 
 ---
 
@@ -439,3 +440,216 @@ sequenceDiagram
 - `UpdatePlanStep` still accepts manual calls — LLM can override auto-updates
 - `PlanStep` status `"failed"` is additive — existing plans with `pending`/`in_progress`/`completed`/`skipped` are unaffected
 - Sub-agent result limit increase (2K→8K) only affects the return value, not the thread history format
+
+---
+
+## Implementation Plan
+
+### Codebase Context (Current State)
+
+Key structures discovered during implementation readiness review:
+
+**`PlanStep`** (`agent_sdk/memory/plan.py:9-14`): Dataclass with `description: str` and `status: Literal["pending", "in_progress", "completed", "skipped"]`. No other fields.
+
+**`Plan.render()`** (`agent_sdk/memory/plan.py:24-45`): Generates markdown with `[status]` badges per step. Shows in_progress guidance and pending guidance. Injected via `WorkingMemory.render()` into every LLM call.
+
+**`WorkingMemory`** (`agent_sdk/memory/working_memory.py`): Has `.task_tracker` (TaskTracker), `.plan` (Plan | None), `.notes` (list[str]). `render()` combines all three as markdown. Checkpoint round-trip support.
+
+**`UpdatePlanStep` handler** (`agent_runtime/agent_host/loop/agent_tools.py:414-444`): Validates `stepIndex` (int, in range) and `status` (one of `in_progress`, `completed`, `skipped`). Calls `_notify_plan_updated()` which triggers the `plan_updated` event via `on_plan_updated` callback → `LoopRuntime` → `EventEmitter`.
+
+**`EnterPlanMode` tool definition** (`agent_tools.py:191-198`): Description says "only read-only tools are available" — misleading because SpawnAgent and other agent-internal tools remain available.
+
+**`SpawnAgent` handler** (`agent_tools.py:482-495`): Accepts `task` (required) and `context` (optional). Delegates to `self._spawn_sub_agent()` callback → `LoopRuntime.spawn_sub_agent()`.
+
+**`spawn_sub_agent()`** (`loop_runtime.py:287-397`): Creates child `LoopRuntime` with fresh thread, shared LLM client/budget/policy. System prompt built from task + context. `_RESULT_MAX_CHARS = 2000`. Result dict: `{ status, result, steps }`. `result.reason` is a string: `"completed"`, `"max_steps"`, `"cancelled"`, `"budget_exceeded"`.
+
+**`ReactLoop` plan continuation** (`react_loop.py:100-137`): When agent signals completion (no tool calls, stop_reason="stop") and plan has incomplete steps (`status in ("pending", "in_progress")`), injects "continue with next step" and re-enters loop. Adding `"failed"` requires NO change here — failed steps are already not in `("pending", "in_progress")`.
+
+**`ExecutionContext`** (`tool_runtime/models.py:25-43`): Frozen dataclass. Adding `on_output_chunk` field requires either making it non-frozen or using a separate callback mechanism.
+
+### Resolved Ambiguities
+
+| Question | Resolution |
+|----------|-----------|
+| How is sub-agent context injected? | Via `system_prompt` string in `_run_sub_agent()` (line 323-332). Plan context + working memory snapshot appended as text. Naturally read-only. |
+| What does `result.reason` contain? | `LoopResult.reason` — string: `"completed"`, `"max_steps"`, `"cancelled"`, `"budget_exceeded"` |
+| Where is `_notify_plan_updated()`? | `AgentToolHandler._notify_plan_updated()` (agent_tools.py:446-455) → `on_plan_updated` callback → `LoopRuntime.emit_plan_updated()` → `EventEmitter` |
+| How to enforce read-only working memory for sub-agents? | Text injection into system prompt — naturally read-only. No object reference shared. |
+| Sub-agent result file path: absolute or relative? | Absolute path (for `ReadFile` tool compatibility). Logged as relative from workspace for display. |
+| File write failure for large results? | Fall back to inline truncation with `logger.warning`. Never crash. |
+| Should `acceptance_criteria` be added to PlanStep? | No — deferred to Phase D1 (Sprint Contracts). Keep PlanStep minimal for now. |
+
+### Implementation Order
+
+All A1-A5 changes land in one feature branch across `cowork-agent-sdk` and `cowork-agent-runtime`.
+
+**Step 1: A1 — Add "failed" status** (`cowork-agent-sdk`)
+- Modify `PlanStep.status` literal type
+- Update `Plan.render()` to show `[FAILED]` distinctly
+- Extend tests in `test_plan.py`
+
+**Step 2: A1 continued — UpdatePlanStep accepts "failed"** (`cowork-agent-runtime`)
+- Update `_handle_update_plan_step()` to accept `"failed"` in status validation
+- Add test in `test_agent_tools.py`
+
+**Step 3: A2 — Plan context for sub-agents** (`cowork-agent-runtime`)
+- Create `agent_host/loop/plan_context.py` with `build_sub_agent_plan_context(plan, current_step_index)`
+- Modify `loop_runtime.py`: add `plan_step_index` parameter to `spawn_sub_agent()` and `_run_sub_agent()`, inject plan context into system prompt
+- Update `agent_tools.py`: `_handle_spawn_agent()` passes `plan_step_index` from arguments
+- Add SpawnAgent `planStepIndex` parameter to tool definition
+- Fix `EnterPlanMode` description to list available agent-internal tools
+- Add tests for `build_sub_agent_plan_context()` and context injection
+
+**Step 4: A3 — Auto-update plan step** (`cowork-agent-runtime`)
+- Modify `_handle_spawn_agent()`: mark step `in_progress` before spawn, mark `completed`/`failed` after return, call `_notify_plan_updated()` at each transition
+- Add tests for auto-transitions and event emission
+
+**Step 5: A4 — Improve result handling** (`cowork-agent-runtime`)
+- Change `_RESULT_MAX_CHARS` from `2000` to `8000`
+- Add workspace file write for oversized results in `_run_sub_agent()`
+- Add tests for inline, file-based, and fallback scenarios
+
+**Step 6: A5 — Working memory snapshot** (`cowork-agent-runtime`)
+- Add `_build_working_memory_snapshot()` to `LoopRuntime`
+- Inject snapshot into sub-agent system prompt in `_run_sub_agent()` (after plan context, before "Focus on the assigned task")
+- Add tests for snapshot content and injection
+
+---
+
+## Definition of Done — A1 through A5
+
+### A1: Add "failed" Status to PlanStep
+
+**Code changes:**
+| File | Change |
+|------|--------|
+| `cowork-agent-sdk/src/agent_sdk/memory/plan.py` | Add `"failed"` to `PlanStep.status` Literal. Update `Plan.render()` to show `[FAILED]` marker. |
+| `cowork-agent-runtime/src/agent_host/loop/agent_tools.py` | Update `_handle_update_plan_step()` to accept `"failed"` in status validation (line: `status not in ("in_progress", "completed", "skipped")` → add `"failed"`). |
+
+**Tests:**
+| Test | File | Assertion |
+|------|------|-----------|
+| `test_plan_step_failed_status_valid` | `agent_sdk/.../test_plan.py` | `PlanStep(status="failed")` doesn't raise |
+| `test_plan_render_failed_step` | `agent_sdk/.../test_plan.py` | Rendered output contains `[FAILED]` |
+| `test_plan_render_failed_not_in_progress_guidance` | `agent_sdk/.../test_plan.py` | Failed step doesn't trigger "still marked in_progress" guidance |
+| `test_plan_checkpoint_round_trip_with_failed` | `agent_sdk/.../test_plan.py` | Checkpoint preserves `"failed"` status |
+| `test_update_plan_step_accepts_failed` | `agent_runtime/.../test_agent_tools.py` | `UpdatePlanStep(stepIndex=0, status="failed")` returns success |
+
+**Acceptance criteria:**
+- [ ] `PlanStep(status="failed")` is valid
+- [ ] `Plan.render()` shows failed steps with `[FAILED]` marker (uppercase, visually distinct)
+- [ ] ReactLoop plan continuation treats failed as resolved — no code change needed, verified by existing logic
+- [ ] Checkpoint round-trip preserves "failed"
+- [ ] `UpdatePlanStep` accepts "failed" status
+- [ ] `make check` passes in both repos
+
+---
+
+### A2: Pass Plan Context to Sub-agents
+
+**Code changes:**
+| File | Change |
+|------|--------|
+| **New:** `cowork-agent-runtime/src/agent_host/loop/plan_context.py` | `build_sub_agent_plan_context(plan: Plan, current_step_index: int \| None) -> str` — markdown with goal, steps+status, current step highlighted with `→` |
+| `cowork-agent-runtime/src/agent_host/loop/loop_runtime.py` | `spawn_sub_agent()` and `_run_sub_agent()` gain `plan_step_index: int \| None = None`. When plan exists, build plan context and inject into system prompt. |
+| `cowork-agent-runtime/src/agent_host/loop/agent_tools.py` | `_handle_spawn_agent()` extracts `planStepIndex` from arguments, passes to `spawn_sub_agent()`. SpawnAgent tool definition gains `planStepIndex` (integer, optional). |
+| `cowork-agent-runtime/src/agent_host/loop/agent_tools.py` | Fix EnterPlanMode description: list SpawnAgent and other agent-internal tools as available. |
+
+**Tests:**
+| Test | File | Assertion |
+|------|------|-----------|
+| `test_build_plan_context_with_current_step` | `agent_runtime/.../test_plan_context.py` | Current step marked with `→`, others without |
+| `test_build_plan_context_shows_all_statuses` | `agent_runtime/.../test_plan_context.py` | Completed, pending, failed, in_progress all rendered |
+| `test_build_plan_context_no_step_index` | `agent_runtime/.../test_plan_context.py` | Plan included without "You are implementing" message |
+| `test_build_plan_context_no_plan` | `agent_runtime/.../test_plan_context.py` | Returns empty string when plan is None |
+| `test_spawn_sub_agent_with_plan_injects_context` | `agent_runtime/.../test_loop_runtime.py` | System prompt contains plan goal and step descriptions |
+| `test_spawn_sub_agent_without_plan_unchanged` | `agent_runtime/.../test_loop_runtime.py` | No plan context in system prompt when no plan |
+| `test_enter_plan_mode_description_includes_spawn_agent` | `agent_runtime/.../test_agent_tools.py` | Description mentions SpawnAgent |
+| `test_spawn_agent_tool_definition_has_plan_step_index` | `agent_runtime/.../test_agent_tools.py` | Tool definition includes `planStepIndex` parameter |
+
+**Acceptance criteria:**
+- [ ] Sub-agent system prompt includes parent plan goal + all steps with statuses
+- [ ] Current step highlighted with `→` when `planStepIndex` provided
+- [ ] No plan → no context injection (backward compatible)
+- [ ] EnterPlanMode description accurately lists available tools
+- [ ] SpawnAgent tool definition includes `planStepIndex` (integer, optional, described)
+- [ ] `make check` passes
+
+---
+
+### A3: Auto-Update Plan Step on Sub-agent Return
+
+**Code changes:**
+| File | Change |
+|------|--------|
+| `cowork-agent-runtime/src/agent_host/loop/agent_tools.py` | `_handle_spawn_agent()`: Before spawn — mark step `in_progress` if currently `pending`. After spawn — mark `completed` if `result["status"] == "completed"`, mark `failed` if `result["status"]` in `("error", "max_steps")`. Call `_notify_plan_updated()` after each transition. Guard: validate `planStepIndex` is in range, log warning and skip auto-update if invalid. |
+
+**Tests:**
+| Test | File | Assertion |
+|------|------|-----------|
+| `test_spawn_agent_marks_step_in_progress` | `test_agent_tools.py` | Step transitions pending → in_progress before spawn |
+| `test_spawn_agent_completed_marks_step_completed` | `test_agent_tools.py` | Step transitions to completed on success |
+| `test_spawn_agent_error_marks_step_failed` | `test_agent_tools.py` | Step transitions to failed on error |
+| `test_spawn_agent_max_steps_marks_step_failed` | `test_agent_tools.py` | Step transitions to failed on max_steps |
+| `test_spawn_agent_emits_plan_updated` | `test_agent_tools.py` | `_on_plan_updated` callback called at each transition |
+| `test_spawn_agent_invalid_step_index_no_crash` | `test_agent_tools.py` | Out-of-range index logs warning, no crash, no auto-update |
+| `test_spawn_agent_no_plan_step_index_unchanged` | `test_agent_tools.py` | No plan auto-update when planStepIndex absent |
+| `test_spawn_agent_no_plan_with_step_index_no_crash` | `test_agent_tools.py` | planStepIndex provided but no plan exists → no crash |
+
+**Acceptance criteria:**
+- [ ] Plan step auto-transitions: pending → in_progress → completed/failed
+- [ ] `plan_updated` event emitted after each transition
+- [ ] Invalid step index: log warning, skip auto-update, don't crash
+- [ ] No plan + planStepIndex: skip auto-update, don't crash
+- [ ] SpawnAgent without `planStepIndex` works exactly as before
+- [ ] `make check` passes
+
+---
+
+### A4: Improve Sub-agent Result Handling
+
+**Code changes:**
+| File | Change |
+|------|--------|
+| `cowork-agent-runtime/src/agent_host/loop/loop_runtime.py` | Change `_RESULT_MAX_CHARS` from `2000` to `8000`. In `_run_sub_agent()`: if `len(result_text) > _RESULT_MAX_CHARS` and `self._workspace_dir` is set, write full result to `{workspace_dir}/.cowork/sub-agent-results/{sub_task_id}.md`, truncate inline result, append `"[Full result saved to {path}]"`. On `OSError`: log warning, fall back to inline truncation. |
+
+**Tests:**
+| Test | File | Assertion |
+|------|------|-----------|
+| `test_sub_agent_result_under_limit_inline` | `test_loop_runtime.py` | Results ≤8000 chars returned as-is, no file written |
+| `test_sub_agent_result_over_limit_writes_file` | `test_loop_runtime.py` | Results >8000 chars: file created, inline truncated with path ref |
+| `test_sub_agent_result_file_content_is_full` | `test_loop_runtime.py` | Workspace file contains complete untruncated result |
+| `test_sub_agent_result_write_failure_fallback` | `test_loop_runtime.py` | OSError on write → inline truncation, no crash |
+| `test_sub_agent_result_no_workspace_dir` | `test_loop_runtime.py` | No workspace dir → inline truncation only |
+
+**Acceptance criteria:**
+- [ ] Results ≤8000 chars returned inline (no file)
+- [ ] Results >8000 chars: full result in workspace file, inline truncated with path reference
+- [ ] File write failure → graceful fallback to inline truncation (no crash)
+- [ ] No workspace directory → inline truncation only
+- [ ] `make check` passes
+
+---
+
+### A5: Pass Read-Only Working Memory to Sub-agents
+
+**Code changes:**
+| File | Change |
+|------|--------|
+| `cowork-agent-runtime/src/agent_host/loop/loop_runtime.py` | Add `_build_working_memory_snapshot(self) -> str`. Renders task tracker via `self.working_memory.task_tracker.render()` and notes as `"- {note}"` bullet list. Excludes plan (handled by plan context in A2). Returns empty string if no working memory or empty. In `_run_sub_agent()`: append snapshot to system prompt after plan context. |
+
+**Tests:**
+| Test | File | Assertion |
+|------|------|-----------|
+| `test_working_memory_snapshot_includes_tasks` | `test_loop_runtime.py` | Task tracker content appears in snapshot |
+| `test_working_memory_snapshot_includes_notes` | `test_loop_runtime.py` | Notes rendered as bullet list |
+| `test_working_memory_snapshot_empty` | `test_loop_runtime.py` | Returns "" when no working memory |
+| `test_working_memory_snapshot_excludes_plan` | `test_loop_runtime.py` | Plan not in snapshot (handled separately by A2) |
+| `test_spawn_sub_agent_injects_working_memory` | `test_loop_runtime.py` | Sub-agent system prompt contains task/note content |
+
+**Acceptance criteria:**
+- [ ] Sub-agent sees parent's task list and notes in system prompt
+- [ ] Plan not duplicated (A2 handles plan context separately)
+- [ ] Empty working memory → no empty sections injected
+- [ ] Read-only by nature (text in system prompt)
+- [ ] `make check` passes
