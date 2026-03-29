@@ -2,7 +2,7 @@
 
 **Repos:** `cowork-agent-runtime` (`tool_runtime/tools/browser/`), `cowork-desktop-app` (browser side panel, approval extensions)
 **Bounded Context:** ToolExecution (browser), AgentExecution (UI)
-**Phase:** 2 (MVP); autonomous mode in Phase 3+
+**Phase:** B (roadmap item B1-B8); autonomous mode deferred to future phase
 
 ---
 
@@ -70,7 +70,7 @@ The core requirement is human-in-the-loop browser automation. This means every b
 
 **browser-use** (MIT, Python, 81k stars) is the strongest autonomous browser agent library, but it owns its own agent loop — it makes LLM calls internally, decides what to click, and executes. Inserting approval checkpoints between its internal decisions would require forking or heavy monkey-patching. The autonomous capability it provides is valuable, but for the HITL use case it fights the architecture.
 
-**Playwright MCP** (Apache 2.0, TypeScript, 29k stars) aligns with Cowork's Phase 2 MCP infrastructure, but adds a TypeScript sidecar process and another transport layer when Playwright Python is available in-process.
+**Playwright MCP** (Apache 2.0, TypeScript, 29k stars) aligns with Cowork's MCP infrastructure (Phase C), but adds a TypeScript sidecar process and another transport layer when Playwright Python is available in-process.
 
 **Stagehand** (MIT, TypeScript) has promising act/extract/observe primitives, but its Python SDK is immature and it's optimized for Browserbase cloud.
 
@@ -80,12 +80,12 @@ The core requirement is human-in-the-loop browser automation. This means every b
 - Headed mode for user visibility and takeover
 - Screenshot capture for the side panel and conversation history
 - Accessibility tree API for token-efficient page state
-- Storage state persistence for cross-session auth
-- Native Electron support (future Phase 4 embedding)
+- Persistent browser context (`userDataDir`) for cross-session auth
+- Native Electron support (future — embedded browser view)
 - Multi-browser support (Chromium, Firefox, WebKit)
 - Industry standard, Microsoft-backed
 
-**Phase 3+ option:** browser-use can be added as an optional "autonomous mode" for tasks where the user trades HITL granularity for speed. It would run as a sub-agent, with its LLM calls routed through Cowork's LLM client for budget tracking.
+**Future option:** browser-use can be added as an optional "autonomous mode" for tasks where the user trades HITL granularity for speed. It would run as a sub-agent, with its LLM calls routed through Cowork's LLM client for budget tracking.
 
 ---
 
@@ -116,33 +116,67 @@ tool_runtime/tools/browser/
 
 ```mermaid
 flowchart TD
-  router["router/<br/><small>ToolRouter impl<br/>dispatch + registry</small>"]
-  bm["browser/<br/>browser_manager<br/><small>Playwright lifecycle</small>"]
-  dom["browser/<br/>dom_service<br/><small>a11y tree extraction</small>"]
-  ps["browser/<br/>page_state<br/><small>LLM representation</small>"]
-  sd["browser/<br/>sensitive_detector<br/><small>risk heuristics</small>"]
-  nav["browser/<br/>navigate"]
-  click["browser/<br/>click"]
-  type["browser/<br/>type_text"]
-  sel["browser/<br/>select"]
-  scroll["browser/<br/>scroll"]
-  back["browser/<br/>back"]
-  extract["browser/<br/>extract"]
-  ss["browser/<br/>screenshot"]
-  submit["browser/<br/>submit"]
-  dl["browser/<br/>download"]
-  wait["browser/<br/>wait"]
-  output["output/<br/><small>formatting<br/>truncation</small>"]
-  platform["platform/<br/><small>OS abstraction</small>"]
+  t_router["router/<br/><small>ToolRouter impl<br/>dispatch + registry</small>"]
+  t_bm["browser/<br/>browser_manager<br/><small>Playwright lifecycle</small>"]
+  t_dom["browser/<br/>dom_service<br/><small>a11y tree extraction</small>"]
+  t_ps["browser/<br/>page_state<br/><small>LLM representation</small>"]
+  t_sd["browser/<br/>sensitive_detector<br/><small>risk heuristics</small>"]
+  t_nav["browser/<br/>navigate"]
+  t_click["browser/<br/>click"]
+  t_type["browser/<br/>type_text"]
+  t_sel["browser/<br/>select"]
+  t_scroll["browser/<br/>scroll"]
+  t_back["browser/<br/>back"]
+  t_extract["browser/<br/>extract"]
+  t_ss["browser/<br/>screenshot"]
+  t_submit["browser/<br/>submit"]
+  t_dl["browser/<br/>download"]
+  t_wait["browser/<br/>wait"]
+  t_output["output/<br/><small>formatting<br/>truncation</small>"]
+  t_platform["platform/<br/><small>OS abstraction</small>"]
 
-  router --> nav & click & type & sel & scroll & back & extract & ss & submit & dl & wait
-  nav & click & type & sel & scroll & back & extract & ss & submit & dl & wait --> bm
-  nav & click & type & extract & submit --> dom
-  nav & click & type & extract --> ps
-  click & type & submit --> sd
-  ss --> output
-  dl --> platform
-  dl --> output
+  t_router --> t_nav
+  t_router --> t_click
+  t_router --> t_type
+  t_router --> t_sel
+  t_router --> t_scroll
+  t_router --> t_back
+  t_router --> t_extract
+  t_router --> t_ss
+  t_router --> t_submit
+  t_router --> t_dl
+  t_router --> t_wait
+
+  t_nav --> t_bm
+  t_click --> t_bm
+  t_type --> t_bm
+  t_sel --> t_bm
+  t_scroll --> t_bm
+  t_back --> t_bm
+  t_extract --> t_bm
+  t_ss --> t_bm
+  t_submit --> t_bm
+  t_dl --> t_bm
+  t_wait --> t_bm
+
+  t_nav --> t_dom
+  t_click --> t_dom
+  t_type --> t_dom
+  t_extract --> t_dom
+  t_submit --> t_dom
+
+  t_nav --> t_ps
+  t_click --> t_ps
+  t_type --> t_ps
+  t_extract --> t_ps
+
+  t_click --> t_sd
+  t_type --> t_sd
+  t_submit --> t_sd
+
+  t_ss --> t_output
+  t_dl --> t_platform
+  t_dl --> t_output
 ```
 
 **Dependency rules:**
@@ -173,42 +207,51 @@ stateDiagram-v2
   ShuttingDown --> [*]: cleanup complete
 
   note right of Launching: Lazy — no browser\nresources until needed
-  note right of Suspended: Storage state persisted\nPlaywright closed\nRe-launches on next call
-  note right of ShuttingDown: Storage state persisted\nto workspace directory
+  note right of Suspended: Playwright closed\nProfile dir persists on disk\nRe-launches on next call
+  note right of ShuttingDown: Browser closed\nProfile dir persists on disk
 ```
 
 ### Launch behavior
 
 1. First browser tool call triggers launch
-2. `BrowserManager` starts Playwright in **headed mode** (visible browser window)
-3. Creates a browser context with:
-   - Storage state loaded from workspace directory (if exists — preserves auth from previous sessions)
-   - Viewport size: 1280×800 (configurable)
-   - User-agent: default Chromium (no stealth/anti-detection)
-4. Opens a single page (tab)
-5. Returns the page handle to the requesting tool
+2. `BrowserManager` starts Playwright with a **persistent context** in **headed mode** (visible browser window):
+   ```python
+   context = await playwright.chromium.launch_persistent_context(
+       user_data_dir=f"{workspace_dir}/.cowork/browser-profile",
+       headless=False,
+       viewport={"width": 1280, "height": 800},
+       args=["--disk-cache-size=0"],  # Disable disk cache to keep profile small
+   )
+   ```
+3. Chrome manages its own state in the profile directory — cookies, localStorage, IndexedDB, service workers all persist automatically across browser restarts. No custom serialization needed.
+4. Disk cache is disabled (`--disk-cache-size=0`) to keep the profile directory small (~10-20MB instead of 100-500MB). Pages load from network on every visit — acceptable tradeoff for a tool-driven browser.
+5. Opens a single page (tab)
+6. Returns the page handle to the requesting tool
+
+**Profile directory:** `{workspace_dir}/.cowork/browser-profile/` — managed entirely by Chrome. We never read or write to it directly. Contains cookies, localStorage, IndexedDB, preferences. Survives browser restarts, session boundaries, and crashes.
 
 ### Idle timeout
 
 - Timer resets on every browser tool call
 - After `browserIdleTimeoutSeconds` (default 600s / 10 min, configurable via policy bundle) of no browser tool calls:
-  - Storage state (cookies, localStorage) persisted to disk
   - Browser closed (Playwright process terminates)
   - State transitions to `Suspended`
-- Next browser tool call re-launches (same as initial launch, but with persisted storage state)
+  - Profile directory remains on disk — no export needed, Chrome already persisted state
+- Next browser tool call re-launches with the same `user_data_dir` — Chrome loads cookies, localStorage, etc. from the profile directory automatically
 
 ### Session-end cleanup
 
 On session end or browser toggle off:
-1. Persist storage state to `{workspace_dir}/.cowork/browser-state.json`
-2. Close all pages and browser context
-3. Stop Playwright
-4. State file is encrypted at rest using the OS keychain key (same mechanism as other workspace secrets)
+1. Close all pages and browser context
+2. Stop Playwright
+3. Profile directory remains on disk for next session in the same workspace
+
+No export or serialization step — Chrome manages its own persistence. The profile directory is on the user's local machine (browser automation is desktop-only), so OS-level disk encryption (FileVault / BitLocker) provides at-rest protection.
 
 ### Multiple pages
 
-- Phase 2 (MVP): single page per session. Tools operate on the active page.
-- Phase 3: multi-page support. Agent can open new tabs for parallel research. Page handle passed as optional argument to tools.
+- Phase B (current): single page per session. Tools operate on the active page.
+- Future: multi-page support. Agent can open new tabs for parallel research. Page handle passed as optional argument to tools.
 
 ### Configuration
 
@@ -216,11 +259,11 @@ All settings are configurable — none are hardcoded constants. Policy bundle se
 
 | Setting | Default | Source | Notes |
 |---------|---------|--------|-------|
-| `browserHeadless` | `false` | Policy bundle | Phase 2: always headed. Phase 3+: headless for CI/standalone runtime |
+| `browserHeadless` | `false` | Policy bundle | Phase B: always headed. Future: headless for CI/standalone runtime |
 | `browserViewportWidth` | `1280` | Policy bundle (overridable via session options) | Standard desktop viewport |
 | `browserViewportHeight` | `800` | Policy bundle (overridable via session options) | Standard desktop viewport |
 | `browserIdleTimeoutSeconds` | `600` | Policy bundle | 10 min default. Browser suspends after this idle period |
-| `browserChannel` | `chromium` | Policy bundle | Phase 2: Chromium only. Phase 3+: Firefox, WebKit |
+| `browserChannel` | `chromium` | Policy bundle | Phase B: Chromium only. Future: Firefox, WebKit |
 | `maxDownloadFileSizeBytes` | `524288000` | Policy bundle | 500MB default. Downloads exceeding this are rejected |
 
 ---
@@ -845,11 +888,12 @@ If auto-detection fails (e.g., a custom login form that doesn't use `type=passwo
 
 ### Session persistence
 
-- After successful authentication, Playwright's storage state (cookies + localStorage) is held in the browser context
-- On session end or idle timeout, storage state is persisted to `{workspace_dir}/.cowork/browser-state.json`
-- Next session in the same workspace loads this state → user stays logged in
-- Storage state file is encrypted at rest
-- User can clear stored sessions via browser profile management (Phase 3 UI)
+- Chrome manages its own state via the persistent context profile directory (`{workspace_dir}/.cowork/browser-profile/`)
+- After successful authentication, cookies and localStorage are automatically written to the profile by Chrome
+- Next session in the same workspace re-launches with the same profile → user stays logged in
+- No custom export/import — Chrome handles persistence natively
+- At-rest protection via OS disk encryption (FileVault / BitLocker) — browser automation is desktop-only
+- User can clear stored sessions by deleting the profile directory, or via browser profile management UI (future)
 
 ---
 
@@ -887,7 +931,7 @@ sequenceDiagram
 - **Default:** OFF at session start
 - **Enable:** User clicks toggle. Takes effect on the next task (next `StartTask` call).
 - **Disable:** User clicks toggle again. Browser tools removed from next LLM call. Idle timeout still applies — browser shuts down after 10 minutes of inactivity, or immediately on session end.
-- **Re-enable:** Same session, browser context reused (no re-auth needed if browser is still running or storage state was persisted).
+- **Re-enable:** Same session, browser context reused (no re-auth needed — profile directory preserves state).
 
 ### Why explicit opt-in
 
@@ -909,7 +953,7 @@ Browser automation is **desktop-only**. The Policy Service must not grant `Brows
 
 **How it works:** The Policy Service determines capabilities based on session type. Desktop sessions can include `Browser.*` capabilities (subject to tenant policy). Web sandbox sessions omit them entirely. The agent-runtime doesn't need any conditional logic — it simply never sees `Browser.*` in the policy bundle, so browser tools are never registered, and the LLM never sees them.
 
-**Future consideration (Phase 3+):** If headless browser support is added for CI/automation use cases, a separate capability (e.g., `Browser.Headless`) with its own policy rules could enable limited browser functionality in web sandbox — extract and screenshot only, no user takeover, no form submission, stricter domain restrictions.
+**Future consideration:** If headless browser support is added for CI/automation use cases, a separate capability (e.g., `Browser.Headless`) with its own policy rules could enable limited browser functionality in web sandbox — extract and screenshot only, no user takeover, no form submission, stricter domain restrictions.
 
 ---
 
@@ -1157,20 +1201,20 @@ _NEVER_PARALLELIZE_BROWSER = {
 | `BROWSER_PATH_DENIED` | Download path not in allowed paths | Agent asks user for valid path |
 | `BROWSER_SENSITIVE_DENIED` | User denied sensitive action | Agent tries alternative approach |
 | `BROWSER_SUBMIT_DENIED` | User denied form submission | Agent reports to user |
-| `BROWSER_CRASHED` | Browser process crashed | Re-launch browser, restore storage state |
+| `BROWSER_CRASHED` | Browser process crashed | Re-launch browser with same profile directory |
 
 ### Crash recovery
 
 If the Playwright browser process crashes:
 1. `BrowserManager` detects process exit via Playwright's `browser.on("disconnected")` event
 2. Emits `browser_stopped` event with `reason: "crashed"`
-3. On next browser tool call: re-launches browser with persisted storage state
+3. On next browser tool call: re-launches browser with the same `userDataDir` — Chrome's profile directory survives crashes, so cookies and auth state are preserved
 4. Agent re-extracts page state (may need to re-navigate)
 
-Browser crashes do not affect the agent session — only the browser state is lost.
+Browser crashes do not affect the agent session — only the in-memory page state is lost. Auth state persists in the profile directory.
 
 **Edge cases:**
-- **Corrupted storage state file:** If `browser-state.json` fails to parse, log a warning, delete the file, and launch with a fresh browser context. User will need to re-authenticate.
+- **Corrupted profile directory:** If Playwright fails to launch with the existing profile (e.g., locked files, corrupted SQLite), log a warning, delete the profile directory, and launch fresh. User will need to re-authenticate.
 - **Crash during auth takeover:** Emit `browser_stopped` + `browser_takeover_ended` events. User sees a notification. On next browser tool call, re-launch and re-navigate. The LLM will detect the login page again and request takeover.
 - **Repeated crashes (3+ within 5 minutes):** Mark browser capability as temporarily unavailable. Return `BROWSER_LAUNCH_FAILED` with message suggesting the user restart the session. Do not retry indefinitely.
 
@@ -1197,7 +1241,7 @@ Browser crashes do not affect the agent session — only the browser state is lo
 - The agent never sees or stores user passwords
 - `BrowserType` into password fields triggers approval — the agent must declare what it's doing
 - Form data summaries in submission checkpoints redact sensitive values
-- Storage state files (cookies) are encrypted at rest
+- Browser profile directory protected by OS disk encryption (FileVault / BitLocker)
 - No credential manager integration — authentication is always user-driven via takeover
 
 ### Content isolation
@@ -1216,9 +1260,11 @@ Browser crashes do not affect the agent session — only the browser state is lo
 
 ---
 
-## 15. Phasing
+## 15. Scope
 
-### Phase 2 (MVP) — This document
+### Phase B (Current) — This document
+
+Everything described in this document is in scope for Phase B of the roadmap (`agent-improvement-roadmap.md`, items B1-B8):
 
 - All 11 browser tools in `tool_runtime/tools/browser/`
 - Playwright integration with headed browser + screenshot stream side panel
@@ -1226,25 +1272,25 @@ Browser crashes do not affect the agent session — only the browser state is lo
 - Three-tier HITL (domain approval, sensitive detection, submission checkpoints)
 - User takeover with pause/resume
 - Hybrid auth detection with takeover fallback
-- Persistent browser sessions per workspace (encrypted storage state)
+- Persistent browser sessions per workspace (Chrome profile directory, disk cache disabled)
 - Session-scoped opt-in toggle, policy-gated
 - Browser side panel in desktop app
 - Browser-specific approval dialogs
+- Streaming tool output rendering (`tool_output_chunk` events from Phase A)
 - Lazy launch, 10-min idle timeout, session-end cleanup
 
-### Phase 3
+### Future — Not in Phase B
+
+The following are explicitly out of scope for Phase B. They may be scheduled in later roadmap phases based on user demand.
 
 - **Autonomous browsing mode** — browser-use integration as a sub-agent for goal-driven tasks with reduced HITL. LLM calls routed through Cowork's LLM client for budget tracking.
 - **Browser profile management UI** — view, switch, and clear saved browser sessions per workspace
 - **Multi-page (tab) support** — agent can open multiple tabs for parallel research. Page handle passed as optional tool argument.
 - **Improved sensitive detection** — ML-based classifier instead of heuristic pattern matching, trained on labeled examples of destructive/sensitive UI elements
-
-### Phase 4
-
 - **Embedded interactive browser view** — replace screenshot stream with a true embedded browser inside the Electron window (WebContentsView + CDP). Only if user demand warrants the complexity and security investment.
 - **Web app testing** — localhost browsing, assertion tools, test recording
 - **Workflow recording and replay** — record a browser session as a macro, replay it in future sessions with parameterized inputs
-- **browser-use as primary mode** — if autonomous mode proves reliable in Phase 3, consider making it the default with HITL as the safety net rather than the primary interaction model
+- **browser-use as primary mode** — if autonomous mode proves reliable, consider making it the default with HITL as the safety net rather than the primary interaction model
 
 ---
 
@@ -1252,11 +1298,468 @@ Browser crashes do not affect the agent session — only the browser state is lo
 
 | Question | Current Decision | Revisit When |
 |----------|-----------------|--------------|
-| Multi-browser support (Firefox, WebKit) | Chromium only for MVP | Phase 3 — if users need cross-browser testing |
-| Screenshot stream frame rate | Event-driven (after each action) | Phase 3 — if users want smoother real-time view |
-| Max concurrent browser sessions | One per Cowork session | Phase 3 — tab support may change this |
-| Browser extension support | Not supported | Phase 3 — if users need extensions (e.g., ad blockers) |
-| Headless mode for CI/automation | Headed only for MVP | Phase 3 — when standalone runtime supports headless |
-| Network request interception | Not supported | Phase 3 — useful for testing, mocking APIs |
-| Cookie consent automation | User handles via takeover | Phase 3 — common enough to warrant auto-handling |
-| Proxy configuration | Not supported | Phase 3 — enterprise environments may require proxies |
+| Multi-browser support (Firefox, WebKit) | Chromium only for MVP | Future — if users need cross-browser testing |
+| Screenshot stream frame rate | Event-driven (after each action) | Future — if users want smoother real-time view |
+| Max concurrent browser sessions | One per Cowork session | Future — tab support may change this |
+| Browser extension support | Not supported | Future — if users need extensions (e.g., ad blockers) |
+| Headless mode for CI/automation | Headed only for MVP | Future — when standalone runtime supports headless |
+| Network request interception | Not supported | Future — useful for testing, mocking APIs |
+| Cookie consent automation | User handles via takeover | Future — common enough to warrant auto-handling |
+| Proxy configuration | Not supported | Future — enterprise environments may require proxies |
+
+---
+
+## 17. Implementation Plan
+
+**Status:** Implementation Ready
+**Branch:** `feature/phase-b-browser-automation` (single branch across all affected repos)
+**Repos:** `cowork-agent-runtime`, `cowork-desktop-app`, `cowork-platform`, `cowork-infra`
+
+### Codebase Context (Current State)
+
+**BaseTool** (`tool_runtime/tools/base.py`): Abstract base class. Must implement `name`, `description`, `capability`, `input_schema` properties and `async execute(arguments, context) -> RawToolOutput`. `validate_input()` provided by base class.
+
+**ToolRouter** (`tool_runtime/router/tool_router.py`): Registration via `self._register(tool)` in `__init__`. All 16 built-in tools registered there. `execute(request, context)` dispatches by tool name. `get_available_tools()` returns `list[ToolDefinition]`.
+
+**ToolExecutor** (`agent_host/loop/tool_executor.py`): Orchestrates policy check → approval → execution → artifact upload → events. Key constants to extend: `TOOL_CAPABILITY_MAP`, `PLAN_MODE_ALLOWED_TOOLS`, `_PARALLELIZABLE_TOOLS`, `_TOOL_TIMEOUTS`, `_NO_TIMEOUT_TOOLS`.
+
+**ApprovalGate** (`agent_sdk/approval/approval_gate.py`): `request_approval(approval_id, timeout) -> "approved"|"denied"`. Existing infrastructure handles approval events, Desktop App dialog rendering, and decision delivery. Browser tools use this unchanged.
+
+**ExecutionContext** (`tool_runtime/models.py`): Carries `allowed_domains`, `blocked_domains`, `max_file_size_bytes`, `on_output_chunk`, etc. Browser tools use `allowed_domains`/`blocked_domains` for Tier 1 domain checks.
+
+**EventEmitter** (`agent_host/events/event_emitter.py`): `emit(event_type, task_id, payload)` with arbitrary string event types. New browser events emitted via this.
+
+**Exceptions** (`tool_runtime/exceptions.py`): `ToolRuntimeError` hierarchy with `.code` attribute. Browser tools add subclasses here.
+
+**PlatformAdapter** (`tool_runtime/platform/base.py`): Protocol for OS abstraction. Browser tools use `kill_process_tree()` for cleanup.
+
+### Resolved Ambiguities
+
+| Question | Resolution |
+|----------|-----------|
+| How do browser tools integrate with approval flow? | Via existing `ApprovalGate`. Tier 1 (domain) and Tier 2 (sensitive) approvals are triggered *inside* the browser tool's `execute()` method — the tool calls a domain/sensitive check helper, which emits an approval event and awaits the gate. Tier 3 (submission) same pattern. This keeps approval inside `tool_runtime/` without crossing the `agent_host` boundary — the approval gate is passed via `ExecutionContext`. |
+| How are browser tools conditionally registered? | `ToolRouter.__init__` gains an optional `browser_enabled: bool = False` parameter. When `True`, browser tools are registered. `ToolExecutor` passes this based on session config. |
+| How does the page state return work? | All browser tools return `RawToolOutput(output_text=page_state_markdown)`. `BrowserScreenshot` additionally sets `image_content=ImageContent(...)`. Same pattern as `ViewImage`. |
+| How do tools share the BrowserManager singleton? | `BrowserManager` is instantiated once in `ToolRouter` and passed to all browser tool constructors. Tools call `await self._browser_manager.get_page()` which handles lazy launch. |
+| Are all 11 tools separate classes? | Yes — one class per tool file, all extend `BaseTool`. Shared logic (page state extraction, screenshot capture) is in `BrowserManager`, `DomService`, and `PageState` helpers. |
+| How does domain approval work inside tool_runtime? | `BrowserManager` maintains an in-memory `approved_domains: set[str]`. On first navigation to a new domain, the tool checks `allowed_domains` from `ExecutionContext` (pre-approved) and `approved_domains` (session-approved). If neither, it needs approval — the tool raises a new `BrowserDomainApprovalRequired` error, which `ToolExecutor` catches and routes through the existing approval flow. |
+| User takeover/pause — how does agent loop know? | `BrowserManager` exposes a `pause_event: asyncio.Event`. When user clicks Pause (via IPC → JSON-RPC), the event is set. The next browser tool call checks the event before executing, and waits until it's cleared (Resume). This is internal to `tool_runtime`. |
+| How does `BrowserSubmit` always trigger approval? | The tool itself raises `BrowserSubmitApprovalRequired` with form data payload. `ToolExecutor` catches it and routes through approval flow. This is not policy-driven — the tool enforces it unconditionally. |
+| Where are new error codes defined? | New `ToolRuntimeError` subclasses in `tool_runtime/exceptions.py` with browser-specific `.code` values. New `ErrorCode` constants in `cowork-platform` SDK. |
+| How does screenshot get to Desktop App side panel? | After each action, the tool emits a `browser_page_state` event with `{ url, screenshotBase64 }` via `EventEmitter`. Desktop App receives it via SSE/JSON-RPC notification and updates the Zustand store. |
+
+### Implementation Order
+
+Implementation is split into 12 steps. Each step is independently testable.
+
+**Step 1: Platform contracts (B8)** — `cowork-platform`
+- Add 5 `Browser.*` capabilities to capability schema + codegen
+- Add browser error codes to `ErrorCode` constants
+- Add browser event types to `EventType` constants
+- Regenerate Python + TypeScript bindings
+
+**Step 2: Browser exceptions** — `cowork-agent-runtime`
+- Add browser-specific exception classes to `tool_runtime/exceptions.py`
+- `BrowserLaunchError`, `BrowserDomainBlockedError`, `BrowserDomainDeniedError`, `BrowserNavigationError`, `BrowserAuthRequiredError`, `BrowserElementNotFoundError`, `BrowserElementNotInteractableError`, `BrowserWaitTimeoutError`, `BrowserDownloadError`, `BrowserDownloadTimeoutError`, `BrowserPathDeniedError`, `BrowserSensitiveDeniedError`, `BrowserSubmitDeniedError`, `BrowserCrashedError`
+
+**Step 3: BrowserManager (B1)** — `cowork-agent-runtime`
+- `tool_runtime/tools/browser/browser_manager.py`
+- State machine: Idle → Launching → Active → Suspended → ShuttingDown
+- `launch_persistent_context()` with `userDataDir` and `--disk-cache-size=0`
+- `get_page()` — lazy launch, returns current page
+- `close()` — persist state, close browser
+- Idle timeout via `asyncio.create_task` timer
+- `pause_event` / `resume()` for user takeover
+- Crash detection via `browser.on("disconnected")`
+- Repeated crash protection (3+ in 5 min → mark unavailable)
+
+**Step 4: DomService + PageState (B2)** — `cowork-agent-runtime`
+- `tool_runtime/tools/browser/dom_service.py`
+  - `extract_page_state(page) -> PageState` — a11y tree + indexed interactive elements
+  - Element indexing: depth-first traversal, monotonic indices for interactive elements
+  - Interactive detection: `<a>`, `<button>`, `<input>`, `<select>`, `<textarea>`, ARIA roles, contenteditable
+- `tool_runtime/tools/browser/page_state.py`
+  - `PageState` dataclass: `url`, `title`, `elements` (indexed), `content_markdown`
+  - `render_for_llm(max_tokens) -> str` — markdown with indexed elements, truncated to token budget
+- `tool_runtime/tools/browser/sensitive_detector.py`
+  - `detect_sensitive(element) -> SensitiveType | None` — password, payment, destructive, PII
+  - Heuristic-based: field type, autocomplete attr, name/id patterns, button text
+
+**Step 5: Core browser tools — B3 (6 tools)** — `cowork-agent-runtime`
+- `navigate.py`: URL validation (http/https only, SSRF check), domain check (Tier 1), `page.goto()`, extract page state, capture screenshot, auth detection
+- `click.py`: Resolve by index, sensitive check (Tier 2), scroll into view, `element.click()`, wait for settlement, re-extract
+- `type_text.py`: Resolve by index, sensitive field check (Tier 2), `element.fill()` or `element.type()`, re-extract
+- `select.py`: Resolve by index, element type detection (dropdown/checkbox/radio), appropriate selection, re-extract
+- `scroll.py`: Direction + amount, `page.evaluate()` scroll, wait for lazy load, re-extract
+- `back.py`: `page.go_back()`, re-extract
+
+**Step 6: Extract + Screenshot tools — B4 (2 tools)** — `cowork-agent-runtime`
+- `extract.py`: Optional CSS selector scope, format (markdown/text/html), truncation
+- `screenshot.py`: `page.screenshot()` / `element.screenshot()`, return as `ImageContent`, store as artifact
+
+**Step 7: Submit + Download + Wait tools — B5 (3 tools)** — `cowork-agent-runtime`
+- `submit.py`: Form data extraction, redaction algorithm, unconditional approval, click submit, re-extract
+- `download.py`: Path validation, approval, click/navigate, Playwright download handler, move to savePath
+- `wait.py`: Condition routing (element/navigation/networkidle), Playwright wait APIs, re-extract
+
+**Step 8: Tool registration + ToolExecutor integration** — `cowork-agent-runtime`
+- `ToolRouter`: Conditional browser tool registration (`browser_enabled` flag)
+- `ToolExecutor`: Add browser tools to `TOOL_CAPABILITY_MAP`, `PLAN_MODE_ALLOWED_TOOLS` (Extract, Screenshot only), `_TOOL_TIMEOUTS` (Navigate=60s, others=30s), browser-specific approval handling
+- Domain approval flow: `ToolExecutor` catches `BrowserDomainApprovalRequired`, routes through `ApprovalGate`
+- Sensitive approval flow: catches `BrowserSensitiveApprovalRequired`, routes through `ApprovalGate`
+- Submit approval flow: catches `BrowserSubmitApprovalRequired`, routes through `ApprovalGate`
+
+**Step 9: Event types + wiring** — `cowork-agent-runtime`
+- `EventEmitter`: Add `emit_browser_started()`, `emit_browser_stopped()`, `emit_browser_page_state()`, `emit_browser_auth_required()`, `emit_browser_takeover_started()`, `emit_browser_takeover_ended()`, `emit_browser_domain_approved()`
+- `BrowserManager` emits lifecycle events via callback to `EventEmitter`
+- Browser tools emit `browser_page_state` after each action (screenshot + URL for side panel)
+
+**Step 10: Session + StartTask plumbing** — `cowork-agent-runtime`
+- `SessionManager.start_task()`: Read `browserEnabled` from `taskOptions`, pass to `LoopRuntime` → `ToolExecutor` → `ToolRouter`
+- `SessionManager`: Wire `browser:pause` / `browser:resume` JSON-RPC methods to `BrowserManager.pause_event`
+- `LoopRuntime`: Pass `browser_enabled` through to `ToolExecutor` on construction
+- System prompt: When browser tools are enabled, add guidance for when to use browser vs file/shell tools
+
+**Step 11: Policy Service** — `cowork-policy-service`
+- Add `Browser.*` capabilities to static policy config schema
+- Add `browserConfig` section: `allowedDomains`, `blockedDomains`, `browserIdleTimeoutSeconds`, viewport settings
+- Session-type awareness: config supports `desktop` vs `sandbox` profiles. Sandbox profile omits `Browser.*` capabilities. Desktop profile includes them (subject to tenant policy).
+- Default policy: browser capabilities disabled (must be explicitly granted per tenant)
+- Tests: policy bundle includes/excludes browser capabilities based on session type and tenant config
+
+**Step 12: Desktop App integration (B7)** — `cowork-desktop-app`
+- `renderer/views/conversation/browser-panel.tsx` — side panel with URL bar, screenshot, action buttons
+- `renderer/components/browser-toggle.tsx` — enable/disable toggle in prompt area
+- `renderer/components/browser-approval.tsx` — 3 approval dialog variants (domain, sensitive, submission)
+- `renderer/state/browser-store.ts` — Zustand store for browser state
+- `main/ipc-handlers.ts` — add `browser:takeover`, `browser:pause`, `browser:resume`, `browser:close` handlers
+- `shared/ipc-channels.ts` — add browser channel constants
+- Streaming tool output: listen for `tool_output_chunk` events, render in conversation view
+- JSON-RPC: wire `browser:pause/resume` to agent-runtime RPC
+- Toggle sends `browserEnabled` in `StartTask` taskOptions
+- Handle `browser_page_state`, `browser_auth_required`, `browser_started`, `browser_stopped` events
+- Handle policy check: gray out toggle if session policy lacks `Browser.*` capabilities
+
+---
+
+## 18. Definition of Done
+
+### B1: BrowserManager & Playwright Integration
+
+**Code changes:**
+| File | Change |
+|------|--------|
+| **New:** `cowork-agent-runtime/src/tool_runtime/tools/browser/__init__.py` | Package init |
+| **New:** `cowork-agent-runtime/src/tool_runtime/tools/browser/browser_manager.py` | BrowserManager class: state machine, `launch_persistent_context`, `get_page()`, `close()`, idle timeout, pause/resume, crash detection |
+
+**Tests:**
+| Test | Assertion |
+|------|-----------|
+| `test_browser_manager_lazy_launch` | No browser process until first `get_page()` call |
+| `test_browser_manager_get_page_returns_page` | Returns Playwright Page object |
+| `test_browser_manager_idle_timeout_closes_browser` | Browser closes after configured idle period |
+| `test_browser_manager_resume_after_suspend` | Re-launches with same `userDataDir`, page accessible |
+| `test_browser_manager_close_cleanup` | Browser process terminated, state → ShuttingDown |
+| `test_browser_manager_crash_detection` | Disconnected event transitions state, next call re-launches |
+| `test_browser_manager_repeated_crash_unavailable` | 3+ crashes in 5 min → raises `BrowserLaunchError` |
+| `test_browser_manager_pause_resume` | Pause blocks `get_page()`, resume unblocks |
+
+**Acceptance criteria:**
+- [ ] Browser launches only on first tool call (lazy)
+- [ ] Idle timeout closes browser, next call re-launches with preserved profile
+- [ ] Crash detection and recovery with repeated-crash protection
+- [ ] Pause/resume for user takeover
+- [ ] `make check` passes
+
+---
+
+### B2: DomService & PageState
+
+**Code changes:**
+| File | Change |
+|------|--------|
+| **New:** `cowork-agent-runtime/src/tool_runtime/tools/browser/dom_service.py` | `extract_page_state()`: a11y tree traversal, interactive element indexing, element metadata |
+| **New:** `cowork-agent-runtime/src/tool_runtime/tools/browser/page_state.py` | `PageState` dataclass, `render_for_llm()` with token budget truncation |
+| **New:** `cowork-agent-runtime/src/tool_runtime/tools/browser/sensitive_detector.py` | `detect_sensitive()`: password, payment, destructive, PII heuristics |
+
+**Tests:**
+| Test | Assertion |
+|------|-----------|
+| `test_dom_service_indexes_interactive_elements` | Links, buttons, inputs assigned indices |
+| `test_dom_service_skips_non_interactive` | Static text not indexed |
+| `test_dom_service_depth_first_ordering` | Indices follow DOM order |
+| `test_page_state_render_within_token_budget` | Output truncated at configured max tokens |
+| `test_page_state_render_includes_url_and_title` | URL and title in rendered output |
+| `test_sensitive_detector_password_field` | `input[type=password]` detected |
+| `test_sensitive_detector_payment_field` | `autocomplete="cc-number"` detected |
+| `test_sensitive_detector_destructive_button` | "Delete" button text detected |
+| `test_sensitive_detector_normal_field_not_flagged` | Regular text input returns None |
+
+**Acceptance criteria:**
+- [ ] Page state renders interactive elements with indices, static content as markdown
+- [ ] Token budget enforced with 80/20 head/tail truncation
+- [ ] Sensitive detector identifies password, payment, destructive, PII fields
+- [ ] `make check` passes
+
+---
+
+### B3: Core Browser Tools (6 tools)
+
+**Code changes:**
+| File | Change |
+|------|--------|
+| **New:** `navigate.py` | BrowserNavigate: URL validation, SSRF check, domain check, `page.goto()`, page state, screenshot, auth detection |
+| **New:** `click.py` | BrowserClick: resolve by index, sensitive check, scroll, click, wait, re-extract |
+| **New:** `type_text.py` | BrowserType: resolve by index, sensitive field check, fill/type, re-extract |
+| **New:** `select.py` | BrowserSelect: element type detection, appropriate selection method |
+| **New:** `scroll.py` | BrowserScroll: direction/amount, scroll, wait for lazy load, re-extract |
+| **New:** `back.py` | BrowserBack: go_back(), re-extract |
+
+**Tests (per tool):**
+| Test | Assertion |
+|------|-----------|
+| `test_navigate_valid_url` | Navigates successfully, returns page state |
+| `test_navigate_blocked_domain` | Raises `BrowserDomainBlockedError` |
+| `test_navigate_ssrf_local_address` | Blocks `127.0.0.1`, `10.*`, `192.168.*` |
+| `test_navigate_http_https_only` | Blocks `file://`, `javascript:`, `data:` schemes |
+| `test_navigate_auth_detection` | Returns `BrowserAuthRequiredError` on login page |
+| `test_click_valid_index` | Clicks element, returns updated page state |
+| `test_click_invalid_index` | Raises `BrowserElementNotFoundError` |
+| `test_click_sensitive_destructive` | Triggers sensitive detection for "Delete" buttons |
+| `test_type_into_field` | Types text, returns updated page state |
+| `test_type_password_field_sensitive` | Triggers sensitive detection for password fields |
+| `test_select_dropdown` | Selects option in `<select>` element |
+| `test_scroll_down_page` | Scrolls, re-extracts page state |
+| `test_back_navigates_history` | Goes back, re-extracts page state |
+
+**Acceptance criteria:**
+- [ ] All 6 tools return updated page state after action
+- [ ] URL validation blocks non-HTTP schemes and local addresses
+- [ ] Domain check integrates with `allowed_domains`/`blocked_domains` from `ExecutionContext`
+- [ ] Sensitive detection triggers for password fields and destructive buttons
+- [ ] `make check` passes
+
+---
+
+### B4: Extraction & Screenshot Tools (2 tools)
+
+**Code changes:**
+| File | Change |
+|------|--------|
+| **New:** `extract.py` | BrowserExtract: optional selector scope, markdown/text/html format, truncation |
+| **New:** `screenshot.py` | BrowserScreenshot: viewport/full-page/element, `ImageContent` return, artifact storage |
+
+**Tests:**
+| Test | Assertion |
+|------|-----------|
+| `test_extract_full_page_markdown` | Returns page content as markdown |
+| `test_extract_with_selector` | Scopes to CSS selector |
+| `test_extract_truncation` | Output truncated when exceeding max bytes |
+| `test_screenshot_viewport` | Returns `ImageContent` with base64 PNG |
+| `test_screenshot_full_page` | Captures scrollable area |
+| `test_screenshot_element` | Captures specific element |
+
+**Acceptance criteria:**
+- [ ] Extract returns content in requested format (markdown/text/html)
+- [ ] Screenshot returns `ImageContent` (same pattern as ViewImage)
+- [ ] Large outputs trigger artifact extraction
+- [ ] `make check` passes
+
+---
+
+### B5: Submission, Download & Wait Tools (3 tools)
+
+**Code changes:**
+| File | Change |
+|------|--------|
+| **New:** `submit.py` | BrowserSubmit: form data extraction, redaction, unconditional approval, submit |
+| **New:** `download.py` | BrowserDownload: path validation, approval, download handler, move to savePath |
+| **New:** `wait.py` | BrowserWait: condition routing (element/navigation/networkidle), Playwright wait APIs |
+
+**Tests:**
+| Test | Assertion |
+|------|-----------|
+| `test_submit_extracts_form_data` | Correct label+value pairs extracted |
+| `test_submit_redacts_password` | Password fields show `"••••••"` |
+| `test_submit_redacts_credit_card` | CC fields show last 4 digits |
+| `test_submit_short_values_fully_redacted` | Values ≤2 chars show `"••"` |
+| `test_download_path_validation` | Rejects paths outside workspace |
+| `test_download_size_limit` | Rejects downloads exceeding `maxDownloadFileSizeBytes` |
+| `test_wait_element_condition` | Waits for CSS selector to appear |
+| `test_wait_timeout` | Raises `BrowserWaitTimeoutError` after configured timeout |
+
+**Acceptance criteria:**
+- [ ] Form data redaction follows documented algorithm (password, CC, SSN, short values)
+- [ ] Submit always triggers approval (unconditional, not policy-driven)
+- [ ] Download validates path against allowed workspace paths
+- [ ] Wait supports element, navigation, networkidle conditions
+- [ ] `make check` passes
+
+---
+
+### B6: Three-Tier HITL & SensitiveDetector
+
+**Code changes:**
+| File | Change |
+|------|--------|
+| `cowork-agent-runtime/src/agent_host/loop/tool_executor.py` | Add browser approval handling: catch `BrowserDomainApprovalRequired`, `BrowserSensitiveApprovalRequired`, `BrowserSubmitApprovalRequired` → route through `ApprovalGate` with appropriate risk levels and payloads |
+| `cowork-agent-runtime/src/tool_runtime/tools/browser/browser_manager.py` | Add `approved_domains: set[str]` for session-scoped domain tracking |
+
+**Tests:**
+| Test | Assertion |
+|------|-----------|
+| `test_domain_approval_new_domain` | First visit triggers approval, second visit skips |
+| `test_domain_pre_approved_by_policy` | Domains in `allowedDomains` skip approval |
+| `test_domain_blocked_by_policy` | Domains in `blockedDomains` denied without prompt |
+| `test_sensitive_password_triggers_approval` | Password field interaction shows approval dialog |
+| `test_sensitive_destructive_triggers_approval` | "Delete" button shows approval dialog |
+| `test_submit_always_triggers_approval` | Every form submission requires approval regardless of domain/policy |
+| `test_approval_denied_returns_error` | Denied approval returns appropriate error code |
+
+**Acceptance criteria:**
+- [ ] Tier 1: new domains require approval, `allowedDomains` pre-approves, `blockedDomains` blocks
+- [ ] Tier 2: password fields, payment forms, destructive buttons trigger approval
+- [ ] Tier 3: form submissions always require approval with form data + screenshot
+- [ ] Denied approvals return appropriate error codes to LLM
+- [ ] `make check` passes
+
+---
+
+### B7: Desktop App Integration & User Takeover
+
+**Code changes:**
+| File | Change |
+|------|--------|
+| **New:** `cowork-desktop-app/src/renderer/views/conversation/browser-panel.tsx` | Collapsible side panel: URL bar, screenshot stream, Takeover/Pause/Close buttons |
+| **New:** `cowork-desktop-app/src/renderer/components/browser-toggle.tsx` | Toggle in prompt area, grayed if policy denies |
+| **New:** `cowork-desktop-app/src/renderer/components/browser-approval.tsx` | 3 approval dialog variants (domain/sensitive/submission) |
+| **New:** `cowork-desktop-app/src/renderer/state/browser-store.ts` | Zustand store: browserEnabled, browserStatus, currentUrl, currentScreenshot, approvedDomains, panelOpen |
+| `cowork-desktop-app/src/main/ipc-handlers.ts` | Add `browser:*` channel handlers, wire pause/resume to JSON-RPC |
+| `cowork-desktop-app/src/shared/ipc-channels.ts` | Add browser channel constants |
+| `cowork-desktop-app/src/renderer/views/conversation/` | Render `tool_output_chunk` events inline (streaming command output from Phase A) |
+| `cowork-desktop-app/src/renderer/views/conversation/` | Toggle sends `browserEnabled` in `StartTask` taskOptions |
+| `cowork-desktop-app/src/renderer/views/conversation/` | Listen for `browser_page_state`, `browser_auth_required`, `browser_started`, `browser_stopped` events |
+
+**Tests:**
+| Test | Assertion |
+|------|-----------|
+| `test_browser_panel_opens_on_browser_started` | Panel opens when `browser_started` event received |
+| `test_browser_panel_updates_screenshot` | Screenshot updates on `browser_page_state` event |
+| `test_browser_toggle_grayed_without_capability` | Toggle disabled when policy lacks `Browser.*` |
+| `test_browser_toggle_sends_option_in_start_task` | StartTask includes `browserEnabled: true` when toggle on |
+| `test_browser_store_reset_on_session_end` | Store clears on session end |
+| `test_tool_output_chunk_renders_inline` | Streaming output appears in conversation view |
+| `test_browser_auth_required_shows_notification` | Auth required event shows login prompt with Resume button |
+
+**Acceptance criteria:**
+- [ ] Side panel opens on first browser tool, shows URL + screenshot + action buttons
+- [ ] Toggle grayed out if policy doesn't grant `Browser.*`
+- [ ] Toggle sends `browserEnabled: true` in `StartTask` taskOptions
+- [ ] 3 approval dialog variants render correctly with appropriate risk levels
+- [ ] Takeover focuses browser window, Pause suspends agent, Resume continues
+- [ ] Auth required notification shows with Resume button
+- [ ] `tool_output_chunk` events render as streaming output in conversation view
+- [ ] `make check` passes in `cowork-desktop-app`
+
+---
+
+### B8: Policy & Contract Updates
+
+**Code changes:**
+| File | Change |
+|------|--------|
+| `cowork-platform/contracts/schemas/capability.json` | Add `Browser.Navigate`, `Browser.Interact`, `Browser.Extract`, `Browser.Submit`, `Browser.Download` to capability name enum |
+| `cowork-platform/sdk/python/cowork_platform_sdk/constants.py` | Add `CapabilityName.BROWSER_*` constants, `ErrorCode.BROWSER_*` constants, `EventType.BROWSER_*` constants |
+| `cowork-platform/sdk/typescript/src/constants.ts` | Same additions for TypeScript |
+| `cowork-platform/contracts/enums/event-types.json` | Add browser event types |
+| Codegen | Regenerate Python + TypeScript bindings |
+
+**Tests:**
+| Test | Assertion |
+|------|-----------|
+| `test_browser_capabilities_in_schema` | All 5 Browser.* capabilities valid in generated models |
+| `test_browser_error_codes_defined` | All BROWSER_* error codes accessible |
+| `test_browser_event_types_defined` | All browser_* event types accessible |
+
+**Acceptance criteria:**
+- [ ] 5 Browser.* capabilities defined in platform contracts
+- [ ] 14 browser error codes defined
+- [ ] 7 browser event types defined
+- [ ] Codegen produces valid Python + TypeScript bindings
+- [ ] `make check` passes in `cowork-platform`
+
+---
+
+### Session + StartTask Plumbing
+
+This is not a roadmap item — it's the glue that makes browser tools reachable from the user. Without it, the tools exist but nothing enables them.
+
+**Code changes:**
+| File | Change |
+|------|--------|
+| `cowork-agent-runtime/src/agent_host/session/session_manager.py` | Read `browserEnabled` from `taskOptions` in `start_task()`. Pass to `LoopRuntime` constructor. Wire `browser.pause` / `browser.resume` JSON-RPC methods to `BrowserManager`. |
+| `cowork-agent-runtime/src/agent_host/loop/loop_runtime.py` | Accept `browser_enabled: bool` parameter. Pass to `ToolExecutor` on construction. |
+| `cowork-agent-runtime/src/agent_host/loop/tool_executor.py` | Accept `browser_enabled: bool`. Pass to `ToolRouter` so it conditionally registers browser tools. |
+| `cowork-agent-runtime/src/agent_host/server/handlers.py` | Register `browser.pause` and `browser.resume` JSON-RPC methods. |
+| `cowork-agent-runtime/src/agent_host/loop/system_prompt.py` or equivalent | When browser tools enabled, add guidance: "You have browser tools available. Use them for web research, form filling, and data extraction. For local file work, use the file and shell tools." |
+
+**Tests:**
+| Test | Assertion |
+|------|-----------|
+| `test_start_task_browser_enabled_passes_to_tool_executor` | `browserEnabled: true` in taskOptions → ToolExecutor receives flag |
+| `test_start_task_browser_disabled_by_default` | No `browserEnabled` → browser tools not registered |
+| `test_browser_pause_rpc_sets_event` | `browser.pause` RPC sets BrowserManager pause event |
+| `test_browser_resume_rpc_clears_event` | `browser.resume` RPC clears pause event |
+
+**Acceptance criteria:**
+- [ ] `browserEnabled` flows from `StartTask` → `SessionManager` → `LoopRuntime` → `ToolExecutor` → `ToolRouter`
+- [ ] Browser tools only registered when `browserEnabled=true` AND policy grants `Browser.*`
+- [ ] `browser.pause` / `browser.resume` JSON-RPC methods work
+- [ ] System prompt includes browser guidance when tools enabled
+- [ ] Default is `browserEnabled=false` — zero impact on existing sessions
+- [ ] `make check` passes
+
+---
+
+### Policy Service Updates
+
+The Policy Service must generate policy bundles that include or exclude browser capabilities based on tenant config and session type.
+
+**Code changes:**
+| File | Change |
+|------|--------|
+| `cowork-policy-service/src/policy_service/config/` | Add `browserPolicy` section to static config schema: `enabled` (bool), `allowedDomains`, `blockedDomains`, `browserIdleTimeoutSeconds`, `viewportWidth`, `viewportHeight`, `maxDownloadFileSizeBytes` |
+| `cowork-policy-service/src/policy_service/services/policy_builder.py` | When building policy bundle: if `browserPolicy.enabled=true` AND session type is `desktop`, include 5 `Browser.*` capabilities with scope fields. If session type is `sandbox` or `browserPolicy.enabled=false`, omit. |
+| `cowork-policy-service/src/policy_service/config/default.yaml` (or `.json`) | Add default browser policy: `enabled: false` (must be explicitly enabled per tenant) |
+
+**Tests:**
+| Test | Assertion |
+|------|-----------|
+| `test_policy_bundle_includes_browser_when_enabled` | Desktop session + enabled → 5 Browser.* capabilities in bundle |
+| `test_policy_bundle_excludes_browser_when_disabled` | Disabled → no Browser.* capabilities |
+| `test_policy_bundle_excludes_browser_for_sandbox` | Sandbox session → no Browser.* even if enabled |
+| `test_policy_bundle_browser_domains` | `allowedDomains` and `blockedDomains` flow into capability scope |
+| `test_policy_bundle_browser_defaults` | Missing browser config → no Browser.* (safe default) |
+
+**Acceptance criteria:**
+- [ ] Browser capabilities included in policy bundle only when explicitly enabled AND desktop session
+- [ ] Sandbox sessions never get browser capabilities regardless of config
+- [ ] `allowedDomains`, `blockedDomains`, idle timeout, viewport, download size flow through policy bundle
+- [ ] Default config has browser disabled (zero impact on existing deployments)
+- [ ] `make check` passes in `cowork-policy-service`
+
+---
+
+### Cross-cutting Requirements
+
+All items:
+- [ ] Single feature branch: `feature/phase-b-browser-automation` per repo
+- [ ] `make check` passes in all affected repos (`cowork-platform`, `cowork-agent-runtime`, `cowork-desktop-app`, `cowork-policy-service`, `cowork-infra`)
+- [ ] No regressions in existing tests
+- [ ] Structured logging with `structlog` for all new code paths
+- [ ] Error handling: browser exceptions mapped to error codes, no unhandled exceptions
+- [ ] Backward compatible: browser tools are opt-in, existing sessions unaffected
+- [ ] SSRF prevention: block `file://`, `javascript:`, `data:`, local/private IPs
+- [ ] Playwright as optional dependency: `pip install cowork-agent-runtime[browser]` extras group
+- [ ] End-to-end testable: user can enable toggle → start task → agent uses browser tools → results shown
+- [ ] PR with squash merge to main after all items complete
