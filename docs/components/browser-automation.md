@@ -2,7 +2,7 @@
 
 **Repos:** `cowork-agent-runtime` (`tool_runtime/tools/browser/`), `cowork-desktop-app` (browser side panel, approval extensions)
 **Bounded Context:** ToolExecution (browser), AgentExecution (UI)
-**Phase:** 2 (MVP); autonomous mode in Phase 3+
+**Phase:** B (roadmap item B1-B8); autonomous mode deferred to future phase
 
 ---
 
@@ -70,7 +70,7 @@ The core requirement is human-in-the-loop browser automation. This means every b
 
 **browser-use** (MIT, Python, 81k stars) is the strongest autonomous browser agent library, but it owns its own agent loop — it makes LLM calls internally, decides what to click, and executes. Inserting approval checkpoints between its internal decisions would require forking or heavy monkey-patching. The autonomous capability it provides is valuable, but for the HITL use case it fights the architecture.
 
-**Playwright MCP** (Apache 2.0, TypeScript, 29k stars) aligns with Cowork's Phase 2 MCP infrastructure, but adds a TypeScript sidecar process and another transport layer when Playwright Python is available in-process.
+**Playwright MCP** (Apache 2.0, TypeScript, 29k stars) aligns with Cowork's MCP infrastructure (Phase C), but adds a TypeScript sidecar process and another transport layer when Playwright Python is available in-process.
 
 **Stagehand** (MIT, TypeScript) has promising act/extract/observe primitives, but its Python SDK is immature and it's optimized for Browserbase cloud.
 
@@ -81,11 +81,11 @@ The core requirement is human-in-the-loop browser automation. This means every b
 - Screenshot capture for the side panel and conversation history
 - Accessibility tree API for token-efficient page state
 - Persistent browser context (`userDataDir`) for cross-session auth
-- Native Electron support (future Phase 4 embedding)
+- Native Electron support (future — embedded browser view)
 - Multi-browser support (Chromium, Firefox, WebKit)
 - Industry standard, Microsoft-backed
 
-**Phase 3+ option:** browser-use can be added as an optional "autonomous mode" for tasks where the user trades HITL granularity for speed. It would run as a sub-agent, with its LLM calls routed through Cowork's LLM client for budget tracking.
+**Future option:** browser-use can be added as an optional "autonomous mode" for tasks where the user trades HITL granularity for speed. It would run as a sub-agent, with its LLM calls routed through Cowork's LLM client for budget tracking.
 
 ---
 
@@ -250,8 +250,8 @@ No export or serialization step — Chrome manages its own persistence. The prof
 
 ### Multiple pages
 
-- Phase 2 (MVP): single page per session. Tools operate on the active page.
-- Phase 3: multi-page support. Agent can open new tabs for parallel research. Page handle passed as optional argument to tools.
+- Phase B (current): single page per session. Tools operate on the active page.
+- Future: multi-page support. Agent can open new tabs for parallel research. Page handle passed as optional argument to tools.
 
 ### Configuration
 
@@ -259,11 +259,11 @@ All settings are configurable — none are hardcoded constants. Policy bundle se
 
 | Setting | Default | Source | Notes |
 |---------|---------|--------|-------|
-| `browserHeadless` | `false` | Policy bundle | Phase 2: always headed. Phase 3+: headless for CI/standalone runtime |
+| `browserHeadless` | `false` | Policy bundle | Phase B: always headed. Future: headless for CI/standalone runtime |
 | `browserViewportWidth` | `1280` | Policy bundle (overridable via session options) | Standard desktop viewport |
 | `browserViewportHeight` | `800` | Policy bundle (overridable via session options) | Standard desktop viewport |
 | `browserIdleTimeoutSeconds` | `600` | Policy bundle | 10 min default. Browser suspends after this idle period |
-| `browserChannel` | `chromium` | Policy bundle | Phase 2: Chromium only. Phase 3+: Firefox, WebKit |
+| `browserChannel` | `chromium` | Policy bundle | Phase B: Chromium only. Future: Firefox, WebKit |
 | `maxDownloadFileSizeBytes` | `524288000` | Policy bundle | 500MB default. Downloads exceeding this are rejected |
 
 ---
@@ -893,7 +893,7 @@ If auto-detection fails (e.g., a custom login form that doesn't use `type=passwo
 - Next session in the same workspace re-launches with the same profile → user stays logged in
 - No custom export/import — Chrome handles persistence natively
 - At-rest protection via OS disk encryption (FileVault / BitLocker) — browser automation is desktop-only
-- User can clear stored sessions by deleting the profile directory, or via browser profile management UI (Phase 3)
+- User can clear stored sessions by deleting the profile directory, or via browser profile management UI (future)
 
 ---
 
@@ -953,7 +953,7 @@ Browser automation is **desktop-only**. The Policy Service must not grant `Brows
 
 **How it works:** The Policy Service determines capabilities based on session type. Desktop sessions can include `Browser.*` capabilities (subject to tenant policy). Web sandbox sessions omit them entirely. The agent-runtime doesn't need any conditional logic — it simply never sees `Browser.*` in the policy bundle, so browser tools are never registered, and the LLM never sees them.
 
-**Future consideration (Phase 3+):** If headless browser support is added for CI/automation use cases, a separate capability (e.g., `Browser.Headless`) with its own policy rules could enable limited browser functionality in web sandbox — extract and screenshot only, no user takeover, no form submission, stricter domain restrictions.
+**Future consideration:** If headless browser support is added for CI/automation use cases, a separate capability (e.g., `Browser.Headless`) with its own policy rules could enable limited browser functionality in web sandbox — extract and screenshot only, no user takeover, no form submission, stricter domain restrictions.
 
 ---
 
@@ -1260,9 +1260,11 @@ Browser crashes do not affect the agent session — only the in-memory page stat
 
 ---
 
-## 15. Phasing
+## 15. Scope
 
-### Phase 2 (MVP) — This document
+### Phase B (Current) — This document
+
+Everything described in this document is in scope for Phase B of the roadmap (`agent-improvement-roadmap.md`, items B1-B8):
 
 - All 11 browser tools in `tool_runtime/tools/browser/`
 - Playwright integration with headed browser + screenshot stream side panel
@@ -1274,21 +1276,21 @@ Browser crashes do not affect the agent session — only the in-memory page stat
 - Session-scoped opt-in toggle, policy-gated
 - Browser side panel in desktop app
 - Browser-specific approval dialogs
+- Streaming tool output rendering (`tool_output_chunk` events from Phase A)
 - Lazy launch, 10-min idle timeout, session-end cleanup
 
-### Phase 3
+### Future — Not in Phase B
+
+The following are explicitly out of scope for Phase B. They may be scheduled in later roadmap phases based on user demand.
 
 - **Autonomous browsing mode** — browser-use integration as a sub-agent for goal-driven tasks with reduced HITL. LLM calls routed through Cowork's LLM client for budget tracking.
 - **Browser profile management UI** — view, switch, and clear saved browser sessions per workspace
 - **Multi-page (tab) support** — agent can open multiple tabs for parallel research. Page handle passed as optional tool argument.
 - **Improved sensitive detection** — ML-based classifier instead of heuristic pattern matching, trained on labeled examples of destructive/sensitive UI elements
-
-### Phase 4
-
 - **Embedded interactive browser view** — replace screenshot stream with a true embedded browser inside the Electron window (WebContentsView + CDP). Only if user demand warrants the complexity and security investment.
 - **Web app testing** — localhost browsing, assertion tools, test recording
 - **Workflow recording and replay** — record a browser session as a macro, replay it in future sessions with parameterized inputs
-- **browser-use as primary mode** — if autonomous mode proves reliable in Phase 3, consider making it the default with HITL as the safety net rather than the primary interaction model
+- **browser-use as primary mode** — if autonomous mode proves reliable, consider making it the default with HITL as the safety net rather than the primary interaction model
 
 ---
 
@@ -1296,11 +1298,11 @@ Browser crashes do not affect the agent session — only the in-memory page stat
 
 | Question | Current Decision | Revisit When |
 |----------|-----------------|--------------|
-| Multi-browser support (Firefox, WebKit) | Chromium only for MVP | Phase 3 — if users need cross-browser testing |
-| Screenshot stream frame rate | Event-driven (after each action) | Phase 3 — if users want smoother real-time view |
-| Max concurrent browser sessions | One per Cowork session | Phase 3 — tab support may change this |
-| Browser extension support | Not supported | Phase 3 — if users need extensions (e.g., ad blockers) |
-| Headless mode for CI/automation | Headed only for MVP | Phase 3 — when standalone runtime supports headless |
-| Network request interception | Not supported | Phase 3 — useful for testing, mocking APIs |
-| Cookie consent automation | User handles via takeover | Phase 3 — common enough to warrant auto-handling |
-| Proxy configuration | Not supported | Phase 3 — enterprise environments may require proxies |
+| Multi-browser support (Firefox, WebKit) | Chromium only for MVP | Future — if users need cross-browser testing |
+| Screenshot stream frame rate | Event-driven (after each action) | Future — if users want smoother real-time view |
+| Max concurrent browser sessions | One per Cowork session | Future — tab support may change this |
+| Browser extension support | Not supported | Future — if users need extensions (e.g., ad blockers) |
+| Headless mode for CI/automation | Headed only for MVP | Future — when standalone runtime supports headless |
+| Network request interception | Not supported | Future — useful for testing, mocking APIs |
+| Cookie consent automation | User handles via takeover | Future — common enough to warrant auto-handling |
+| Proxy configuration | Not supported | Future — enterprise environments may require proxies |
