@@ -32,14 +32,51 @@ The agent can only use 16 built-in tools. Organizations need custom tools — in
 
 ## MCP Protocol
 
-**Version:** MCP 1.0 (streamable HTTP transport)
+**Version:** MCP 2025-11-25 (latest specification)
 
-**Transport:** HTTPS — all communication over TLS. No plaintext HTTP.
+**Transport:** Streamable HTTP over TLS. All communication must be HTTPS.
 
-**Key operations:**
-- `initialize` — capability negotiation, protocol version agreement
-- `tools/list` — server returns its tool manifest (name, description, inputSchema per tool)
-- `tools/call` — invoke a tool with arguments, receive structured result
+The Streamable HTTP transport replaces the older HTTP+SSE transport from 2024-11-05. The server exposes a single MCP endpoint (e.g., `https://mcp.example.com/mcp`) that supports both POST and GET methods.
+
+**Key operations (JSON-RPC 2.0):**
+- `initialize` — capability negotiation, protocol version agreement. Server may return `MCP-Session-Id` header for stateful sessions.
+- `tools/list` — server returns tool manifest with pagination support (`cursor`/`nextCursor`). Each tool has `name`, `title`, `description`, `inputSchema`, optional `outputSchema`, `annotations`, and `execution` config.
+- `tools/call` — invoke a tool with `name` + `arguments`, receive structured result with `content` array and optional `structuredContent`.
+- `notifications/tools/list_changed` — server notifies when available tools change.
+
+**Request format:**
+- Client sends JSON-RPC request via HTTP POST to the MCP endpoint
+- Client MUST include `Accept: application/json, text/event-stream` header
+- Client MUST include `MCP-Protocol-Version: 2025-11-25` header on all requests after initialization
+- If server returned `MCP-Session-Id` at initialization, client MUST include it on all subsequent requests
+
+**Response format:**
+- Server responds with either `Content-Type: application/json` (single response) or `Content-Type: text/event-stream` (SSE stream for long-running operations or server-initiated messages)
+- For notifications/responses from client: server returns `202 Accepted` with no body
+
+**Tool response content types:**
+- `text` — plain text content
+- `image` — base64-encoded image with mimeType
+- `audio` — base64-encoded audio with mimeType
+- `resource_link` — URI link to a resource
+- `resource` — embedded resource with content
+- `structuredContent` — typed JSON object (alongside `content` for backward compat)
+
+**Tool annotations:**
+- `readOnlyHint` — tool does not modify state
+- `destructiveHint` — tool may perform destructive operations
+- `idempotentHint` — safe to retry
+- `openWorldHint` — interacts with external entities
+
+**Error handling:**
+- Protocol errors: JSON-RPC error codes (e.g., `-32602` for unknown tool)
+- Tool execution errors: `isError: true` in result with descriptive content (actionable, LLM can self-correct)
+
+**Session management:**
+- Server MAY assign `MCP-Session-Id` at initialization
+- Client MUST include session ID on all subsequent requests
+- Server MAY terminate session at any time (returns 404)
+- Client SHOULD send HTTP DELETE to terminate session on cleanup
 
 **HTTP client:** `httpx.AsyncClient` with connection pooling (same library used for all outbound HTTP in agent-runtime).
 
@@ -208,7 +245,13 @@ sequenceDiagram
 
 **Timing:** Discovery happens once at session initialization, after the policy bundle is received. Not per tool call.
 
-**Caching:** Tool manifests are cached for the session lifetime. No re-discovery mid-session. If a server adds/removes tools, it takes effect on the next session.
+**Pagination:** `tools/list` supports pagination via `cursor`/`nextCursor`. The client fetches all pages during discovery to build the complete tool list.
+
+**List change notifications:** If the server declares `listChanged` capability during initialization, it may send `notifications/tools/list_changed`. On receiving this notification, the client re-fetches `tools/list` and updates the tool registry. This enables dynamic tool addition/removal mid-session.
+
+**Session management:** If the server returns `MCP-Session-Id` during initialization, the client stores it and includes it in all subsequent requests. On session termination, the client sends HTTP DELETE to the MCP endpoint. If the server returns 404 for a session ID, the client re-initializes.
+
+**Caching:** Tool manifests are cached for the session lifetime. Re-discovery only happens on `list_changed` notifications.
 
 **Failure during discovery:** If an MCP server is unreachable during discovery, log a warning and skip it. The agent operates without that server's tools. No session failure.
 
@@ -407,6 +450,8 @@ Invalid responses → ToolResult with `status: "failed"` and descriptive error.
 
 ## MCP Response Translation
 
+The MCP 2025-11-25 spec supports multiple content types in tool responses. We translate each to our ToolResult format.
+
 ### Text Content
 
 ```python
@@ -430,6 +475,23 @@ Multiple text blocks concatenated with `\n\n`:
 { "status": "success", "output": "Found 3 results:\n\n1. PROJ-101\n2. PROJ-102\n3. PROJ-103" }
 ```
 
+### Structured Content
+
+If the MCP response includes `structuredContent`, we prefer it over unstructured `content`:
+
+```python
+# MCP response with structured content
+{
+    "content": [{ "type": "text", "text": "{\"temperature\": 22.5}" }],
+    "structuredContent": { "temperature": 22.5, "conditions": "Partly cloudy" }
+}
+
+# → ToolResult (structured content serialized as JSON for LLM)
+{ "status": "success", "output": "{\"temperature\": 22.5, \"conditions\": \"Partly cloudy\"}" }
+```
+
+If the tool definition includes `outputSchema`, validate `structuredContent` against it. Invalid responses → ToolResult with `status: "failed"`.
+
 ### Image Content
 
 ```python
@@ -439,7 +501,7 @@ Multiple text blocks concatenated with `\n\n`:
     { "type": "image", "data": "base64...", "mimeType": "image/png" }
 ]}
 
-# → ToolResult with artifact
+# → ToolResult with multimodal content
 {
     "status": "success",
     "output": "Screenshot of the dashboard",
@@ -449,15 +511,52 @@ Multiple text blocks concatenated with `\n\n`:
 
 Image content becomes a multimodal tool result — same handling as `ViewImage` tool.
 
+### Audio Content
+
+```python
+# MCP response with audio
+{ "content": [{ "type": "audio", "data": "base64...", "mimeType": "audio/wav" }] }
+
+# → ToolResult (audio stored as artifact, text description for LLM)
+{ "status": "success", "output": "[Audio content: audio/wav, saved as artifact]" }
+```
+
+Audio content is saved as a workspace artifact. The LLM sees a text description.
+
+### Resource Links and Embedded Resources
+
+```python
+# MCP response with resource link
+{ "content": [{ "type": "resource_link", "uri": "file:///project/src/main.rs", "name": "main.rs" }] }
+
+# → ToolResult (resource URI as text for LLM)
+{ "status": "success", "output": "Resource: main.rs (file:///project/src/main.rs)" }
+```
+
+Resource links are presented as text to the LLM. The agent can use `ReadFile` or `FetchUrl` to access the resource if needed. Embedded resources with inline content are extracted and included directly.
+
 ### Error Content
 
 ```python
 # MCP response with isError
 { "content": [{ "type": "text", "text": "Project PROJ not found" }], "isError": true }
 
-# → ToolResult
+# → ToolResult (actionable error — LLM can self-correct)
 { "status": "failed", "error": { "message": "Project PROJ not found", "code": "MCP_TOOL_ERROR" } }
 ```
+
+Tool execution errors (`isError: true`) are distinct from protocol errors (JSON-RPC error codes). Both are surfaced to the LLM but execution errors are more likely to be actionable.
+
+### Tool Annotations for Policy
+
+MCP tool annotations (`readOnlyHint`, `destructiveHint`, etc.) are used to enhance policy enforcement:
+
+| MCP Annotation | Policy Use |
+|---|---|
+| `readOnlyHint: true` | Tool is safe for plan mode (read-only) |
+| `destructiveHint: true` | Elevates risk level, may require approval |
+| `idempotentHint: true` | Safe to retry on transient errors |
+| `openWorldHint: true` | Interacts with external systems, log for audit |
 
 ---
 
