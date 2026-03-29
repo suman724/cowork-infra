@@ -116,67 +116,67 @@ tool_runtime/tools/browser/
 
 ```mermaid
 flowchart TD
-  router["router/<br/><small>ToolRouter impl<br/>dispatch + registry</small>"]
-  bm["browser/<br/>browser_manager<br/><small>Playwright lifecycle</small>"]
-  dom["browser/<br/>dom_service<br/><small>a11y tree extraction</small>"]
-  ps["browser/<br/>page_state<br/><small>LLM representation</small>"]
-  sd["browser/<br/>sensitive_detector<br/><small>risk heuristics</small>"]
-  nav["browser/<br/>navigate"]
-  click["browser/<br/>click"]
-  type["browser/<br/>type_text"]
-  sel["browser/<br/>select"]
-  scroll["browser/<br/>scroll"]
-  back["browser/<br/>back"]
-  extract["browser/<br/>extract"]
-  ss["browser/<br/>screenshot"]
-  submit["browser/<br/>submit"]
-  dl["browser/<br/>download"]
-  wait["browser/<br/>wait"]
-  output["output/<br/><small>formatting<br/>truncation</small>"]
-  platform["platform/<br/><small>OS abstraction</small>"]
+  t_router["router/<br/><small>ToolRouter impl<br/>dispatch + registry</small>"]
+  t_bm["browser/<br/>browser_manager<br/><small>Playwright lifecycle</small>"]
+  t_dom["browser/<br/>dom_service<br/><small>a11y tree extraction</small>"]
+  t_ps["browser/<br/>page_state<br/><small>LLM representation</small>"]
+  t_sd["browser/<br/>sensitive_detector<br/><small>risk heuristics</small>"]
+  t_nav["browser/<br/>navigate"]
+  t_click["browser/<br/>click"]
+  t_type["browser/<br/>type_text"]
+  t_sel["browser/<br/>select"]
+  t_scroll["browser/<br/>scroll"]
+  t_back["browser/<br/>back"]
+  t_extract["browser/<br/>extract"]
+  t_ss["browser/<br/>screenshot"]
+  t_submit["browser/<br/>submit"]
+  t_dl["browser/<br/>download"]
+  t_wait["browser/<br/>wait"]
+  t_output["output/<br/><small>formatting<br/>truncation</small>"]
+  t_platform["platform/<br/><small>OS abstraction</small>"]
 
-  router --> nav
-  router --> click
-  router --> type
-  router --> sel
-  router --> scroll
-  router --> back
-  router --> extract
-  router --> ss
-  router --> submit
-  router --> dl
-  router --> wait
+  t_router --> t_nav
+  t_router --> t_click
+  t_router --> t_type
+  t_router --> t_sel
+  t_router --> t_scroll
+  t_router --> t_back
+  t_router --> t_extract
+  t_router --> t_ss
+  t_router --> t_submit
+  t_router --> t_dl
+  t_router --> t_wait
 
-  nav --> bm
-  click --> bm
-  type --> bm
-  sel --> bm
-  scroll --> bm
-  back --> bm
-  extract --> bm
-  ss --> bm
-  submit --> bm
-  dl --> bm
-  wait --> bm
+  t_nav --> t_bm
+  t_click --> t_bm
+  t_type --> t_bm
+  t_sel --> t_bm
+  t_scroll --> t_bm
+  t_back --> t_bm
+  t_extract --> t_bm
+  t_ss --> t_bm
+  t_submit --> t_bm
+  t_dl --> t_bm
+  t_wait --> t_bm
 
-  nav --> dom
-  click --> dom
-  type --> dom
-  extract --> dom
-  submit --> dom
+  t_nav --> t_dom
+  t_click --> t_dom
+  t_type --> t_dom
+  t_extract --> t_dom
+  t_submit --> t_dom
 
-  nav --> ps
-  click --> ps
-  type --> ps
-  extract --> ps
+  t_nav --> t_ps
+  t_click --> t_ps
+  t_type --> t_ps
+  t_extract --> t_ps
 
-  click --> sd
-  type --> sd
-  submit --> sd
+  t_click --> t_sd
+  t_type --> t_sd
+  t_submit --> t_sd
 
-  ss --> output
-  dl --> platform
-  dl --> output
+  t_ss --> t_output
+  t_dl --> t_platform
+  t_dl --> t_output
 ```
 
 **Dependency rules:**
